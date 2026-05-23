@@ -1,0 +1,171 @@
+export interface Maquina {
+  id: string
+  nombre: string
+  cantidad: number
+  descripcion?: string | null
+  activa: boolean
+  fecha_creacion: string
+}
+
+export interface Habilidad {
+  id: string
+  nombre: string
+  descripcion?: string | null
+  fecha_creacion: string
+}
+
+export type TipoEtapa = 'critica' | 'flexible' | 'descanso'
+
+export interface VentanaEmpleado {
+  desde: number  // minutos relativos al inicio del proceso
+  hasta: number
+}
+
+export interface RecursoEtapa {
+  maquina_id: string
+  uso_recurso: number  // 0.01–1.0
+  desde: number        // minutos desde inicio del proceso
+  hasta: number        // minutos desde inicio del proceso
+}
+
+export interface RecursoProgramado {
+  maquinaId: string
+  maquinaNombre: string
+  inicio: number  // minutos absolutos
+  fin: number
+}
+
+export interface PlantillaEtapa {
+  id: string
+  plantilla_id: string
+  orden: number
+  nombre: string
+  duracion_proceso: number
+  // Nuevo modelo: ventanas explícitas de empleado
+  ventanas_empleado: VentanaEmpleado[]
+  // Recursos múltiples (nuevo modelo)
+  recursos: RecursoEtapa[]
+  // Legacy recurso único (fallback si recursos está vacío)
+  uso_recurso: number
+  maquina_id?: string | null
+  maquina?: Maquina | null
+  // Legacy campos empleado (fallback si ventanas_empleado está vacío)
+  tiempo_empleado_inicio: number
+  tiempo_empleado_fin: number
+  bloquea_empleado_total: boolean
+  habilidad_id?: string | null
+  habilidad?: Habilidad | null
+  dependencias: number[]
+  prerequisitos: number[]           // deps sueltas: deben terminar ANTES, sin encadenar
+  margen_espera_max?: number | null
+  hora_inicio_min?: number | null   // minuto del día: no puede empezar antes
+  hora_fin_max?: number | null      // minuto del día: debe terminar antes
+  prioridad: number
+  tipo: TipoEtapa
+  color?: string | null
+  descripcion_extra?: string | null
+}
+
+export interface PlantillaProceso {
+  id: string
+  nombre: string
+  descripcion?: string | null
+  categoria?: string | null
+  color?: string | null             // color del proceso para el modo "color por proceso"
+  activa: boolean
+  fecha_creacion: string
+  etapas?: PlantillaEtapa[]
+}
+
+export interface PlanDia {
+  id: string
+  dia_semana: number
+  plantilla_id: string
+  plantilla?: PlantillaProceso
+  cantidad_lotes: number
+  prioridad: number
+  hora_inicio_deseada?: string | null
+  hora_inicio_min?: number | null   // override: ninguna etapa empieza antes de este minuto
+  hora_fin_max?: number | null      // override: ninguna etapa termina después de este minuto
+  activo: boolean
+  fecha_creacion: string
+}
+
+export interface EtapaScheduled {
+  key: string
+  plantillaId: string
+  plantillaNombre: string
+  lote: number
+  etapa: PlantillaEtapa
+  inicio: number
+  fin: number
+  empleadoId: string | null
+  empleadoNombre: string | null
+  lineaId: string | null
+  // Legacy (primer recurso) – mantenido por compatibilidad
+  maquinaId: string | null
+  maquinaNombre: string | null
+  // Multi-recurso
+  recursosProgramados: RecursoProgramado[]
+  conflicto: boolean
+  mensajeConflicto?: string
+}
+
+export interface ResultadoScheduler {
+  etapas: EtapaScheduled[]
+  conflictos: EtapaScheduled[]
+  duracionTotal: number
+}
+
+export interface CrearMaquinaRequest {
+  nombre: string
+  cantidad: number
+  descripcion?: string | null
+}
+
+export interface CrearHabilidadRequest {
+  nombre: string
+  descripcion?: string | null
+}
+
+export interface CrearPlantillaRequest {
+  nombre: string
+  descripcion?: string | null
+  categoria?: string | null
+}
+
+export interface CrearEtapaRequest {
+  plantilla_id: string
+  orden: number
+  nombre: string
+  duracion_proceso: number
+  ventanas_empleado: VentanaEmpleado[]
+  recursos: RecursoEtapa[]
+  // Legacy
+  uso_recurso: number
+  tiempo_empleado_inicio: number
+  tiempo_empleado_fin: number
+  bloquea_empleado_total: boolean
+  maquina_id?: string | null
+  habilidad_id?: string | null
+  dependencias: number[]
+  margen_espera_max?: number | null
+  prioridad: number
+  tipo: TipoEtapa
+  color?: string | null
+  descripcion_extra?: string | null
+}
+
+export interface CrearPlanDiaRequest {
+  dia_semana: number
+  plantilla_id: string
+  cantidad_lotes: number
+  prioridad: number
+  hora_inicio_deseada?: string | null
+}
+
+export const COLORES_ETAPA: Record<TipoEtapa, string> = {
+  critica: '#dc2626',
+  flexible: '#16a34a',
+  descanso: '#0ea5e9'
+}

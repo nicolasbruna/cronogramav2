@@ -1,0 +1,1126 @@
+import { PlantillaEtapa, PlanDia, Maquina, EtapaScheduled, ResultadoScheduler, VentanaEmpleado, RecursoProgramado, EmpleadoAsignado, EmpleadoEtapaSlot } from '../types/planificacion'
+
+// Convierte "HH:MM" o "HH:MM:SS" a minutos desde medianoche. null si vacío.
+function timeStrToMin(t: string | null | undefined): number | null {
+  if (!t) return null
+  const [h, m] = t.split(':').map(Number)
+  return h * 60 + (m ?? 0)
+}
+
+interface EmpleadoScheduler {
+  id: string
+  nombre_completo: string
+  habilidades: string[]
+  lineas: { id: string; nombre: string }[]
+  busyIntervals: [number, number][]
+  parallelIntervals: [number, number][]   // ocupaciones de tareas paralelas (no bloquean tareas normales)
+  exclusiveIntervals: [number, number][]  // ocupaciones de tareas con atención exclusiva (bloquean paralelas)
+  horarioInicio: number | null   // minutos del día — hora de entrada (null = sin restricción)
+  horarioFin: number | null      // minutos del día — hora de salida
+}
+
+interface UsageSlot {
+  start: number
+  end: number
+  usage: number
+}
+
+interface MaquinaScheduler {
+  id: string
+  nombre: string
+  cantidad: number
+  grupo_id: string | null
+  prioridad_grupo: number
+  slots: UsageSlot[]
+}
+
+interface RecursoEfectivo {
+  maquinaId: string
+  usoRecurso: number
+  desde: number  // relativo al inicio de la tarea
+  hasta: number
+}
+
+interface EtapaExpandida {
+  key: string
+  plantillaId: string
+  plantillaNombre: string
+  lote: number
+  etapa: PlantillaEtapa
+  dependencyKeys: string[]
+  prerequisitoKeys: string[]  // deps sueltas: deben terminar antes, sin encadenar al bloque
+  horaInicioMin: number | null   // minuto del día: no puede empezar antes (etapa o plan override)
+  horaInicioMaxEtapa: number | null    // tope de comienzo a nivel ETAPA (se aplica a esta etapa, con su offset)
+  horaInicioMaxProceso: number | null  // tope de comienzo a nivel PLANTILLA (se aplica al inicio del proceso, sin offset)
+  horaFinMax: number | null      // minuto del día: debe terminar antes
+}
+
+interface ChainGroup {
+  headKey: string
+  tasks: EtapaExpandida[]
+  offsets: number[]      // offset desde el inicio del chain head para cada tarea
+  totalDuration: number
+}
+
+interface ChainPlacement {
+  inicio: number
+  fin: number
+  empleadoId: string | null
+  empleadoNombre: string | null
+  lineaId: string | null
+  recursosProgramados: RecursoProgramado[]
+}
+
+// ---- Helpers recursos ----
+
+function getRecursosEfectivos(etapa: PlantillaEtapa): RecursoEfectivo[] {
+  if (etapa.recursos && etapa.recursos.length > 0) {
+    return etapa.recursos.map(r => ({
+      maquinaId: r.maquina_id,
+      usoRecurso: r.uso_recurso,
+      desde: r.desde,
+      hasta: r.hasta
+    }))
+  }
+  if (etapa.maquina_id) {
+    return [{ maquinaId: etapa.maquina_id, usoRecurso: etapa.uso_recurso ?? 1.0, desde: 0, hasta: etapa.duracion_proceso }]
+  }
+  return []
+}
+
+// ---- Helpers empleado ----
+
+function getVentanasEmpleado(etapa: PlantillaEtapa, inicio: number, fin: number): [number, number][] {
+  if (etapa.ventanas_empleado && etapa.ventanas_empleado.length > 0) {
+    return etapa.ventanas_empleado.map(v => [inicio + v.desde, inicio + v.hasta] as [number, number])
+  }
+  if (etapa.bloquea_empleado_total) return [[inicio, fin]]
+  const w: [number, number][] = []
+  if (etapa.tiempo_empleado_inicio > 0) w.push([inicio, inicio + etapa.tiempo_empleado_inicio])
+  if (etapa.tiempo_empleado_fin > 0) w.push([fin - etapa.tiempo_empleado_fin, fin])
+  return w
+}
+
+function isSlotFree(intervals: [number, number][], start: number, end: number): boolean {
+  for (const [s, e] of intervals) {
+    if (s < end && e > start) return false
+  }
+  return true
+}
+
+function addInterval(intervals: [number, number][], start: number, end: number): void {
+  if (start < end) intervals.push([start, end])
+}
+
+function empleadoDisponible(emp: EmpleadoScheduler, inicio: number, fin: number, etapa: PlantillaEtapa): boolean {
+  // Verificar ventana horaria del empleado (hora de entrada / salida)
+  const ventanas = getVentanasEmpleado(etapa, inicio, fin)
+  const esParalela = etapa.permite_solape === true
+  const esExclusiva = etapa.atencion_exclusiva === true
+  if (ventanas.length > 0) {
+    for (const [vs, ve] of ventanas) {
+      if (emp.horarioInicio !== null && vs < emp.horarioInicio) return false
+      if (emp.horarioFin !== null && ve > emp.horarioFin) return false
+      if (esParalela) {
+        // Paralela: ignora ocupaciones normales y otras paralelas, pero no puede pisar una exclusiva
+        if (!isSlotFree(emp.exclusiveIntervals, vs, ve)) return false
+      } else {
+        // Normal o exclusiva: respeta la ocupación normal del empleado
+        if (!isSlotFree(emp.busyIntervals, vs, ve)) return false
+        // Exclusiva: además no puede coincidir con una tarea paralela del mismo empleado
+        if (esExclusiva && !isSlotFree(emp.parallelIntervals, vs, ve)) return false
+      }
+    }
+  } else {
+    // Sin ventanas: verificar el bloque completo
+    if (emp.horarioInicio !== null && inicio < emp.horarioInicio) return false
+    if (emp.horarioFin !== null && fin > emp.horarioFin) return false
+  }
+  return true
+}
+
+function marcarEmpleadoOcupado(emp: EmpleadoScheduler, inicio: number, fin: number, etapa: PlantillaEtapa): void {
+  const ventanas = getVentanasEmpleado(etapa, inicio, fin)
+  if (etapa.permite_solape === true) {
+    // Paralela: no reserva al empleado, pero registra el intervalo para bloquear exclusivas
+    for (const [s, e] of ventanas) addInterval(emp.parallelIntervals, s, e)
+    return
+  }
+  for (const [s, e] of ventanas) addInterval(emp.busyIntervals, s, e)
+  if (etapa.atencion_exclusiva === true) {
+    for (const [s, e] of ventanas) addInterval(emp.exclusiveIntervals, s, e)
+  }
+}
+
+// ---- Múltiples empleados por etapa (principal + ayudantes) ----
+
+function buildCandidatosSlot(slot: EmpleadoEtapaSlot, empleados: EmpleadoScheduler[]): EmpleadoScheduler[] {
+  const prefId = slot.empleado_preferido_id ?? null
+  const preferido = prefId ? (empleados.find(e => e.id === prefId) ?? null) : null
+  if (preferido) {
+    if (slot.puede_reemplazarse === false) return [preferido]
+    const otros = slot.habilidad_id
+      ? empleados.filter(e => e.id !== preferido.id && e.habilidades.includes(slot.habilidad_id!))
+      : empleados.filter(e => e.id !== preferido.id)
+    return [preferido, ...otros]
+  }
+  return slot.habilidad_id
+    ? empleados.filter(e => e.habilidades.includes(slot.habilidad_id!))
+    : [...empleados]
+}
+
+function slotLibre(emp: EmpleadoScheduler, intervals: [number, number][], esParalela: boolean, esExclusiva: boolean): boolean {
+  for (const [s, e] of intervals) {
+    if (emp.horarioInicio !== null && s < emp.horarioInicio) return false
+    if (emp.horarioFin !== null && e > emp.horarioFin) return false
+    if (esParalela) {
+      if (!isSlotFree(emp.exclusiveIntervals, s, e)) return false
+    } else {
+      if (!isSlotFree(emp.busyIntervals, s, e)) return false
+      if (esExclusiva && !isSlotFree(emp.parallelIntervals, s, e)) return false
+    }
+  }
+  return true
+}
+
+// Construye la lista de empleados asignados a una etapa: el principal (del modelo legacy)
+// más un empleado por cada slot 'ayudante' definido en empleados_etapa. Reserva las ventanas
+// del ayudante en empState para evitar doble reserva.
+function construirAsignados(
+  etapa: PlantillaEtapa, inicio: number, fin: number,
+  principalId: string | null, principalNombre: string | null,
+  empState: EmpleadoScheduler[]
+): EmpleadoAsignado[] {
+  const asignados: EmpleadoAsignado[] = [
+    { empleadoId: principalId, empleadoNombre: principalNombre, inicio, fin, rol: 'principal' }
+  ]
+  const paralelo = etapa.permite_solape === true
+  const exclusiva = etapa.atencion_exclusiva === true
+  for (const slot of (etapa.empleados_etapa || [])) {
+    if (slot.rol !== 'ayudante') continue
+    const vent = (slot.ventanas && slot.ventanas.length > 0) ? slot.ventanas : [{ desde: 0, hasta: etapa.duracion_proceso }]
+    const intervals = vent.map(v => [inicio + v.desde, inicio + v.hasta] as [number, number])
+    const sIni = Math.min(...intervals.map(i => i[0]))
+    const sFin = Math.max(...intervals.map(i => i[1]))
+    const cand = buildCandidatosSlot(slot, empState)
+    const elegido = cand.find(e => e.id !== principalId && slotLibre(e, intervals, paralelo, exclusiva)) ?? null
+    if (elegido) {
+      if (paralelo) {
+        for (const [a, b] of intervals) addInterval(elegido.parallelIntervals, a, b)
+      } else {
+        for (const [a, b] of intervals) addInterval(elegido.busyIntervals, a, b)
+        if (exclusiva) for (const [a, b] of intervals) addInterval(elegido.exclusiveIntervals, a, b)
+      }
+      asignados.push({ empleadoId: elegido.id, empleadoNombre: elegido.nombre_completo, inicio: sIni, fin: sFin, rol: 'ayudante' })
+    } else {
+      asignados.push({ empleadoId: null, empleadoNombre: null, inicio: sIni, fin: sFin, rol: 'ayudante' })
+    }
+  }
+  return asignados
+}
+
+// ---- Selección de candidatos de empleado ----
+// Orden de prioridad: empleado_preferido → habilidad requerida → cualquiera.
+// Si puede_reemplazarse = false, SOLO se usa el empleado preferido.
+
+function buildCandidatos(etapa: PlantillaEtapa, empleados: EmpleadoScheduler[]): EmpleadoScheduler[] {
+  const prefId = etapa.empleado_preferido_id ?? null
+  const preferido = prefId ? (empleados.find(e => e.id === prefId) ?? null) : null
+
+  if (preferido) {
+    if (etapa.puede_reemplazarse === false) {
+      // No admite sustitución: solo este empleado
+      return [preferido]
+    }
+    // Preferido primero, luego los que tienen la habilidad requerida (si aplica), luego el resto
+    const otros = etapa.habilidad_id
+      ? empleados.filter(e => e.id !== preferido.id && e.habilidades.includes(etapa.habilidad_id!))
+      : empleados.filter(e => e.id !== preferido.id)
+    return [preferido, ...otros]
+  }
+
+  // Sin preferido: filtrar por habilidad o usar todos
+  return etapa.habilidad_id
+    ? empleados.filter(e => e.habilidades.includes(etapa.habilidad_id!))
+    : [...empleados]
+}
+
+function necesitaEmpleadoFn(etapa: PlantillaEtapa): boolean {
+  return !!(
+    (etapa.ventanas_empleado && etapa.ventanas_empleado.length > 0) ||
+    etapa.bloquea_empleado_total ||
+    etapa.tiempo_empleado_inicio > 0 ||
+    etapa.tiempo_empleado_fin > 0
+  )
+}
+
+// ---- Sustitución de máquinas por grupo ----
+// Intenta el recurso primario y, si no cabe, prueba en orden de prioridad los
+// miembros del mismo grupo. Devuelve { maq, nextFreeAt } donde nextFreeAt es
+// el mínimo instante libre de todos los miembros del grupo (para avanzar t).
+
+function findMachineForSlot(
+  allMaquinas: MaquinaScheduler[],
+  primaryId: string,
+  rStart: number,
+  rEnd: number,
+  required: number
+): { maq: MaquinaScheduler; isSub: boolean } | null {
+  const primary = allMaquinas.find(m => m.id === primaryId)
+  if (primary && canFitMachine(primary, rStart, rEnd, required)) {
+    return { maq: primary, isSub: false }
+  }
+
+  // No cabe en la primaria → buscar sustituto en el mismo grupo (si existe)
+  const grupoId = primary?.grupo_id ?? null
+  if (!grupoId) return null  // Sin grupo = no hay sustitución
+
+  const groupMembers = allMaquinas
+    .filter(m => m.grupo_id === grupoId && m.id !== primaryId)
+    .sort((a, b) => a.prioridad_grupo - b.prioridad_grupo)
+
+  for (const sub of groupMembers) {
+    if (canFitMachine(sub, rStart, rEnd, required)) {
+      return { maq: sub, isSub: true }
+    }
+  }
+
+  return null  // Ningún miembro del grupo disponible
+}
+
+// Devuelve el próximo instante en que algún miembro del grupo (incluyendo el primario)
+// pueda acomodar el recurso — usado para avanzar t cuando nadie del grupo cabe.
+function nextFreeInGroup(
+  allMaquinas: MaquinaScheduler[],
+  primaryId: string,
+  fromTime: number,
+  duration: number,
+  required: number
+): number {
+  const primary = allMaquinas.find(m => m.id === primaryId)
+  const grupoId = primary?.grupo_id ?? null
+  const members = grupoId
+    ? allMaquinas.filter(m => m.grupo_id === grupoId)
+    : primary ? [primary] : []
+
+  if (members.length === 0) return fromTime + 1
+
+  return Math.min(...members.map(m => getNextFreeStartMachine(m, fromTime, duration, required)))
+}
+
+// ---- Helpers máquina con capacidad parcial ----
+
+function getMaxUsageInRange(slots: UsageSlot[], start: number, end: number): number {
+  const boundaries = new Set<number>([start])
+  for (const s of slots) {
+    if (s.start < end && s.end > start) {
+      if (s.start > start) boundaries.add(s.start)
+      if (s.end < end) boundaries.add(s.end)
+    }
+  }
+  let maxUsage = 0
+  for (const t of boundaries) {
+    let usage = 0
+    for (const s of slots) {
+      if (s.start <= t && s.end > t) usage += s.usage
+    }
+    maxUsage = Math.max(maxUsage, usage)
+  }
+  return maxUsage
+}
+
+function canFitMachine(maq: MaquinaScheduler, start: number, end: number, required: number): boolean {
+  return getMaxUsageInRange(maq.slots, start, end) + required <= maq.cantidad
+}
+
+function getNextFreeStartMachine(maq: MaquinaScheduler, fromTime: number, duration: number, required: number): number {
+  const candidates = [fromTime, ...maq.slots.filter(s => s.end > fromTime).map(s => s.end)]
+  candidates.sort((a, b) => a - b)
+  for (const t of candidates) {
+    if (t < fromTime) continue
+    if (canFitMachine(maq, t, t + duration, required)) return t
+  }
+  return fromTime + duration * 100
+}
+
+// ---- Empleado: próximo slot libre ----
+
+function getNextFreeStart(intervals: [number, number][], fromTime: number, duration: number): number {
+  let candidate = fromTime
+  let changed = true
+  while (changed) {
+    changed = false
+    for (const [s, e] of intervals) {
+      if (s < candidate + duration && e > candidate) {
+        candidate = e
+        changed = true
+      }
+    }
+  }
+  return candidate
+}
+
+// ---- Ordenamiento topológico ----
+
+// includePrereqs=true: también sigue prerequisitoKeys como aristas de orden (necesario para prework)
+function topologicalSort(etapas: EtapaExpandida[], includePrereqs = false): EtapaExpandida[] {
+  const byKey = new Map(etapas.map(e => [e.key, e]))
+  const visited = new Set<string>()
+  const result: EtapaExpandida[] = []
+
+  function visit(e: EtapaExpandida) {
+    if (visited.has(e.key)) return
+    visited.add(e.key)
+    for (const depKey of e.dependencyKeys) {
+      const dep = byKey.get(depKey)
+      if (dep) visit(dep)
+    }
+    if (includePrereqs) {
+      for (const preqKey of e.prerequisitoKeys) {
+        const dep = byKey.get(preqKey)
+        if (dep) visit(dep)
+      }
+    }
+    result.push(e)
+  }
+
+  const sorted = [...etapas].sort((a, b) => {
+    if (a.etapa.tipo !== b.etapa.tipo) {
+      const order: Record<string, number> = { critica: 0, descanso: 1, flexible: 2 }
+      return (order[a.etapa.tipo] ?? 1) - (order[b.etapa.tipo] ?? 1)
+    }
+    return b.etapa.prioridad - a.etapa.prioridad
+  })
+
+  for (const e of sorted) visit(e)
+  return result
+}
+
+// ---- Detección de cadenas ----
+// Una "cadena" es una secuencia lineal A→B→C donde cada paso tiene margen_espera_max=0.
+// Regla principal: solo se absorbe un sucesor S a la cadena si TODAS sus dependencias
+// externas (las que no forman parte de la cadena actual) aparecen ANTES de la cabeza
+// en el orden topológico — de lo contrario S todavía no puede planificarse correctamente
+// dentro de la cadena (su dep externa no fue procesada aún).
+// Si una tarea tiene MÚLTIPLES sucesores válidos con margen=0, se elige el primero.
+
+function detectChains(ordered: EtapaExpandida[]): {
+  chainGroups: Map<string, ChainGroup>
+  chainSuccessors: Set<string>
+} {
+  const chainSuccessors = new Set<string>()
+  const chainGroups = new Map<string, ChainGroup>()
+
+  // Índice de posición para consulta O(1)
+  const indexByKey = new Map<string, number>()
+  ordered.forEach((e, i) => indexByKey.set(e.key, i))
+
+  for (const head of ordered) {
+    if (chainSuccessors.has(head.key)) continue
+
+    const headIndex = indexByKey.get(head.key)!
+    const tasks: EtapaExpandida[] = [head]
+    const offsets: number[] = [0]
+    let offset = head.etapa.duracion_proceso
+
+    let current = head
+    while (true) {
+      const chainKeys = new Set(tasks.map(t => t.key))
+
+      const successor = ordered.find(other => {
+        if (chainSuccessors.has(other.key)) return false
+        if (other.etapa.margen_espera_max !== 0) return false
+        if (other.dependencyKeys.length < 1) return false
+        if (!other.dependencyKeys.includes(current.key)) return false
+
+        // Solo absorber si todas las deps EXTERNAS a la cadena actual
+        // aparecen antes de la cabeza en el orden topológico.
+        // Si una dep externa viene después, el sucesor no puede planificarse
+        // correctamente dentro de esta cadena (la dep aún no fue resuelta).
+        const externalDeps = other.dependencyKeys.filter(dk => !chainKeys.has(dk))
+        return externalDeps.every(dk => {
+          const depIndex = indexByKey.get(dk)
+          return depIndex !== undefined && depIndex < headIndex
+        })
+      })
+
+      if (!successor) break
+      chainSuccessors.add(successor.key)
+      tasks.push(successor)
+      offsets.push(offset)
+      offset += successor.etapa.duracion_proceso
+      current = successor
+    }
+
+    chainGroups.set(head.key, {
+      headKey: head.key,
+      tasks,
+      offsets,
+      totalDuration: offset
+    })
+  }
+
+  return { chainGroups, chainSuccessors }
+}
+
+// ---- Buscar slot para una cadena completa ----
+// Verifica que todos los recursos de todas las tareas de la cadena estén disponibles
+// en sus ventanas relativas al inicio de la cadena.
+
+function findBestSlotForChain(
+  chain: ChainGroup,
+  earliest: number,
+  rangoFin: number,
+  empleados: EmpleadoScheduler[],
+  maquinas: MaquinaScheduler[],
+  maxInicio: number = Infinity
+): { placements: ChainPlacement[] } | null {
+  const { tasks, offsets, totalDuration } = chain
+
+  // Ajustar earliest y maxInicio según hora_inicio_min / hora_fin_max de cada tarea del bloque
+  let effectiveEarliest = earliest
+  let effectiveMax = maxInicio
+  for (let i = 0; i < tasks.length; i++) {
+    const { horaInicioMin, horaInicioMaxEtapa, horaInicioMaxProceso, horaFinMax, etapa } = tasks[i]
+    if (horaInicioMin != null) {
+      // taskStart = t + offsets[i] >= horaInicioMin  →  t >= horaInicioMin - offsets[i]
+      effectiveEarliest = Math.max(effectiveEarliest, horaInicioMin - offsets[i])
+    }
+    if (horaInicioMaxEtapa != null) {
+      // tope de la etapa: taskStart = t + offsets[i] <= max  →  t <= max - offsets[i]
+      effectiveMax = Math.min(effectiveMax, horaInicioMaxEtapa - offsets[i])
+    }
+    if (horaInicioMaxProceso != null) {
+      // tope del proceso: aplica al inicio del bloque  →  t <= max
+      effectiveMax = Math.min(effectiveMax, horaInicioMaxProceso)
+    }
+    if (horaFinMax != null) {
+      // taskEnd = t + offsets[i] + duracion <= horaFinMax  →  t <= horaFinMax - offsets[i] - duracion
+      effectiveMax = Math.min(effectiveMax, horaFinMax - offsets[i] - etapa.duracion_proceso)
+    }
+  }
+
+  let t = effectiveEarliest
+
+  while (t <= effectiveMax && t + totalDuration <= rangoFin) {
+
+    // Fase 1: verificar TODOS los recursos de TODAS las tareas de la cadena
+    let allMachinesOk = true
+    let tAdvance = t + 1
+    const allRecursos: RecursoProgramado[][] = tasks.map(() => [])
+
+    outer:
+    for (let i = 0; i < tasks.length; i++) {
+      const etapa = tasks[i].etapa
+      const taskStart = t + offsets[i]
+      const recursosEfectivos = getRecursosEfectivos(etapa)
+
+      for (const r of recursosEfectivos) {
+        const rStart = taskStart + r.desde
+        const rEnd = taskStart + r.hasta
+
+        const result = findMachineForSlot(maquinas, r.maquinaId, rStart, rEnd, r.usoRecurso)
+        if (!result) {
+          // No hay máquina disponible (ni en el grupo) → avanzar
+          const nextFree = nextFreeInGroup(maquinas, r.maquinaId, rStart, r.hasta - r.desde, r.usoRecurso)
+          tAdvance = Math.max(tAdvance, nextFree - offsets[i] - r.desde)
+          allMachinesOk = false
+          break outer
+        }
+
+        allRecursos[i].push({
+          maquinaId: result.maq.id,
+          maquinaNombre: result.maq.nombre,
+          inicio: rStart,
+          fin: rEnd
+        })
+      }
+    }
+
+    if (!allMachinesOk) {
+      t = tAdvance
+      continue
+    }
+
+    // Fase 2: asignar empleados para cada tarea de la cadena en orden
+    const placements: ChainPlacement[] = []
+    let allEmployeesOk = true
+    // Guardar longitudes para poder deshacer marcaciones si falla algún empleado
+    const savedLengths: [EmpleadoScheduler, number, number, number][] = []
+
+    for (let i = 0; i < tasks.length; i++) {
+      const { etapa } = tasks[i]
+      const inicio = t + offsets[i]
+      const fin = inicio + etapa.duracion_proceso
+
+      if (!necesitaEmpleadoFn(etapa)) {
+        placements.push({ inicio, fin, empleadoId: null, empleadoNombre: null, lineaId: null, recursosProgramados: allRecursos[i] })
+        continue
+      }
+
+      const candidatos = buildCandidatos(etapa, empleados)
+
+      let found = false
+      for (const emp of candidatos) {
+        if (empleadoDisponible(emp, inicio, fin, etapa)) {
+          savedLengths.push([emp, emp.busyIntervals.length, emp.parallelIntervals.length, emp.exclusiveIntervals.length])
+          marcarEmpleadoOcupado(emp, inicio, fin, etapa)
+          placements.push({
+            inicio, fin,
+            empleadoId: emp.id,
+            empleadoNombre: emp.nombre_completo,
+            lineaId: emp.lineas[0]?.id ?? null,
+            recursosProgramados: allRecursos[i]
+          })
+          found = true
+          break
+        }
+      }
+
+      if (!found) {
+        // Deshacer marcaciones de empleados tentativas
+        for (const [emp, bl, pl, el] of savedLengths) {
+          emp.busyIntervals.length = bl
+          emp.parallelIntervals.length = pl
+          emp.exclusiveIntervals.length = el
+        }
+        // Avanzar buscando cuándo libera el mejor empleado
+        let minNext = t + 1
+        for (const emp of candidatos) {
+          const ventanas = getVentanasEmpleado(etapa, t + offsets[i], t + offsets[i] + etapa.duracion_proceso)
+          for (const [vs, ve] of ventanas) {
+            const next = getNextFreeStart(emp.busyIntervals, vs, ve - vs)
+            minNext = Math.min(minNext, next - (vs - t - offsets[i]))
+          }
+        }
+        allEmployeesOk = false
+        t = Math.max(t + 1, minNext)
+        break
+      }
+    }
+
+    if (allEmployeesOk) {
+      return { placements }
+    }
+    // Si no: t ya fue avanzado en el bloque de employee-not-found
+  }
+
+  return null
+}
+
+// ---- Buscar slot para una tarea individual (no en cadena) ----
+
+function findBestSlot(
+  etapa: PlantillaEtapa,
+  earliest: number,
+  rangoFin: number,
+  empleados: EmpleadoScheduler[],
+  maquinas: MaquinaScheduler[],
+  maxInicio: number = Infinity
+): {
+  inicio: number; fin: number
+  empleadoId: string | null; empleadoNombre: string | null; lineaId: string | null
+  recursosProgramados: RecursoProgramado[]
+} | null {
+  const duracion = etapa.duracion_proceso
+  const recursosEfectivos = getRecursosEfectivos(etapa)
+  const candidatos = buildCandidatos(etapa, empleados)
+  const necesitaEmpleado = necesitaEmpleadoFn(etapa)
+
+  let t = earliest
+
+  while (t <= maxInicio && t + duracion <= rangoFin) {
+    const inicio = t
+    const fin = inicio + duracion
+
+    let allMachinesOk = true
+    const recursosProgramados: RecursoProgramado[] = []
+
+    for (const r of recursosEfectivos) {
+      const rStart = t + r.desde
+      const rEnd = t + r.hasta
+
+      const result = findMachineForSlot(maquinas, r.maquinaId, rStart, rEnd, r.usoRecurso)
+      if (!result) {
+        const nextFree = nextFreeInGroup(maquinas, r.maquinaId, rStart, r.hasta - r.desde, r.usoRecurso)
+        t = Math.max(t + 1, nextFree - r.desde)
+        allMachinesOk = false
+        break
+      }
+
+      recursosProgramados.push({ maquinaId: result.maq.id, maquinaNombre: result.maq.nombre, inicio: rStart, fin: rEnd })
+    }
+
+    if (!allMachinesOk) continue
+
+    if (!necesitaEmpleado) {
+      return { inicio, fin, empleadoId: null, empleadoNombre: null, lineaId: null, recursosProgramados }
+    }
+
+    if (candidatos.length === 0) return null
+
+    for (const emp of candidatos) {
+      if (empleadoDisponible(emp, inicio, fin, etapa)) {
+        const lineaId = emp.lineas[0]?.id ?? null
+        return { inicio, fin, empleadoId: emp.id, empleadoNombre: emp.nombre_completo, lineaId, recursosProgramados }
+      }
+    }
+
+    let minNext = t + 1
+    for (const emp of candidatos) {
+      // Saltar directamente a la hora de entrada si el t actual es demasiado temprano
+      if (emp.horarioInicio !== null && t < emp.horarioInicio) {
+        minNext = Math.min(minNext, emp.horarioInicio)
+      }
+      const ventanas = getVentanasEmpleado(etapa, t, t + duracion)
+      for (const [vs, ve] of ventanas) {
+        const next = getNextFreeStart(emp.busyIntervals, vs, ve - vs)
+        minNext = Math.min(minNext, next - (vs - t))
+      }
+    }
+    t = Math.max(t + 1, minNext)
+  }
+
+  return null
+}
+
+// ---- Layout interno de un bloque (proceso) en aislamiento ----
+// Corre el scheduler greedy etapa-por-etapa con un estado de recursos fresco para
+// obtener el "inicio" relativo de cada etapa, respetando dependencias, cadenas
+// (margen=0) y conflictos internos de máquina/empleado. Muta empState y maqState.
+
+function scheduleStagesGreedy(
+  ordered: EtapaExpandida[],
+  empState: EmpleadoScheduler[],
+  maqState: MaquinaScheduler[],
+  rangoInicio: number,
+  rangoFin: number
+): { inicioPorKey: Map<string, number>; failed: Set<string> } {
+  const { chainGroups } = detectChains(ordered)
+  const completionTimes: Record<string, number> = {}
+  const inicioPorKey = new Map<string, number>()
+  const failed = new Set<string>()
+  const prePlaced = new Map<string, ChainPlacement | null>()
+
+  const marcarMaquinas = (etapa: PlantillaEtapa, recursosProgramados: RecursoProgramado[]) => {
+    for (const rp of recursosProgramados) {
+      const maq = maqState.find(m => m.id === rp.maquinaId)
+      const r = getRecursosEfectivos(etapa).find(r => r.maquinaId === rp.maquinaId)
+      if (maq && r) maq.slots.push({ start: rp.inicio, end: rp.fin, usage: r.usoRecurso })
+    }
+  }
+
+  for (const expandida of ordered) {
+    const { key, etapa, dependencyKeys, horaInicioMin, horaInicioMaxEtapa, horaInicioMaxProceso, horaFinMax } = expandida
+
+    if (prePlaced.has(key)) {
+      if (!prePlaced.get(key)) failed.add(key)
+      continue
+    }
+
+    let earliest = rangoInicio
+    for (const depKey of dependencyKeys) {
+      if (completionTimes[depKey] !== undefined) earliest = Math.max(earliest, completionTimes[depKey])
+    }
+    // Respetar hora_inicio_min de la etapa/plan
+    if (horaInicioMin != null) earliest = Math.max(earliest, horaInicioMin)
+
+    const chain = chainGroups.get(key)
+    if (!chain) {
+      completionTimes[key] = earliest + etapa.duracion_proceso
+      continue
+    }
+
+    if (chain.tasks.length === 1) {
+      const margen = etapa.margen_espera_max
+      let maxInicio = Infinity
+      if (margen !== null && margen !== undefined && margen > 0 && dependencyKeys.length > 0) {
+        maxInicio = earliest + margen
+      }
+      // Respetar hora_fin_max y topes de comienzo. El tope de proceso solo aplica a etapas
+      // de arranque (sin dependencias); las etapas posteriores arrancan más tarde por diseño.
+      if (horaFinMax != null) maxInicio = Math.min(maxInicio, horaFinMax - etapa.duracion_proceso)
+      if (horaInicioMaxEtapa != null) maxInicio = Math.min(maxInicio, horaInicioMaxEtapa)
+      if (horaInicioMaxProceso != null && dependencyKeys.length === 0) maxInicio = Math.min(maxInicio, horaInicioMaxProceso)
+      const resultado = findBestSlot(etapa, earliest, rangoFin, empState, maqState, maxInicio)
+      if (!resultado) {
+        failed.add(key)
+        completionTimes[key] = rangoFin + 9999
+        continue
+      }
+      marcarMaquinas(etapa, resultado.recursosProgramados)
+      if (resultado.empleadoId) {
+        const emp = empState.find(e => e.id === resultado.empleadoId)!
+        marcarEmpleadoOcupado(emp, resultado.inicio, resultado.fin, etapa)
+      }
+      completionTimes[key] = resultado.fin
+      inicioPorKey.set(key, resultado.inicio)
+    } else {
+      const margenCabeza = etapa.margen_espera_max
+      let maxInicio = Infinity
+      if (margenCabeza !== null && margenCabeza !== undefined && margenCabeza > 0 && dependencyKeys.length > 0) {
+        maxInicio = earliest + margenCabeza
+      }
+      const resultado = findBestSlotForChain(chain, earliest, rangoFin, empState, maqState, maxInicio)
+      if (!resultado) {
+        for (let i = 0; i < chain.tasks.length; i++) {
+          failed.add(chain.tasks[i].key)
+          if (i > 0) {
+            prePlaced.set(chain.tasks[i].key, null)
+            completionTimes[chain.tasks[i].key] = rangoFin + 9999
+          }
+        }
+        completionTimes[key] = rangoFin + 9999
+      } else {
+        for (let i = 0; i < chain.tasks.length; i++) {
+          const task = chain.tasks[i]
+          const placement = resultado.placements[i]
+          marcarMaquinas(task.etapa, placement.recursosProgramados)
+          completionTimes[task.key] = placement.fin
+          inicioPorKey.set(task.key, placement.inicio)
+          if (i > 0) prePlaced.set(task.key, placement)
+        }
+      }
+    }
+  }
+
+  return { inicioPorKey, failed }
+}
+
+// ---- Clasificación prework ----
+// Identifica etapas que son "prerequisito suelto": aparecen como prerequisito
+// de alguna etapa principal pero NO como dependencia-cadena de nadie.
+// Se incluyen también sus propias dependencias cadena (transitivamente).
+
+function findPreworkSet(etapas: EtapaExpandida[]): Set<string> {
+  const allChainTargets = new Set(etapas.flatMap(e => e.dependencyKeys))
+  const allPrereqTargets = new Set(etapas.flatMap(e => e.prerequisitoKeys))
+  const byKey = new Map(etapas.map(e => [e.key, e]))
+
+  const prework = new Set<string>()
+  const queue: string[] = []
+
+  // Semilla: etapas que son prerequisito de alguien pero no son dep-cadena de nadie
+  for (const e of etapas) {
+    if (allPrereqTargets.has(e.key) && !allChainTargets.has(e.key)) {
+      prework.add(e.key)
+      queue.push(e.key)
+    }
+  }
+
+  // Expansión transitiva: las dep-cadena de las etapas prework también son prework
+  while (queue.length > 0) {
+    const key = queue.pop()!
+    const e = byKey.get(key)
+    if (!e) continue
+    for (const depKey of e.dependencyKeys) {
+      if (!prework.has(depKey)) {
+        prework.add(depKey)
+        queue.push(depKey)
+      }
+    }
+  }
+
+  return prework
+}
+
+// ---- Función principal ----
+// Estrategia "bloque por bloque": cada plantilla+lote es un proceso indivisible.
+// 1) Se calcula su layout interno en aislamiento (offsets relativos entre etapas).
+// 2) Se ubica el proceso COMPLETO como un bloque (vía findBestSlotForChain) en el
+//    primer horario donde ninguna de sus etapas pise una máquina o empleado ya
+//    ocupado por otro proceso. El timing interno del proceso se preserva intacto.
+
+export function generarCronograma(
+  planDia: PlanDia[],
+  empleados: { id: string; nombre_completo: string; habilidades: string[]; lineas: { id: string; nombre: string }[]; horario?: { hora_inicio: string; hora_fin: string } | null }[],
+  maquinas: Maquina[],
+  rangoInicio: number,
+  rangoFin: number
+): ResultadoScheduler {
+
+  console.log('[Scheduler] ▶ generarCronograma (modo bloque) iniciado')
+  console.log('[Scheduler] Máquinas:', maquinas.map(m => `${m.nombre}(cant=${m.cantidad})`))
+
+  const empleadosState: EmpleadoScheduler[] = empleados.map(e => ({
+    ...e,
+    busyIntervals: [],
+    parallelIntervals: [],
+    exclusiveIntervals: [],
+    horarioInicio: timeStrToMin(e.horario?.hora_inicio),
+    horarioFin: timeStrToMin(e.horario?.hora_fin)
+  }))
+  const maquinasState: MaquinaScheduler[] = maquinas.map(m => ({
+    id: m.id, nombre: m.nombre, cantidad: m.cantidad,
+    grupo_id: m.grupo_id ?? null, prioridad_grupo: m.prioridad_grupo ?? 1,
+    slots: []
+  }))
+
+  // ---- Construir bloques (un bloque = plantilla + lote) ----
+  interface Bloque {
+    plantillaId: string
+    plantillaNombre: string
+    lote: number
+    prioridad: number
+    orden: number
+    etapas: EtapaExpandida[]
+  }
+  const bloques: Bloque[] = []
+  let ordenPlan = 0
+  for (const plan of planDia) {
+    if (!plan.activo || !plan.plantilla?.etapas?.length) continue
+    const plantillaNombre = plan.plantilla.nombre
+    const etapasOrdenadas = [...plan.plantilla.etapas].sort((a, b) => a.orden - b.orden)
+    for (let lote = 1; lote <= plan.cantidad_lotes; lote++) {
+      const etapas: EtapaExpandida[] = etapasOrdenadas.map(etapa => {
+        const key = `${plan.plantilla_id}-l${lote}-o${etapa.orden}`
+        const dependencyKeys = (etapa.dependencias ?? []).map(depOrden =>
+          `${plan.plantilla_id}-l${lote}-o${depOrden}`
+        )
+        const prerequisitoKeys = (etapa.prerequisitos ?? []).map(preqOrden =>
+          `${plan.plantilla_id}-l${lote}-o${preqOrden}`
+        )
+        // Prioridad: plan-día > plantilla > etapa
+        const templateInicioMin = timeStrToMin(plan.plantilla?.hora_inicio_min)
+        const templateInicioMax = timeStrToMin(plan.plantilla?.hora_inicio_max)
+        const templateFinMax = timeStrToMin(plan.plantilla?.hora_fin_max)
+        const horaInicioMin = plan.hora_inicio_min ?? templateInicioMin ?? etapa.hora_inicio_min ?? null
+        // Tope de comienzo: el de la plantilla aplica al INICIO DEL PROCESO; el de la etapa aplica a esa etapa.
+        const horaInicioMaxProceso = templateInicioMax ?? null
+        const horaInicioMaxEtapa = etapa.hora_inicio_max ?? null
+        const horaFinMax = plan.hora_fin_max ?? templateFinMax ?? etapa.hora_fin_max ?? null
+        // Solape y atención exclusiva: la etapa hereda el default de la plantilla
+        const permiteSolape = etapa.permite_solape || (plan.plantilla?.permite_solape ?? false)
+        const atencionExclusiva = etapa.atencion_exclusiva || (plan.plantilla?.atencion_exclusiva ?? false)
+        const etapaEff = (permiteSolape !== (etapa.permite_solape ?? false) || atencionExclusiva !== (etapa.atencion_exclusiva ?? false))
+          ? { ...etapa, permite_solape: permiteSolape, atencion_exclusiva: atencionExclusiva }
+          : etapa
+        return { key, plantillaId: plan.plantilla_id, plantillaNombre, lote, etapa: etapaEff, dependencyKeys, prerequisitoKeys, horaInicioMin, horaInicioMaxEtapa, horaInicioMaxProceso, horaFinMax }
+      })
+      bloques.push({
+        plantillaId: plan.plantilla_id,
+        plantillaNombre,
+        lote,
+        prioridad: plan.prioridad ?? 0,
+        orden: ordenPlan,
+        etapas
+      })
+    }
+    ordenPlan++
+  }
+
+  if (bloques.length === 0) return { etapas: [], conflictos: [], duracionTotal: 0 }
+
+  // Mayor prioridad primero; a igual prioridad, respetar orden del plan y el lote
+  bloques.sort((a, b) => (b.prioridad - a.prioridad) || (a.orden - b.orden) || (a.lote - b.lote))
+
+  const scheduled: EtapaScheduled[] = []
+  const conflictos: EtapaScheduled[] = []
+
+  const marcarMaquinasGlobal = (etapa: PlantillaEtapa, recursosProgramados: RecursoProgramado[]) => {
+    for (const rp of recursosProgramados) {
+      const maq = maquinasState.find(m => m.id === rp.maquinaId)
+      const r = getRecursosEfectivos(etapa).find(r => r.maquinaId === rp.maquinaId)
+      if (maq && r) maq.slots.push({ start: rp.inicio, end: rp.fin, usage: r.usoRecurso })
+    }
+  }
+
+  const pushConflictoBloque = (bloque: Bloque, mensaje: (task: EtapaExpandida) => string) => {
+    for (const task of bloque.etapas) {
+      conflictos.push({
+        key: task.key, plantillaId: task.plantillaId, plantillaNombre: task.plantillaNombre,
+        lote: task.lote, etapa: task.etapa,
+        inicio: -1, fin: -1,
+        empleadoId: null, empleadoNombre: null, empleadosAsignados: [], lineaId: null,
+        maquinaId: null, maquinaNombre: null,
+        recursosProgramados: [],
+        conflicto: true,
+        mensajeConflicto: mensaje(task)
+      })
+    }
+  }
+
+  for (const bloque of bloques) {
+    // 0) Separar etapas en prework (deps sueltas) y cadena principal
+    const preworkSet = findPreworkSet(bloque.etapas)
+    const preworkEtapas = bloque.etapas.filter(e => preworkSet.has(e.key))
+    const mainEtapas = bloque.etapas.filter(e => !preworkSet.has(e.key))
+
+    // 0b) Planificar prework greedy contra el estado GLOBAL (lo antes posible en el día)
+    const preworkFinish = new Map<string, number>()
+    if (preworkEtapas.length > 0) {
+      // Ordenar prework respetando tanto dependencyKeys como prerequisitoKeys (dentro del conjunto prework)
+      const orderedPrework = topologicalSort(preworkEtapas, true)
+      const completionTimesPrework: Record<string, number> = {}
+
+      for (const expandida of orderedPrework) {
+        const { key, etapa, dependencyKeys, prerequisitoKeys, horaInicioMin, horaInicioMaxEtapa, horaInicioMaxProceso, horaFinMax } = expandida
+        let earliest = rangoInicio
+        for (const depKey of dependencyKeys) {
+          if (completionTimesPrework[depKey] !== undefined)
+            earliest = Math.max(earliest, completionTimesPrework[depKey])
+        }
+        // Respetar también prerequisitoKeys dentro del prework (e.g. "Preparar ingredientes" antes de "Amasar")
+        for (const preqKey of prerequisitoKeys) {
+          if (completionTimesPrework[preqKey] !== undefined)
+            earliest = Math.max(earliest, completionTimesPrework[preqKey])
+        }
+        if (horaInicioMin != null) earliest = Math.max(earliest, horaInicioMin)
+        let maxInicio = horaFinMax != null ? horaFinMax - etapa.duracion_proceso : Infinity
+        if (horaInicioMaxEtapa != null) maxInicio = Math.min(maxInicio, horaInicioMaxEtapa)
+        if (horaInicioMaxProceso != null && dependencyKeys.length === 0) maxInicio = Math.min(maxInicio, horaInicioMaxProceso)
+
+        const res = findBestSlot(etapa, earliest, rangoFin, empleadosState, maquinasState, maxInicio)
+        if (res) {
+          marcarMaquinasGlobal(etapa, res.recursosProgramados)
+          if (res.empleadoId) {
+            const emp = empleadosState.find(e => e.id === res.empleadoId)!
+            marcarEmpleadoOcupado(emp, res.inicio, res.fin, etapa)
+          }
+          completionTimesPrework[key] = res.fin
+          preworkFinish.set(key, res.fin)
+          const primerRecurso = res.recursosProgramados[0] ?? null
+          scheduled.push({
+            key, plantillaId: bloque.plantillaId, plantillaNombre: bloque.plantillaNombre,
+            lote: bloque.lote, etapa,
+            inicio: res.inicio, fin: res.fin,
+            empleadoId: res.empleadoId, empleadoNombre: res.empleadoNombre,
+            empleadosAsignados: construirAsignados(etapa, res.inicio, res.fin, res.empleadoId, res.empleadoNombre, empleadosState),
+            lineaId: res.lineaId,
+            maquinaId: primerRecurso?.maquinaId ?? null,
+            maquinaNombre: primerRecurso?.maquinaNombre ?? null,
+            recursosProgramados: res.recursosProgramados,
+            conflicto: false
+          })
+        } else {
+          completionTimesPrework[key] = rangoFin + 9999
+          preworkFinish.set(key, rangoFin + 9999)
+          conflictos.push({
+            key, plantillaId: bloque.plantillaId, plantillaNombre: bloque.plantillaNombre,
+            lote: bloque.lote, etapa,
+            inicio: -1, fin: -1,
+            empleadoId: null, empleadoNombre: null, empleadosAsignados: [], lineaId: null,
+            maquinaId: null, maquinaNombre: null, recursosProgramados: [],
+            conflicto: true,
+            mensajeConflicto: `Prework "${etapa.nombre}" no encontró horario libre`
+          })
+        }
+      }
+    }
+
+    // Si no hay etapas principales, el bloque era solo prework → listo
+    if (mainEtapas.length === 0) continue
+
+    // 0c) Calcular blockEarliest: máximo de los fines de prework que bloquean a etapas principales
+    // Se consideran tanto prerequisitoKeys como dependencyKeys de main etapas que apunten a prework
+    let blockEarliest = rangoInicio
+    for (const etapa of mainEtapas) {
+      for (const prereqKey of etapa.prerequisitoKeys) {
+        const finish = preworkFinish.get(prereqKey)
+        if (finish !== undefined && finish < rangoFin + 9999) {
+          blockEarliest = Math.max(blockEarliest, finish)
+        }
+      }
+      // Si una etapa principal depende directamente de una prework (ej. "Sacar Salado" depende de "Amasar" que es prework)
+      for (const depKey of etapa.dependencyKeys) {
+        const finish = preworkFinish.get(depKey)
+        if (finish !== undefined && finish < rangoFin + 9999) {
+          blockEarliest = Math.max(blockEarliest, finish)
+        }
+      }
+    }
+
+    // 1) Layout interno de la cadena principal en aislamiento (estado fresco, desde blockEarliest)
+    const isoEmp: EmpleadoScheduler[] = empleadosState.map(e => ({ ...e, busyIntervals: [], parallelIntervals: [], exclusiveIntervals: [] }))
+    const isoMaq: MaquinaScheduler[] = maquinas.map(m => ({
+      id: m.id, nombre: m.nombre, cantidad: m.cantidad,
+      grupo_id: m.grupo_id ?? null, prioridad_grupo: m.prioridad_grupo ?? 1,
+      slots: []
+    }))
+    const orderedIso = topologicalSort(mainEtapas)
+    const { inicioPorKey, failed } = scheduleStagesGreedy(orderedIso, isoEmp, isoMaq, blockEarliest, rangoFin)
+
+    if (failed.size > 0 || inicioPorKey.size === 0) {
+      console.warn(`[Scheduler] Bloque "${bloque.plantillaNombre}" (lote ${bloque.lote}) no entra ni en aislamiento`)
+      const mainFailed = mainEtapas.map(e => e)
+      for (const task of mainFailed) {
+        conflictos.push({
+          key: task.key, plantillaId: task.plantillaId, plantillaNombre: task.plantillaNombre,
+          lote: task.lote, etapa: task.etapa,
+          inicio: -1, fin: -1,
+          empleadoId: null, empleadoNombre: null, empleadosAsignados: [], lineaId: null,
+          maquinaId: null, maquinaNombre: null, recursosProgramados: [],
+          conflicto: true,
+          mensajeConflicto: `"${task.etapa.nombre}" no entra en el rango horario`
+        })
+      }
+      continue
+    }
+
+    // 2) Construir el bloque-cadena con offsets relativos al inicio del bloque
+    const blockMin = Math.min(...inicioPorKey.values())
+    const tasksOrdenadas = [...mainEtapas]
+      .filter(t => inicioPorKey.has(t.key))
+      .sort((a, b) => inicioPorKey.get(a.key)! - inicioPorKey.get(b.key)!)
+    const offsets = tasksOrdenadas.map(t => inicioPorKey.get(t.key)! - blockMin)
+    const totalDuration = Math.max(...tasksOrdenadas.map((t, i) => offsets[i] + t.etapa.duracion_proceso))
+    const blockChain: ChainGroup = {
+      headKey: tasksOrdenadas[0].key,
+      tasks: tasksOrdenadas,
+      offsets,
+      totalDuration
+    }
+
+    // 3) Ubicar el bloque principal contra el estado global (desde blockEarliest)
+    const resultado = findBestSlotForChain(blockChain, blockEarliest, rangoFin, empleadosState, maquinasState, Infinity)
+
+    if (!resultado) {
+      console.warn(`[Scheduler] Bloque "${bloque.plantillaNombre}" (lote ${bloque.lote}) no encontró horario libre`)
+      pushConflictoBloque({ ...bloque, etapas: mainEtapas }, t => `El proceso "${t.plantillaNombre}" (lote ${t.lote}) no encontró un horario libre sin pisar otros procesos`)
+      continue
+    }
+
+    const inicioBloque = Math.min(...resultado.placements.map(p => p.inicio))
+    console.log(`[Scheduler] ✔ "${bloque.plantillaNombre}" (lote ${bloque.lote}) ubicado en ${minToTimeStr(inicioBloque)}`)
+
+    // 4) Commit: marcar máquinas global (empleados ya marcados en findBestSlotForChain)
+    for (let i = 0; i < tasksOrdenadas.length; i++) {
+      const task = tasksOrdenadas[i]
+      const placement = resultado.placements[i]
+      marcarMaquinasGlobal(task.etapa, placement.recursosProgramados)
+      const primerRecurso = placement.recursosProgramados[0] ?? null
+      scheduled.push({
+        key: task.key, plantillaId: task.plantillaId, plantillaNombre: task.plantillaNombre,
+        lote: task.lote, etapa: task.etapa,
+        inicio: placement.inicio, fin: placement.fin,
+        empleadoId: placement.empleadoId, empleadoNombre: placement.empleadoNombre,
+        empleadosAsignados: construirAsignados(task.etapa, placement.inicio, placement.fin, placement.empleadoId, placement.empleadoNombre, empleadosState),
+        lineaId: placement.lineaId,
+        maquinaId: primerRecurso?.maquinaId ?? null,
+        maquinaNombre: primerRecurso?.maquinaNombre ?? null,
+        recursosProgramados: placement.recursosProgramados,
+        conflicto: false
+      })
+    }
+  }
+
+  const allStarts = scheduled.map(s => s.inicio).filter(t => t >= 0)
+  const allFins = scheduled.map(s => s.fin).filter(t => t >= 0)
+  const duracionTotal = allStarts.length > 0 ? Math.max(...allFins) - Math.min(...allStarts) : 0
+
+  return { etapas: scheduled, conflictos, duracionTotal }
+}
+
+export function minToTimeStr(min: number): string {
+  const h = Math.floor(min / 60)
+  const m = min % 60
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`
+}
+
+export function convertirLegacyAVentanas(etapa: Pick<PlantillaEtapa, 'bloquea_empleado_total' | 'tiempo_empleado_inicio' | 'tiempo_empleado_fin' | 'duracion_proceso'>): VentanaEmpleado[] {
+  if (etapa.bloquea_empleado_total) return [{ desde: 0, hasta: etapa.duracion_proceso }]
+  const w: VentanaEmpleado[] = []
+  if (etapa.tiempo_empleado_inicio > 0) w.push({ desde: 0, hasta: etapa.tiempo_empleado_inicio })
+  if (etapa.tiempo_empleado_fin > 0) w.push({ desde: etapa.duracion_proceso - etapa.tiempo_empleado_fin, hasta: etapa.duracion_proceso })
+  return w
+}

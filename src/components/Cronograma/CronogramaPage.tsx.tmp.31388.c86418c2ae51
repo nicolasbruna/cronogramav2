@@ -1,0 +1,1863 @@
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
+import { Plus, Minus, Maximize2, Copy, Trash2, ChevronLeft, ChevronRight, Lock, Unlock, UserPlus, Undo2, Redo2, List, Save, FolderOpen, Menu, Link, Unlink, ArchiveRestore, Magnet, Users, LogOut, Settings, CalendarClock, LayoutList, Layers, Zap, AlertTriangle } from 'lucide-react'
+import { PlanificarModal } from '../Planificacion/PlanificarModal'
+import { cronogramaService } from '../../services/cronogramaService'
+import { planificacionService } from '../../services/planificacionService'
+import { cronogramaHistorialService } from '../../services/cronogramaHistorialService'
+import { CronogramaLinea, CronogramaTarea, CronogramaVersion, EmpleadoConLineas, DIAS_SEMANA_NOMBRES, ActualizarCronogramaTareaRequest } from '../../types/cronograma'
+import { CronogramaTimeline } from './CronogramaTimeline'
+import { TareaModal } from './TareaModal'
+import { ModalConfirmacionRapida } from '../common/ModalConfirmacionRapida'
+import { ModuloPersonalModal } from '../common/ModuloPersonalModal'
+import { useAuth } from '../../contexts/AuthContext'
+import { getDiaSemanaHoy, timeToMin, minToTime } from './cronogramaHelpers'
+
+interface CronogramaPageProps {
+  onSectionChange?: (section: string) => void
+  onToggleMenu?: () => void
+  onIrAConfiguracion?: () => void
+}
+
+export function CronogramaPage({ onSectionChange, onToggleMenu, onIrAConfiguracion }: CronogramaPageProps) {
+  const { signOut } = useAuth()
+  const [planificarVisible, setPlanificarVisible] = useState(false)
+  const [empleados, setEmpleados] = useState<EmpleadoConLineas[]>([])
+  const [tareas, setTareas] = useState<CronogramaTarea[]>([])
+  const [diaActual, setDiaActual] = useState(() => {
+    const saved = localStorage.getItem('cronograma_dia_actual')
+    return saved !== null ? parseInt(saved, 10) : getDiaSemanaHoy()
+  })
+  const [loading, setLoading] = useState(true)
+  const [zoom, setZoom] = useState(1)
+  const [rowScale, setRowScale] = useState(1)
+  const [rangoInicio, setRangoInicio] = useState('04:00')
+  const [rangoFin, setRangoFin] = useState('15:00')
+  const rangoSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const [tareasSeleccionadas, setTareasSeleccionadasRaw] = useState<string[]>([])
+  const tareaSeleccionada = tareasSeleccionadas.length === 1 ? tareasSeleccionadas[0] : null
+
+  const setTareasSeleccionadas = useCallback((ids: string[]) => {
+    const grupoIds = new Set<string>()
+    ids.forEach(id => {
+      const t = tareas.find(ta => ta.id === id)
+      if (t?.grupo_id) grupoIds.add(t.grupo_id)
+    })
+    if (grupoIds.size === 0) {
+      setTareasSeleccionadasRaw(ids)
+      return
+    }
+    const tareasDeGrupos = tareas
+      .filter(t => t.grupo_id && grupoIds.has(t.grupo_id))
+      .map(t => t.id)
+    setTareasSeleccionadasRaw([...new Set([...ids, ...tareasDeGrupos])])
+  }, [tareas])
+  const [collapsedEmpleados, setCollapsedEmpleados] = useState<string[]>([])
+  const [modalVisible, setModalVisible] = useState(false)
+  const [modalTarea, setModalTarea] = useState<Partial<CronogramaTarea> | null>(null)
+  const [copiarModalVisible, setCopiarModalVisible] = useState(false)
+  const [diaOrigen, setDiaOrigen] = useState(0)
+  const [agregarEmpleadoModalVisible, setAgregarEmpleadoModalVisible] = useState(false)
+  const [puedeDeshacer, setPuedeDeshacer] = useState(false)
+  const [puedeRehacer, setPuedeRehacer] = useState(false)
+  const [undoRedoLoading, setUndoRedoLoading] = useState(false)
+  const [confirmarEliminar, setConfirmarEliminar] = useState<{ tipo: 'tarea' | 'linea'; id: string; nombre: string } | null>(null)
+  const [listadoModalVisible, setListadoModalVisible] = useState(false)
+  const [filtroEmpleado, setFiltroEmpleado] = useState<string>('todos')
+  const [guardarModalVisible, setGuardarModalVisible] = useState(false)
+  const [abrirModalVisible, setAbrirModalVisible] = useState(false)
+  const [versiones, setVersiones] = useState<CronogramaVersion[]>([])
+  const [nombreVersion, setNombreVersion] = useState('')
+  const [notasVersion, setNotasVersion] = useState('')
+  const [versionesLoading, setVersionesLoading] = useState(false)
+  const [snapHorarioOriginal, setSnapHorarioOriginal] = useState(true)
+  const [filtroVersionDia, setFiltroVersionDia] = useState<number | 'todos'>('todos')
+  const [moduloPersonalVisible, setModuloPersonalVisible] = useState(false)
+  const [vistaAgrupacion, setVistaAgrupacion] = useState<'secciones' | 'todos'>('secciones')
+  const [modoInteligente, setModoInteligente] = useState(false)
+  const [maquinasCapacidad, setMaquinasCapacidad] = useState<Map<string, number>>(new Map())
+  const [horariosDia, setHorariosDia] = useState<Map<string, { inicio: number; fin: number }>>(new Map())
+  interface ConflictoModal {
+    tareaId: string
+    nuevaHoraInicio: string
+    nuevaHoraFin: string
+    nuevaLineaId: string
+    tareasConflicto: CronogramaTarea[]
+    motivos: string[]
+  }
+  const [conflictoModal, setConflictoModal] = useState<ConflictoModal | null>(null)
+
+  const cargarDatos = useCallback(async () => {
+    try {
+      setLoading(true)
+      const [emps, tars] = await Promise.all([
+        cronogramaService.listarEmpleadosConLineas(diaActual),
+        cronogramaService.listarTareas(diaActual)
+      ])
+      setEmpleados(emps)
+      setTareas(tars)
+    } catch (err) {
+      console.error('Error cargando cronograma:', err)
+    } finally {
+      setLoading(false)
+    }
+  }, [diaActual])
+
+  const actualizarEstadoHistorial = useCallback(async () => {
+    try {
+      const estado = await cronogramaHistorialService.obtenerEstado(diaActual)
+      setPuedeDeshacer(estado.puedeDeshacer)
+      setPuedeRehacer(estado.puedeRehacer)
+    } catch (err) {
+      console.error('Error obteniendo estado historial:', err)
+    }
+  }, [diaActual])
+
+  const historialQueueRef = useRef<Promise<void>>(Promise.resolve())
+
+  const obtenerLineasActuales = useCallback((): CronogramaLinea[] => {
+    return empleados.flatMap(e => e.lineas)
+  }, [empleados])
+
+  const registrarEnHistorial = useCallback((tareasActuales: CronogramaTarea[], descripcion: string, lineasActuales?: CronogramaLinea[]) => {
+    const lineas = lineasActuales ?? obtenerLineasActuales()
+    historialQueueRef.current = historialQueueRef.current
+      .then(() => cronogramaHistorialService.registrarAccion(diaActual, tareasActuales, descripcion, lineas))
+      .then(() => actualizarEstadoHistorial())
+      .catch(err => console.error('Error registrando en historial:', err))
+  }, [diaActual, actualizarEstadoHistorial, obtenerLineasActuales])
+
+  const aplicarSnapshot = useCallback((snapshot: { tareas: CronogramaTarea[]; lineas: CronogramaLinea[] | null }) => {
+    setTareas(snapshot.tareas)
+    if (snapshot.lineas) {
+      setEmpleados(prev => {
+        const lineasPorEmpleado = new Map<string, CronogramaLinea[]>()
+        for (const linea of snapshot.lineas!) {
+          const arr = lineasPorEmpleado.get(linea.empleado_id) || []
+          arr.push(linea)
+          lineasPorEmpleado.set(linea.empleado_id, arr)
+        }
+        return prev.map(emp => ({
+          ...emp,
+          lineas: lineasPorEmpleado.get(emp.id) || []
+        }))
+      })
+    }
+  }, [])
+
+  const handleDeshacer = useCallback(async () => {
+    if (!puedeDeshacer || undoRedoLoading) return
+    setUndoRedoLoading(true)
+    try {
+      const snapshot = await cronogramaHistorialService.deshacer(diaActual)
+      if (snapshot) {
+        aplicarSnapshot(snapshot)
+        cronogramaHistorialService.restaurarSnapshot(diaActual, snapshot).catch(err => {
+          console.error('Error restaurando snapshot en BD:', err)
+          cargarDatos()
+        })
+      }
+      actualizarEstadoHistorial()
+    } catch (err) {
+      console.error('Error deshaciendo:', err)
+      await cargarDatos()
+    } finally {
+      setUndoRedoLoading(false)
+    }
+  }, [puedeDeshacer, undoRedoLoading, diaActual, actualizarEstadoHistorial, aplicarSnapshot, cargarDatos])
+
+  const handleRehacer = useCallback(async () => {
+    if (!puedeRehacer || undoRedoLoading) return
+    setUndoRedoLoading(true)
+    try {
+      const snapshot = await cronogramaHistorialService.rehacer(diaActual)
+      if (snapshot) {
+        aplicarSnapshot(snapshot)
+        cronogramaHistorialService.restaurarSnapshot(diaActual, snapshot).catch(err => {
+          console.error('Error restaurando snapshot en BD:', err)
+          cargarDatos()
+        })
+      }
+      actualizarEstadoHistorial()
+    } catch (err) {
+      console.error('Error rehaciendo:', err)
+      await cargarDatos()
+    } finally {
+      setUndoRedoLoading(false)
+    }
+  }, [puedeRehacer, undoRedoLoading, diaActual, actualizarEstadoHistorial, aplicarSnapshot, cargarDatos])
+
+  useEffect(() => { cargarDatos() }, [cargarDatos])
+  useEffect(() => { actualizarEstadoHistorial() }, [actualizarEstadoHistorial])
+
+  // Capacidad de máquinas (para validación de conflictos en modo Inteligente)
+  useEffect(() => {
+    let cancelled = false
+    planificacionService.listarMaquinas()
+      .then(ms => { if (!cancelled) setMaquinasCapacidad(new Map(ms.map(m => [m.id, m.cantidad]))) })
+      .catch(err => console.error('Error cargando capacidad de máquinas:', err))
+    return () => { cancelled = true }
+  }, [])
+
+  // Horarios de empleados del día actual (para validación de conflictos)
+  useEffect(() => {
+    let cancelled = false
+    planificacionService.listarTodosHorariosEmpleados()
+      .then(hs => {
+        if (cancelled) return
+        const map = new Map<string, { inicio: number; fin: number }>()
+        for (const h of hs) {
+          if (h.dia_semana !== diaActual) continue
+          map.set(h.empleado_id, { inicio: timeToMin(h.hora_inicio), fin: timeToMin(h.hora_fin) })
+        }
+        setHorariosDia(map)
+      })
+      .catch(err => console.error('Error cargando horarios de empleados:', err))
+    return () => { cancelled = true }
+  }, [diaActual])
+
+  useEffect(() => {
+    let cancelled = false
+    const cargarRango = async () => {
+      try {
+        const rango = await cronogramaService.obtenerRangoHorario(diaActual)
+        if (cancelled) return
+        if (rango) {
+          setRangoInicio(rango.hora_inicio)
+          setRangoFin(rango.hora_fin)
+        } else {
+          setRangoInicio('04:00')
+          setRangoFin('15:00')
+        }
+      } catch (err) {
+        console.error('Error cargando rango horario:', err)
+      }
+    }
+    cargarRango()
+    return () => { cancelled = true }
+  }, [diaActual])
+
+  const guardarRangoEnBD = useCallback((inicio: string, fin: string) => {
+    if (rangoSaveTimerRef.current) clearTimeout(rangoSaveTimerRef.current)
+    rangoSaveTimerRef.current = setTimeout(() => {
+      cronogramaService.guardarRangoHorario(diaActual, inicio, fin).catch(err =>
+        console.error('Error guardando rango horario:', err)
+      )
+    }, 800)
+  }, [diaActual])
+
+  const handleCrearTarea = useCallback((lineaId: string, horaInicio: string, horaFin: string) => {
+    setModalTarea({
+      linea_id: lineaId,
+      hora_inicio: horaInicio,
+      hora_fin: horaFin,
+      dia_semana: diaActual,
+      descripcion: '',
+      color: null,
+      bloqueada: false
+    })
+    setModalVisible(true)
+  }, [diaActual])
+
+  const handleDobleClickTarea = useCallback((tarea: CronogramaTarea) => {
+    setModalTarea(tarea)
+    setModalVisible(true)
+  }, [])
+
+  const handleGuardarModal = useCallback(async (data: {
+    linea_id: string; hora_inicio: string; hora_fin: string; descripcion: string; color: string | null; bloqueada: boolean; tamano_texto: string; orientacion_texto: string
+  }) => {
+    try {
+      const esNueva = !modalTarea?.id
+      if (modalTarea?.id) {
+        await cronogramaService.actualizarTarea(modalTarea.id, data)
+      } else {
+        await cronogramaService.crearTarea({ ...data, dia_semana: diaActual })
+      }
+      setModalVisible(false)
+      setModalTarea(null)
+      const tareasActualizadas = await cronogramaService.listarTareas(diaActual)
+      setTareas(tareasActualizadas)
+      setEmpleados(await cronogramaService.listarEmpleadosConLineas(diaActual))
+      await registrarEnHistorial(tareasActualizadas, esNueva ? `Crear tarea "${data.descripcion}"` : `Editar tarea "${data.descripcion}"`)
+    } catch (err) {
+      console.error('Error guardando tarea:', err)
+    }
+  }, [modalTarea, diaActual, registrarEnHistorial])
+
+  const handleEliminarModal = useCallback(() => {
+    if (!modalTarea?.id) return
+    setConfirmarEliminar({ tipo: 'tarea', id: modalTarea.id, nombre: modalTarea.descripcion || 'tarea' })
+  }, [modalTarea])
+
+  const handleMoverTarea = useCallback(async (tareaId: string, nuevaHoraInicio: string, nuevaHoraFin: string, nuevaLineaId?: string) => {
+    try {
+      const tarea = tareas.find(t => t.id === tareaId)
+      const delta = tarea ? timeToMin(nuevaHoraInicio) - timeToMin(tarea.hora_inicio) : 0
+      const recursosDesplazados = (tarea?.recursos_programados && delta !== 0)
+        ? tarea.recursos_programados.map(r => ({
+            ...r,
+            hora_inicio: minToTime(timeToMin(r.hora_inicio) + delta),
+            hora_fin: minToTime(timeToMin(r.hora_fin) + delta)
+          }))
+        : tarea?.recursos_programados
+      const tareasOptimistas = tareas.map(t =>
+        t.id === tareaId
+          ? { ...t, hora_inicio: nuevaHoraInicio, hora_fin: nuevaHoraFin, recursos_programados: recursosDesplazados ?? t.recursos_programados, ...(nuevaLineaId ? { linea_id: nuevaLineaId } : {}) }
+          : t
+      )
+      setTareas(tareasOptimistas)
+
+      const update: ActualizarCronogramaTareaRequest = { hora_inicio: nuevaHoraInicio, hora_fin: nuevaHoraFin }
+      if (nuevaLineaId) update.linea_id = nuevaLineaId
+      if (recursosDesplazados && delta !== 0) update.recursos_programados = recursosDesplazados
+      await cronogramaService.actualizarTarea(tareaId, update)
+      registrarEnHistorial(tareasOptimistas, `Mover tarea "${tarea?.descripcion || ''}"`)
+    } catch (err) {
+      console.error('Error moviendo tarea:', err)
+      await cargarDatos()
+    }
+  }, [tareas, registrarEnHistorial, cargarDatos])
+
+  const handleMoverMultiTareas = useCallback(async (movimientos: { tareaId: string; nuevaHoraInicio: string; nuevaHoraFin: string; nuevaLineaId?: string }[]) => {
+    try {
+      let tareasOptimistas = [...tareas]
+      for (const mov of movimientos) {
+        tareasOptimistas = tareasOptimistas.map(t =>
+          t.id === mov.tareaId
+            ? { ...t, hora_inicio: mov.nuevaHoraInicio, hora_fin: mov.nuevaHoraFin, ...(mov.nuevaLineaId ? { linea_id: mov.nuevaLineaId } : {}) }
+            : t
+        )
+      }
+      setTareas(tareasOptimistas)
+
+      await Promise.all(movimientos.map(mov => {
+        const update: Record<string, string> = { hora_inicio: mov.nuevaHoraInicio, hora_fin: mov.nuevaHoraFin }
+        if (mov.nuevaLineaId) update.linea_id = mov.nuevaLineaId
+        return cronogramaService.actualizarTarea(mov.tareaId, update)
+      }))
+      registrarEnHistorial(tareasOptimistas, `Mover ${movimientos.length} tareas`)
+    } catch (err) {
+      console.error('Error moviendo múltiples tareas:', err)
+      await cargarDatos()
+    }
+  }, [tareas, registrarEnHistorial, cargarDatos])
+
+  const handleResizeTarea = useCallback(async (tareaId: string, nuevaHoraInicio: string, nuevaHoraFin: string) => {
+    try {
+      const tarea = tareas.find(t => t.id === tareaId)
+      const tareasOptimistas = tareas.map(t =>
+        t.id === tareaId ? { ...t, hora_inicio: nuevaHoraInicio, hora_fin: nuevaHoraFin } : t
+      )
+      setTareas(tareasOptimistas)
+
+      await cronogramaService.actualizarTarea(tareaId, { hora_inicio: nuevaHoraInicio, hora_fin: nuevaHoraFin })
+      registrarEnHistorial(tareasOptimistas, `Redimensionar tarea "${tarea?.descripcion || ''}"`)
+    } catch (err) {
+      console.error('Error redimensionando tarea:', err)
+      await cargarDatos()
+    }
+  }, [tareas, registrarEnHistorial, cargarDatos])
+
+  const handleToggleCollapse = useCallback((empId: string) => {
+    setCollapsedEmpleados(prev =>
+      prev.includes(empId) ? prev.filter(id => id !== empId) : [...prev, empId]
+    )
+  }, [])
+
+  const handleEliminarSeleccionada = useCallback(() => {
+    if (!tareaSeleccionada) return
+    const tarea = tareas.find(t => t.id === tareaSeleccionada)
+    if (!tarea || tarea.bloqueada) return
+    setConfirmarEliminar({ tipo: 'tarea', id: tareaSeleccionada, nombre: tarea.descripcion || 'tarea' })
+  }, [tareaSeleccionada, tareas])
+
+  const handleToggleBloqueo = useCallback(async () => {
+    if (!tareaSeleccionada) return
+    const tarea = tareas.find(t => t.id === tareaSeleccionada)
+    if (!tarea) return
+    try {
+      const tareasOptimistas = tareas.map(t =>
+        t.id === tareaSeleccionada ? { ...t, bloqueada: !t.bloqueada } : t
+      )
+      setTareas(tareasOptimistas)
+
+      await cronogramaService.actualizarTarea(tareaSeleccionada, { bloqueada: !tarea.bloqueada })
+      registrarEnHistorial(tareasOptimistas, `${tarea.bloqueada ? 'Desbloquear' : 'Bloquear'} tarea "${tarea.descripcion}"`)
+    } catch (err) {
+      console.error('Error bloqueando:', err)
+      await cargarDatos()
+    }
+  }, [tareaSeleccionada, tareas, registrarEnHistorial, cargarDatos])
+
+  const handleAgruparTareas = useCallback(async () => {
+    if (tareasSeleccionadas.length < 2) return
+    try {
+      const grupoId = await cronogramaService.agruparTareas(tareasSeleccionadas)
+      const tareasOptimistas = tareas.map(t =>
+        tareasSeleccionadas.includes(t.id) ? { ...t, grupo_id: grupoId } : t
+      )
+      setTareas(tareasOptimistas)
+      registrarEnHistorial(tareasOptimistas, `Agrupar ${tareasSeleccionadas.length} tareas`)
+    } catch (err) {
+      console.error('Error agrupando:', err)
+      await cargarDatos()
+    }
+  }, [tareasSeleccionadas, tareas, registrarEnHistorial, cargarDatos])
+
+  const handleDesagruparTareas = useCallback(async () => {
+    if (tareasSeleccionadas.length === 0) return
+    const tareasConGrupo = tareas.filter(t => tareasSeleccionadas.includes(t.id) && t.grupo_id)
+    const gruposUnicos = [...new Set(tareasConGrupo.map(t => t.grupo_id!))]
+    if (gruposUnicos.length === 0) return
+    try {
+      await Promise.all(gruposUnicos.map(gid => cronogramaService.desagruparTareas(gid)))
+      const tareasOptimistas = tareas.map(t =>
+        gruposUnicos.includes(t.grupo_id!) ? { ...t, grupo_id: null } : t
+      )
+      setTareas(tareasOptimistas)
+      registrarEnHistorial(tareasOptimistas, `Desagrupar tareas`)
+    } catch (err) {
+      console.error('Error desagrupando:', err)
+      await cargarDatos()
+    }
+  }, [tareasSeleccionadas, tareas, registrarEnHistorial, cargarDatos])
+
+  const handleCambiarTamano = useCallback(async (ids: string[], delta: number) => {
+    if (ids.length === 0) return
+    const movimientos = tareas
+      .filter(t => ids.includes(t.id))
+      .map(t => {
+        const tamanoActual = t.tamano ?? 5
+        const filaActual = t.fila ?? 0
+        const nuevoTamano = Math.max(1, Math.min(5, tamanoActual + delta))
+        // Al achicar (delta < 0), mover fila hacia abajo
+        let nuevaFila = filaActual
+        if (delta < 0) {
+          nuevaFila = Math.min(5 - nuevoTamano, filaActual + (tamanoActual - nuevoTamano))
+        }
+        // Al agrandar, ajustar fila si se desborda
+        if (delta > 0) {
+          nuevaFila = Math.min(nuevaFila, 5 - nuevoTamano)
+        }
+        return { id: t.id, nuevoTamano, nuevaFila }
+      })
+      .filter(m => {
+        const t = tareas.find(ta => ta.id === m.id)
+        return m.nuevoTamano !== (t?.tamano ?? 5) || m.nuevaFila !== (t?.fila ?? 0)
+      })
+    if (movimientos.length === 0) return
+    try {
+      const tareasOptimistas = tareas.map(t => {
+        const mov = movimientos.find(m => m.id === t.id)
+        return mov ? { ...t, tamano: mov.nuevoTamano, fila: mov.nuevaFila } : t
+      })
+      setTareas(tareasOptimistas)
+      await Promise.all(movimientos.map(m =>
+        cronogramaService.actualizarTarea(m.id, { tamano: m.nuevoTamano, fila: m.nuevaFila })
+      ))
+      registrarEnHistorial(tareasOptimistas, `Cambiar tamano ${movimientos.length} tarea(s)`)
+    } catch (err) {
+      console.error('Error cambiando tamano:', err)
+      await cargarDatos()
+    }
+  }, [tareas, registrarEnHistorial, cargarDatos])
+
+  const handleCambiarFila = useCallback(async (ids: string[], delta: number) => {
+    if (ids.length === 0) return
+    const movimientos = tareas
+      .filter(t => ids.includes(t.id))
+      .map(t => {
+        const tamano = t.tamano ?? 5
+        const maxFila = 5 - tamano
+        return { id: t.id, nuevaFila: Math.max(0, Math.min(maxFila, (t.fila ?? 0) + delta)) }
+      })
+      .filter(m => {
+        const t = tareas.find(ta => ta.id === m.id)
+        return m.nuevaFila !== (t?.fila ?? 0)
+      })
+    if (movimientos.length === 0) return
+    try {
+      const tareasOptimistas = tareas.map(t => {
+        const mov = movimientos.find(m => m.id === t.id)
+        return mov ? { ...t, fila: mov.nuevaFila } : t
+      })
+      setTareas(tareasOptimistas)
+      await Promise.all(movimientos.map(m =>
+        cronogramaService.actualizarTarea(m.id, { fila: m.nuevaFila })
+      ))
+      registrarEnHistorial(tareasOptimistas, `Mover fila ${movimientos.length} tarea(s)`)
+    } catch (err) {
+      console.error('Error cambiando fila:', err)
+      await cargarDatos()
+    }
+  }, [tareas, registrarEnHistorial, cargarDatos])
+
+  const handleMoverConConflicto = useCallback((tareaId: string, nuevaHoraInicio: string, nuevaHoraFin: string, nuevaLineaId: string, tareasConflicto: CronogramaTarea[], motivos: string[]) => {
+    setConflictoModal({ tareaId, nuevaHoraInicio, nuevaHoraFin, nuevaLineaId, tareasConflicto, motivos })
+  }, [])
+
+  const handleDesplazarConflicto = useCallback(async () => {
+    if (!conflictoModal) return
+    const { tareaId, nuevaHoraInicio, nuevaHoraFin, nuevaLineaId, tareasConflicto } = conflictoModal
+    setConflictoModal(null)
+    const tarea = tareas.find(t => t.id === tareaId)
+    const nuevaLineaFinal = nuevaLineaId !== tarea?.linea_id ? nuevaLineaId : undefined
+    const newEndMin = timeToMin(nuevaHoraFin)
+    const movimientos: { tareaId: string; nuevaHoraInicio: string; nuevaHoraFin: string; nuevaLineaId?: string }[] = [
+      { tareaId, nuevaHoraInicio, nuevaHoraFin, nuevaLineaId: nuevaLineaFinal },
+      ...tareasConflicto
+        .filter(t => !t.bloqueada)
+        .map(t => {
+          const dur = timeToMin(t.hora_fin) - timeToMin(t.hora_inicio)
+          return { tareaId: t.id, nuevaHoraInicio: minToTime(newEndMin), nuevaHoraFin: minToTime(newEndMin + dur) }
+        })
+    ]
+    try {
+      let tareasOptimistas = [...tareas]
+      for (const mov of movimientos) {
+        tareasOptimistas = tareasOptimistas.map(t =>
+          t.id === mov.tareaId
+            ? { ...t, hora_inicio: mov.nuevaHoraInicio, hora_fin: mov.nuevaHoraFin, ...(mov.nuevaLineaId ? { linea_id: mov.nuevaLineaId } : {}) }
+            : t
+        )
+      }
+      setTareas(tareasOptimistas)
+      await Promise.all(movimientos.map(mov => {
+        const update: Record<string, string> = { hora_inicio: mov.nuevaHoraInicio, hora_fin: mov.nuevaHoraFin }
+        if (mov.nuevaLineaId) update.linea_id = mov.nuevaLineaId
+        return cronogramaService.actualizarTarea(mov.tareaId, update)
+      }))
+      registrarEnHistorial(tareasOptimistas, `Mover tarea y desplazar conflictos`)
+    } catch (err) {
+      console.error('Error desplazando conflictos:', err)
+      await cargarDatos()
+    }
+  }, [conflictoModal, tareas, registrarEnHistorial, cargarDatos])
+
+  const handleForzarConflicto = useCallback(async () => {
+    if (!conflictoModal) return
+    const { tareaId, nuevaHoraInicio, nuevaHoraFin, nuevaLineaId } = conflictoModal
+    setConflictoModal(null)
+    const tarea = tareas.find(t => t.id === tareaId)
+    const nuevaLineaFinal = nuevaLineaId !== tarea?.linea_id ? nuevaLineaId : undefined
+    await handleMoverTarea(tareaId, nuevaHoraInicio, nuevaHoraFin, nuevaLineaFinal)
+  }, [conflictoModal, tareas, handleMoverTarea])
+
+  const handleLiberarTodas = useCallback(async () => {
+    const bloqueadas = tareas.filter(t => t.bloqueada)
+    if (bloqueadas.length === 0) return
+    try {
+      const tareasOptimistas = tareas.map(t => ({ ...t, bloqueada: false }))
+      setTareas(tareasOptimistas)
+      await Promise.all(bloqueadas.map(t => cronogramaService.actualizarTarea(t.id, { bloqueada: false })))
+      registrarEnHistorial(tareasOptimistas, `Liberar todas las tareas (${bloqueadas.length})`)
+    } catch (err) {
+      console.error('Error liberando tareas:', err)
+      await cargarDatos()
+    }
+  }, [tareas, registrarEnHistorial, cargarDatos])
+
+  const handleBloquearDesdeMenu = useCallback(async (ids: string[]) => {
+    if (ids.length === 0) return
+    try {
+      const tareasOptimistas = tareas.map(t =>
+        ids.includes(t.id) ? { ...t, bloqueada: !t.bloqueada } : t
+      )
+      setTareas(tareasOptimistas)
+      await Promise.all(ids.map(id => {
+        const t = tareas.find(ta => ta.id === id)
+        return cronogramaService.actualizarTarea(id, { bloqueada: !(t?.bloqueada) })
+      }))
+      registrarEnHistorial(tareasOptimistas, `Bloquear/Desbloquear ${ids.length} tarea(s)`)
+    } catch (err) {
+      console.error('Error bloqueando:', err)
+      await cargarDatos()
+    }
+  }, [tareas, registrarEnHistorial, cargarDatos])
+
+  const handleAgruparDesdeMenu = useCallback(async (ids: string[]) => {
+    if (ids.length < 2) return
+    try {
+      const grupoId = await cronogramaService.agruparTareas(ids)
+      const tareasOptimistas = tareas.map(t =>
+        ids.includes(t.id) ? { ...t, grupo_id: grupoId } : t
+      )
+      setTareas(tareasOptimistas)
+      registrarEnHistorial(tareasOptimistas, `Agrupar ${ids.length} tareas`)
+    } catch (err) {
+      console.error('Error agrupando:', err)
+      await cargarDatos()
+    }
+  }, [tareas, registrarEnHistorial, cargarDatos])
+
+  const handleDesagruparDesdeMenu = useCallback(async (ids: string[]) => {
+    if (ids.length === 0) return
+    const tareasConGrupo = tareas.filter(t => ids.includes(t.id) && t.grupo_id)
+    const gruposUnicos = [...new Set(tareasConGrupo.map(t => t.grupo_id!))]
+    if (gruposUnicos.length === 0) return
+    try {
+      await Promise.all(gruposUnicos.map(gid => cronogramaService.desagruparTareas(gid)))
+      const tareasOptimistas = tareas.map(t =>
+        gruposUnicos.includes(t.grupo_id!) ? { ...t, grupo_id: null } : t
+      )
+      setTareas(tareasOptimistas)
+      registrarEnHistorial(tareasOptimistas, `Desagrupar tareas`)
+    } catch (err) {
+      console.error('Error desagrupando:', err)
+      await cargarDatos()
+    }
+  }, [tareas, registrarEnHistorial, cargarDatos])
+
+  const handleCopiarDia = useCallback(async () => {
+    try {
+      const count = await cronogramaService.copiarTareasDesde(diaOrigen, diaActual)
+      setCopiarModalVisible(false)
+      if (count > 0) {
+        const tareasActualizadas = await cronogramaService.listarTareas(diaActual)
+        setTareas(tareasActualizadas)
+        setEmpleados(await cronogramaService.listarEmpleadosConLineas(diaActual))
+        await registrarEnHistorial(tareasActualizadas, `Copiar ${count} tareas desde ${DIAS_SEMANA_NOMBRES[diaOrigen]}`)
+      }
+      alert(`Se copiaron ${count} tareas.`)
+    } catch (err) {
+      console.error('Error copiando:', err)
+      alert('Error al copiar tareas')
+    }
+  }, [diaOrigen, diaActual, registrarEnHistorial])
+
+  const handleAgregarLinea = useCallback(async (empleadoId: string) => {
+    const nombre = prompt('Nombre de la línea:', 'Línea nueva')
+    if (!nombre?.trim()) return
+    try {
+      const emp = empleados.find(e => e.id === empleadoId)
+      await cronogramaService.crearLinea({
+        empleado_id: empleadoId,
+        nombre: nombre.trim(),
+        dia_semana: diaActual,
+        orden: emp?.lineas.length || 0
+      })
+      const [emps, tars] = await Promise.all([
+        cronogramaService.listarEmpleadosConLineas(diaActual),
+        cronogramaService.listarTareas(diaActual)
+      ])
+      setEmpleados(emps)
+      setTareas(tars)
+      registrarEnHistorial(tars, `Crear línea "${nombre.trim()}"`, emps.flatMap(e => e.lineas))
+    } catch (err) {
+      console.error('Error creando línea:', err)
+    }
+  }, [empleados, diaActual, registrarEnHistorial])
+
+  const handleRenombrarLinea = useCallback(async (lineaId: string, nuevoNombre: string) => {
+    try {
+      await cronogramaService.actualizarLinea(lineaId, { nombre: nuevoNombre })
+      const [emps, tars] = await Promise.all([
+        cronogramaService.listarEmpleadosConLineas(diaActual),
+        cronogramaService.listarTareas(diaActual)
+      ])
+      setEmpleados(emps)
+      setTareas(tars)
+      registrarEnHistorial(tars, `Renombrar línea a "${nuevoNombre}"`, emps.flatMap(e => e.lineas))
+    } catch (err) {
+      console.error('Error renombrando línea:', err)
+    }
+  }, [diaActual, registrarEnHistorial])
+
+  const handleMoverLinea = useCallback(async (empleadoId: string, lineaId: string, direccion: 'up' | 'down') => {
+    const emp = empleados.find(e => e.id === empleadoId)
+    if (!emp) return
+    const idx = emp.lineas.findIndex(l => l.id === lineaId)
+    if (idx < 0) return
+    const swapIdx = direccion === 'up' ? idx - 1 : idx + 1
+    if (swapIdx < 0 || swapIdx >= emp.lineas.length) return
+
+    const nuevasLineas = [...emp.lineas]
+    const temp = nuevasLineas[idx]
+    nuevasLineas[idx] = nuevasLineas[swapIdx]
+    nuevasLineas[swapIdx] = temp
+
+    const ordenadas = nuevasLineas.map((l, i) => ({ id: l.id, orden: i }))
+
+    const empsOptimistas = empleados.map(e =>
+      e.id === empleadoId ? { ...e, lineas: nuevasLineas.map((l, i) => ({ ...l, orden: i })) } : e
+    )
+    setEmpleados(empsOptimistas)
+
+    try {
+      await cronogramaService.reordenarLineas(ordenadas)
+      registrarEnHistorial(tareas, `Mover línea ${direccion === 'up' ? 'arriba' : 'abajo'}`, empsOptimistas.flatMap(e => e.lineas))
+    } catch (err) {
+      console.error('Error reordenando líneas:', err)
+      await cargarDatos()
+    }
+  }, [empleados, tareas, cargarDatos, registrarEnHistorial])
+
+  const handleEliminarLinea = useCallback((lineaId: string) => {
+    setConfirmarEliminar({ tipo: 'linea', id: lineaId, nombre: 'línea' })
+  }, [])
+
+  const ejecutarEliminacion = useCallback(async () => {
+    if (!confirmarEliminar) return
+    const { tipo, id, nombre } = confirmarEliminar
+    setConfirmarEliminar(null)
+
+    try {
+      if (tipo === 'tarea') {
+        const esDesdeModal = modalTarea?.id === id
+        await cronogramaService.eliminarTarea(id)
+        if (esDesdeModal) {
+          setModalVisible(false)
+          setModalTarea(null)
+        }
+        setTareasSeleccionadasRaw(prev => prev.filter(tid => tid !== id))
+        const tareasActualizadas = await cronogramaService.listarTareas(diaActual)
+        setTareas(tareasActualizadas)
+        setEmpleados(await cronogramaService.listarEmpleadosConLineas(diaActual))
+        registrarEnHistorial(tareasActualizadas, `Eliminar tarea "${nombre}"`)
+      } else {
+        await cronogramaService.eliminarLinea(id)
+        const tareasActualizadas = await cronogramaService.listarTareas(diaActual)
+        setTareas(tareasActualizadas)
+        setEmpleados(await cronogramaService.listarEmpleadosConLineas(diaActual))
+        registrarEnHistorial(tareasActualizadas, 'Eliminar línea')
+      }
+    } catch (err) {
+      console.error('Error eliminando:', err)
+    }
+  }, [confirmarEliminar, modalTarea, diaActual, registrarEnHistorial])
+
+  const handleAgregarEmpleadoAlCronograma = useCallback(async (empleadoId: string) => {
+    const nombre = prompt('Nombre de la primera línea para este empleado:', 'General')
+    if (!nombre?.trim()) return
+    try {
+      await cronogramaService.crearLinea({
+        empleado_id: empleadoId,
+        nombre: nombre.trim(),
+        dia_semana: diaActual,
+        orden: 0
+      })
+      setAgregarEmpleadoModalVisible(false)
+      const [emps, tars] = await Promise.all([
+        cronogramaService.listarEmpleadosConLineas(diaActual),
+        cronogramaService.listarTareas(diaActual)
+      ])
+      setEmpleados(emps)
+      setTareas(tars)
+      registrarEnHistorial(tars, `Agregar empleado al cronograma`, emps.flatMap(e => e.lineas))
+    } catch (err) {
+      console.error('Error agregando empleado al cronograma:', err)
+    }
+  }, [diaActual, registrarEnHistorial])
+
+  const empleadosSinLineas = empleados.filter(e => e.lineas.length === 0)
+
+  const zoomStep = (dir: 1 | -1) => setZoom(z => Math.max(0.2, Math.min(10, +(z + dir * 0.1).toFixed(1))))
+  const rowScaleBy = (factor: number) => setRowScale(s => Math.max(0.5, Math.min(3, s * factor)))
+
+  const fitZoom = () => {
+    const wrapWidth = document.querySelector('.cronograma-wrap')?.clientWidth || 800
+    const available = wrapWidth - 200 - 16
+    const totalMinutes = Math.max(30, (parseInt(rangoFin.split(':')[0]) * 60 + parseInt(rangoFin.split(':')[1])) - (parseInt(rangoInicio.split(':')[0]) * 60 + parseInt(rangoInicio.split(':')[1])))
+    setZoom(Math.max(0.2, (available / totalMinutes) / 5))
+  }
+
+  const handleGuardarVersion = useCallback(async () => {
+    if (!nombreVersion.trim()) return
+    try {
+      await cronogramaService.guardarVersion(diaActual, nombreVersion.trim(), notasVersion.trim(), '')
+      setGuardarModalVisible(false)
+      setNombreVersion('')
+      setNotasVersion('')
+    } catch (err) {
+      console.error('Error guardando version:', err)
+      alert('Error al guardar la versión')
+    }
+  }, [diaActual, nombreVersion, notasVersion])
+
+  const handleAbrirVersiones = useCallback(async () => {
+    setAbrirModalVisible(true)
+    setVersionesLoading(true)
+    try {
+      const v = await cronogramaService.listarVersiones()
+      setVersiones(v)
+    } catch (err) {
+      console.error('Error cargando versiones:', err)
+    } finally {
+      setVersionesLoading(false)
+    }
+  }, [])
+
+  const handleCargarVersion = useCallback(async (versionId: string) => {
+    if (!confirm('Esto reemplazará todo el cronograma del día actual. ¿Continuar?')) return
+    try {
+      await cronogramaService.cargarVersion(versionId, diaActual)
+      setAbrirModalVisible(false)
+      await cargarDatos()
+    } catch (err) {
+      console.error('Error cargando version:', err)
+      alert('Error al cargar la versión')
+    }
+  }, [diaActual, cargarDatos])
+
+  const handleEliminarVersion = useCallback(async (versionId: string) => {
+    if (!confirm('¿Eliminar esta versión guardada?')) return
+    try {
+      await cronogramaService.eliminarVersion(versionId)
+      setVersiones(prev => prev.filter(v => v.id !== versionId))
+    } catch (err) {
+      console.error('Error eliminando version:', err)
+    }
+  }, [])
+
+  const handleEliminarCronogramaCompleto = useCallback(async () => {
+    if (!confirm(`¿Eliminar TODO el cronograma del ${DIAS_SEMANA_NOMBRES[diaActual]}? Se guardará un backup en la papelera.`)) return
+    try {
+      await cronogramaService.eliminarCronogramaCompleto(diaActual, '')
+      const tareasActualizadas = await cronogramaService.listarTareas(diaActual)
+      setTareas(tareasActualizadas)
+      setEmpleados(await cronogramaService.listarEmpleadosConLineas(diaActual))
+      registrarEnHistorial(tareasActualizadas, `Eliminar cronograma completo - ${DIAS_SEMANA_NOMBRES[diaActual]}`)
+    } catch (err) {
+      console.error('Error eliminando cronograma:', err)
+      alert('Error al eliminar el cronograma')
+    }
+  }, [diaActual, registrarEnHistorial])
+
+  const [papeleraVisible, setPapeleraVisible] = useState(false)
+  const [versionesEliminadas, setVersionesEliminadas] = useState<CronogramaVersion[]>([])
+  const [papeleraLoading, setPapeleraLoading] = useState(false)
+
+  const handleAbrirPapelera = useCallback(async () => {
+    setPapeleraVisible(true)
+    setPapeleraLoading(true)
+    try {
+      const v = await cronogramaService.listarVersionesEliminadas()
+      setVersionesEliminadas(v)
+    } catch (err) {
+      console.error('Error cargando papelera:', err)
+    } finally {
+      setPapeleraLoading(false)
+    }
+  }, [])
+
+  const handleRestaurarVersion = useCallback(async (versionId: string) => {
+    if (!confirm('¿Restaurar esta versión? Reemplazará el cronograma actual del día correspondiente.')) return
+    try {
+      await cronogramaService.restaurarVersion(versionId)
+      const version = versionesEliminadas.find(v => v.id === versionId)
+      if (version) {
+        await cronogramaService.cargarVersion(versionId, version.dia_semana)
+        if (version.dia_semana === diaActual) {
+          const tareasActualizadas = await cronogramaService.listarTareas(diaActual)
+          setTareas(tareasActualizadas)
+          setEmpleados(await cronogramaService.listarEmpleadosConLineas(diaActual))
+        }
+      }
+      setVersionesEliminadas(prev => prev.filter(v => v.id !== versionId))
+    } catch (err) {
+      console.error('Error restaurando version:', err)
+      alert('Error al restaurar')
+    }
+  }, [versionesEliminadas, diaActual])
+
+  const handleEliminarPermanente = useCallback(async (versionId: string) => {
+    if (!confirm('¿Eliminar permanentemente? Esta acción no se puede deshacer.')) return
+    try {
+      await cronogramaService.eliminarVersionPermanente(versionId)
+      setVersionesEliminadas(prev => prev.filter(v => v.id !== versionId))
+    } catch (err) {
+      console.error('Error eliminando permanentemente:', err)
+    }
+  }, [])
+
+  const versionesFiltradas = useMemo(() => {
+    if (filtroVersionDia === 'todos') return versiones
+    return versiones.filter(v => v.dia_semana === filtroVersionDia)
+  }, [versiones, filtroVersionDia])
+
+  const tareasTabla = useMemo(() => {
+    const lista = tareas
+      .map(t => {
+        const emp = empleados.find(e => e.lineas.some(l => l.id === t.linea_id))
+        const linea = emp?.lineas.find(l => l.id === t.linea_id)
+        const [hi, mi] = t.hora_inicio.split(':').map(Number)
+        const [hf, mf] = t.hora_fin.split(':').map(Number)
+        const duracionMin = (hf * 60 + mf) - (hi * 60 + mi)
+        return {
+          id: t.id,
+          hora_inicio: t.hora_inicio.slice(0, 5),
+          hora_fin: t.hora_fin.slice(0, 5),
+          empleado_id: emp?.id || '',
+          empleado: emp?.nombre_completo || '',
+          color_empleado: emp?.color || '#666',
+          color_tarea: t.color || emp?.color || '#3b82f6',
+          linea: linea?.nombre || '',
+          descripcion: t.descripcion,
+          duracionMin
+        }
+      })
+      .filter(t => filtroEmpleado === 'todos' || t.empleado_id === filtroEmpleado)
+      .sort((a, b) => a.hora_inicio.localeCompare(b.hora_inicio))
+    return lista
+  }, [tareas, empleados, filtroEmpleado])
+
+  const tareaSelObj = tareas.find(t => t.id === tareaSeleccionada)
+  const seleccionTieneGrupo = tareasSeleccionadas.some(id => tareas.find(t => t.id === id)?.grupo_id)
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement || e.target instanceof HTMLTextAreaElement) return
+      if (modalVisible || copiarModalVisible) return
+      if ((e.key === 'Delete' || e.key === 'Backspace') && tareasSeleccionadas.length > 0) { e.preventDefault(); handleEliminarSeleccionada() }
+      if (e.key === 'Escape') setTareasSeleccionadas([])
+      if (e.key === 'l' && tareasSeleccionadas.length > 0) handleToggleBloqueo()
+      if ((e.ctrlKey || e.metaKey) && (e.key === '=' || e.key === '+')) { e.preventDefault(); zoomStep(1) }
+      if ((e.ctrlKey || e.metaKey) && e.key === '-') { e.preventDefault(); zoomStep(-1) }
+      if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) { e.preventDefault(); handleDeshacer() }
+      if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || (e.key === 'z' && e.shiftKey))) { e.preventDefault(); handleRehacer() }
+    }
+    document.addEventListener('keydown', handleKeyDown)
+    return () => document.removeEventListener('keydown', handleKeyDown)
+  }, [tareasSeleccionadas, modalVisible, copiarModalVisible, handleEliminarSeleccionada, handleToggleBloqueo, handleDeshacer, handleRehacer])
+
+  const cambiarDia = (dir: number) => {
+    setDiaActual(d => {
+      const nuevo = ((d + dir) % 7 + 7) % 7
+      localStorage.setItem('cronograma_dia_actual', String(nuevo))
+      return nuevo
+    })
+    setTareasSeleccionadas([])
+  }
+
+  if (loading && empleados.length === 0) {
+    return (
+      <div className="flex items-center justify-center h-full">
+        <div className="text-slate-500 text-sm">Cargando cronograma...</div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="h-full flex flex-col bg-[#f6f7fb] overflow-hidden">
+
+      {/* Toolbar - 2 líneas */}
+      <div className="flex-shrink-0 bg-white border-b border-slate-200/80 shadow-sm">
+        {/* Línea 1: Navegación, historial, vista */}
+        <div className="h-[40px] flex items-center px-3 gap-2 overflow-x-auto">
+          {onToggleMenu && (
+            <button
+              onClick={onToggleMenu}
+              className="w-7 h-7 flex items-center justify-center rounded-md hover:bg-slate-100 text-slate-500 transition-colors flex-shrink-0"
+              title="Mostrar menú"
+            >
+              <Menu size={15} />
+            </button>
+          )}
+
+          {/* Day selector */}
+          <div className="flex items-center bg-slate-50 rounded-lg px-1 h-[30px] border border-slate-200/60">
+            <button onClick={() => cambiarDia(-1)} className="w-6 h-6 flex items-center justify-center rounded-md hover:bg-white hover:shadow-sm text-slate-500 transition-all">
+              <ChevronLeft size={13} />
+            </button>
+            <span className="text-[12px] font-bold text-slate-800 min-w-[85px] text-center tracking-tight">
+              {DIAS_SEMANA_NOMBRES[diaActual]}
+            </span>
+            <button onClick={() => cambiarDia(1)} className="w-6 h-6 flex items-center justify-center rounded-md hover:bg-white hover:shadow-sm text-slate-500 transition-all">
+              <ChevronRight size={13} />
+            </button>
+          </div>
+
+          <div className="w-px h-5 bg-slate-200/70" />
+
+          {/* Undo/Redo */}
+          <div className="flex items-center gap-0.5">
+            <button
+              onClick={handleDeshacer}
+              disabled={!puedeDeshacer || undoRedoLoading}
+              className="w-7 h-7 flex items-center justify-center rounded-md hover:bg-blue-50 text-slate-500 hover:text-blue-600 disabled:opacity-25 disabled:cursor-not-allowed transition-colors"
+              title="Deshacer (Ctrl+Z)"
+            >
+              <Undo2 size={14} />
+            </button>
+            <button
+              onClick={handleRehacer}
+              disabled={!puedeRehacer || undoRedoLoading}
+              className="w-7 h-7 flex items-center justify-center rounded-md hover:bg-blue-50 text-slate-500 hover:text-blue-600 disabled:opacity-25 disabled:cursor-not-allowed transition-colors"
+              title="Rehacer (Ctrl+Y)"
+            >
+              <Redo2 size={14} />
+            </button>
+          </div>
+
+          <div className="w-px h-5 bg-slate-200/70" />
+
+          {/* Zoom */}
+          <div className="flex items-center gap-1">
+            <span className="text-[9px] uppercase tracking-wider text-slate-400 font-bold">Zoom</span>
+            <div className="flex items-center bg-slate-50 rounded-md border border-slate-200/60 h-[26px] overflow-hidden">
+              <button onClick={() => zoomStep(-1)} className="w-6 h-full flex items-center justify-center hover:bg-slate-100 text-slate-500 transition-colors"><Minus size={11} /></button>
+              <span className="text-[10px] font-mono font-bold text-slate-700 min-w-[34px] text-center border-x border-slate-200/60">{Math.round(zoom * 100)}%</span>
+              <button onClick={() => zoomStep(1)} className="w-6 h-full flex items-center justify-center hover:bg-slate-100 text-slate-500 transition-colors"><Plus size={11} /></button>
+            </div>
+            <button onClick={fitZoom} className="w-6 h-[26px] flex items-center justify-center rounded-md border border-slate-200/60 bg-slate-50 hover:bg-slate-100 text-slate-500 transition-colors" title="Ajustar"><Maximize2 size={11} /></button>
+            <button onClick={() => setZoom(1)} className="h-[26px] px-1.5 text-[10px] font-bold rounded-md border border-slate-200/60 bg-slate-50 hover:bg-slate-100 text-slate-500 transition-colors">1:1</button>
+          </div>
+
+          <div className="w-px h-5 bg-slate-200/70" />
+
+          {/* Row height */}
+          <div className="flex items-center gap-1">
+            <span className="text-[9px] uppercase tracking-wider text-slate-400 font-bold">Alto</span>
+            <div className="flex items-center bg-slate-50 rounded-md border border-slate-200/60 h-[26px] overflow-hidden">
+              <button onClick={() => rowScaleBy(1 / 1.1)} className="w-6 h-full flex items-center justify-center hover:bg-slate-100 text-slate-500 transition-colors"><Minus size={11} /></button>
+              <span className="text-[10px] font-mono font-bold text-slate-700 min-w-[34px] text-center border-x border-slate-200/60">{Math.round(rowScale * 100)}%</span>
+              <button onClick={() => rowScaleBy(1.1)} className="w-6 h-full flex items-center justify-center hover:bg-slate-100 text-slate-500 transition-colors"><Plus size={11} /></button>
+            </div>
+            <button onClick={() => setRowScale(1)} className="h-[26px] px-1.5 text-[10px] font-bold rounded-md border border-slate-200/60 bg-slate-50 hover:bg-slate-100 text-slate-500 transition-colors">1:1</button>
+          </div>
+
+          <div className="w-px h-5 bg-slate-200/70" />
+
+          {/* Range */}
+          <div className="flex items-center gap-1">
+            <span className="text-[9px] uppercase tracking-wider text-slate-400 font-bold">Rango</span>
+            <input
+              type="time"
+              value={rangoInicio}
+              onChange={e => { setRangoInicio(e.target.value); guardarRangoEnBD(e.target.value, rangoFin) }}
+              className="h-[26px] w-[72px] px-1.5 border border-slate-200/60 bg-slate-50 rounded-md text-[11px] font-mono font-semibold text-slate-700 focus:outline-none focus:ring-1 focus:ring-blue-400 focus:bg-white transition-colors"
+            />
+            <span className="text-slate-300 text-[10px]">&rarr;</span>
+            <input
+              type="time"
+              value={rangoFin}
+              onChange={e => { setRangoFin(e.target.value); guardarRangoEnBD(rangoInicio, e.target.value) }}
+              className="h-[26px] w-[72px] px-1.5 border border-slate-200/60 bg-slate-50 rounded-md text-[11px] font-mono font-semibold text-slate-700 focus:outline-none focus:ring-1 focus:ring-blue-400 focus:bg-white transition-colors"
+            />
+          </div>
+
+          <div className="w-px h-5 bg-slate-200/70" />
+
+          {/* Vista toggle */}
+          <div className="flex items-center gap-0.5 bg-slate-100 rounded-md p-0.5 h-[26px]">
+            <button
+              onClick={() => setVistaAgrupacion('secciones')}
+              className={`flex items-center gap-1 px-2 h-full rounded text-[10px] font-bold transition-colors ${
+                vistaAgrupacion === 'secciones'
+                  ? 'bg-white text-slate-800 shadow-sm'
+                  : 'text-slate-400 hover:text-slate-600'
+              }`}
+              title="Ver por empleado"
+            >
+              <LayoutList size={11} />Secciones
+            </button>
+            <button
+              onClick={() => setVistaAgrupacion('todos')}
+              className={`flex items-center gap-1 px-2 h-full rounded text-[10px] font-bold transition-colors ${
+                vistaAgrupacion === 'todos'
+                  ? 'bg-white text-slate-800 shadow-sm'
+                  : 'text-slate-400 hover:text-slate-600'
+              }`}
+              title="Ver todas las líneas juntas"
+            >
+              <Layers size={11} />Todos
+            </button>
+          </div>
+
+          {/* Snap toggle + Modo Inteligente + logout - al final derecha */}
+          <div className="ml-auto flex items-center gap-1.5">
+            <button
+              onClick={() => setSnapHorarioOriginal(v => !v)}
+              className={`h-[26px] px-2 text-[10px] font-bold rounded-md flex items-center gap-1 transition-all ${
+                snapHorarioOriginal
+                  ? 'bg-emerald-500 text-white shadow-sm shadow-emerald-200'
+                  : 'bg-slate-100 text-slate-400 hover:bg-slate-200'
+              }`}
+              title={snapHorarioOriginal ? 'Imán activado' : 'Imán desactivado'}
+            >
+              <Magnet size={11} /> Imán
+            </button>
+            <div className="w-px h-4 bg-slate-200/70" />
+            {/* Modo Inteligente toggle */}
+            <div className="flex items-center gap-0.5 bg-slate-100 rounded-md p-0.5 h-[26px]">
+              <button
+                onClick={() => setModoInteligente(false)}
+                className={`flex items-center gap-1 px-2 h-full rounded text-[10px] font-bold transition-colors ${
+                  !modoInteligente
+                    ? 'bg-white text-slate-800 shadow-sm'
+                    : 'text-slate-400 hover:text-slate-600'
+                }`}
+                title="Arrastrar libremente sin detección de conflictos"
+              >
+                Libre
+              </button>
+              <button
+                onClick={() => setModoInteligente(true)}
+                className={`flex items-center gap-1 px-2 h-full rounded text-[10px] font-bold transition-colors ${
+                  modoInteligente
+                    ? 'bg-violet-600 text-white shadow-sm'
+                    : 'text-slate-400 hover:text-slate-600'
+                }`}
+                title="Detecta conflictos al arrastrar y ofrece opciones de resolución"
+              >
+                <Zap size={10} /> Inteligente
+              </button>
+            </div>
+            {modoInteligente && tareas.some(t => t.bloqueada) && (
+              <button
+                onClick={handleLiberarTodas}
+                className="h-[26px] px-2 text-[10px] font-bold rounded-md border border-amber-300 bg-amber-50 text-amber-700 hover:bg-amber-100 flex items-center gap-1 transition-colors"
+                title={`Liberar todas las tareas bloqueadas (${tareas.filter(t => t.bloqueada).length})`}
+              >
+                <Unlock size={10} /> Liberar todas
+              </button>
+            )}
+            <div className="w-px h-4 bg-slate-200/70" />
+            <button
+              onClick={signOut}
+              className="h-[26px] px-2 text-[10px] font-semibold rounded-md border border-slate-200 bg-white text-slate-500 hover:bg-slate-50 hover:text-slate-700 flex items-center gap-1 transition-colors"
+              title="Cerrar sesión"
+            >
+              <LogOut size={11} />
+            </button>
+          </div>
+        </div>
+
+        {/* Línea 2: Acciones */}
+        <div className="h-[36px] flex items-center px-3 gap-1.5 overflow-x-auto border-t border-slate-100">
+          <button
+            onClick={() => setAgregarEmpleadoModalVisible(true)}
+            className="h-[26px] px-2.5 text-[10px] font-semibold rounded-md bg-slate-700 text-white hover:bg-slate-800 flex items-center gap-1.5 transition-colors shadow-sm"
+          >
+            <UserPlus size={11} /> Empleado
+          </button>
+          <button
+            onClick={() => setCopiarModalVisible(true)}
+            className="h-[26px] px-2.5 text-[10px] font-semibold rounded-md border border-slate-200 bg-white text-slate-600 hover:bg-slate-50 hover:border-slate-300 flex items-center gap-1.5 transition-colors"
+          >
+            <Copy size={11} /> Importar
+          </button>
+          <button
+            onClick={() => setListadoModalVisible(true)}
+            className="h-[26px] px-2.5 text-[10px] font-semibold rounded-md border border-slate-200 bg-white text-slate-600 hover:bg-slate-50 hover:border-slate-300 flex items-center gap-1.5 transition-colors"
+          >
+            <List size={11} /> Listado
+          </button>
+
+          <div className="w-px h-4 bg-slate-200/70" />
+
+          <button
+            onClick={() => setGuardarModalVisible(true)}
+            className="h-[26px] px-2.5 text-[10px] font-semibold rounded-md border border-blue-200 bg-blue-50 text-blue-700 hover:bg-blue-100 hover:border-blue-300 flex items-center gap-1.5 transition-colors"
+          >
+            <Save size={11} /> Guardar
+          </button>
+          <button
+            onClick={handleAbrirVersiones}
+            className="h-[26px] px-2.5 text-[10px] font-semibold rounded-md border border-slate-200 bg-white text-slate-600 hover:bg-slate-50 hover:border-slate-300 flex items-center gap-1.5 transition-colors"
+          >
+            <FolderOpen size={11} /> Abrir
+          </button>
+
+          <div className="w-px h-4 bg-slate-200/70" />
+
+          <button
+            onClick={handleEliminarCronogramaCompleto}
+            className="h-[26px] px-2.5 text-[10px] font-semibold rounded-md border border-red-200 bg-white text-red-500 hover:bg-red-50 hover:border-red-300 flex items-center gap-1.5 transition-colors"
+            title="Eliminar cronograma completo del día"
+          >
+            <Trash2 size={11} /> Vaciar
+          </button>
+
+          <div className="w-px h-4 bg-slate-200/70" />
+
+          <button
+            onClick={() => setModuloPersonalVisible(true)}
+            className="h-[26px] px-2.5 text-[10px] font-semibold rounded-md border border-slate-200 bg-white text-slate-600 hover:bg-slate-50 hover:border-slate-300 flex items-center gap-1.5 transition-colors"
+          >
+            <Users size={11} /> Módulo de personal
+          </button>
+
+          <div className="w-px h-4 bg-slate-200/70" />
+
+          <button
+            onClick={() => setPlanificarVisible(true)}
+            className="h-[26px] px-2.5 text-[10px] font-semibold rounded-md border border-blue-300 bg-blue-600 text-white hover:bg-blue-700 flex items-center gap-1.5 transition-colors shadow-sm"
+            title="Generar cronograma automáticamente"
+          >
+            <CalendarClock size={11} /> Planificar
+          </button>
+
+          {onIrAConfiguracion && (
+            <button
+              onClick={onIrAConfiguracion}
+              className="h-[26px] px-2.5 text-[10px] font-semibold rounded-md border border-slate-200 bg-white text-slate-600 hover:bg-slate-50 hover:border-slate-300 flex items-center gap-1.5 transition-colors"
+              title="Configurar máquinas, plantillas y habilidades"
+            >
+              <Settings size={11} /> Configuración
+            </button>
+          )}
+
+          {/* Task actions - aparecen a la derecha */}
+          <div className={`flex items-center gap-1.5 ml-auto transition-all duration-200 ${tareasSeleccionadas.length > 0 ? 'opacity-100 translate-x-0' : 'opacity-0 translate-x-2 pointer-events-none'}`}>
+            <div className="w-px h-4 bg-slate-200/70" />
+            <span className="text-[9px] uppercase tracking-wider text-slate-400 font-bold">
+              {tareasSeleccionadas.length > 1 ? `${tareasSeleccionadas.length} sel.` : '1 sel.'}
+            </span>
+            {tareasSeleccionadas.length >= 2 && (
+              <button
+                onClick={handleAgruparTareas}
+                className="h-[26px] px-2 text-[10px] font-semibold rounded-md bg-blue-600 text-white hover:bg-blue-700 flex items-center gap-1 transition-colors shadow-sm"
+                title="Agrupar tareas seleccionadas"
+              >
+                <Link size={10} /> Agrupar
+              </button>
+            )}
+            {seleccionTieneGrupo && (
+              <button
+                onClick={handleDesagruparTareas}
+                className="h-[26px] px-2 text-[10px] font-semibold rounded-md border border-amber-300 bg-amber-50 text-amber-700 hover:bg-amber-100 flex items-center gap-1 transition-colors"
+                title="Desagrupar tareas"
+              >
+                <Unlink size={10} /> Desagrupar
+              </button>
+            )}
+            <button
+              onClick={handleToggleBloqueo}
+              disabled={tareasSeleccionadas.length === 0}
+              className="h-[26px] px-2 text-[10px] font-semibold rounded-md border border-slate-200 bg-white text-slate-600 hover:bg-slate-50 flex items-center gap-1 transition-colors"
+            >
+              {tareaSelObj?.bloqueada ? <><Unlock size={10} /> Desbloq.</> : <><Lock size={10} /> Bloq.</>}
+            </button>
+            <button
+              onClick={handleEliminarSeleccionada}
+              disabled={tareasSeleccionadas.length === 0}
+              className="h-[26px] px-2 text-[10px] font-semibold rounded-md bg-red-500 text-white hover:bg-red-600 flex items-center gap-1 transition-colors shadow-sm"
+            >
+              <Trash2 size={10} />
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* Timeline */}
+      <div className="flex-1 min-h-0 overflow-y-auto cronograma-wrap">
+        {empleados.length === 0 ? (
+          <div className="flex flex-col items-center justify-center h-full text-slate-500">
+            <div className="text-5xl font-bold text-slate-300 mb-2">&empty;</div>
+            <h3 className="text-lg font-bold text-slate-700 mb-1">Sin empleados configurados</h3>
+            <p className="text-sm text-slate-500 mb-4">Primero creá líneas de trabajo para los empleados.</p>
+            <button
+              onClick={() => {
+                if (empleados.length > 0) handleAgregarLinea(empleados[0].id)
+              }}
+              className="h-8 px-3 text-sm font-semibold text-white bg-slate-900 rounded hover:bg-slate-800"
+            >
+              Configurar líneas
+            </button>
+          </div>
+        ) : empleados.every(e => e.lineas.length === 0) ? (
+          <div className="flex flex-col items-center justify-center h-full text-slate-500">
+            <div className="text-5xl font-bold text-slate-300 mb-2">&empty;</div>
+            <h3 className="text-lg font-bold text-slate-700 mb-1">Sin líneas de trabajo</h3>
+            <p className="text-sm text-slate-500 mb-4">Agregá líneas a los empleados para comenzar a planificar.</p>
+            <div className="flex gap-2 flex-wrap justify-center">
+              {empleados.map(emp => (
+                <button
+                  key={emp.id}
+                  onClick={() => handleAgregarLinea(emp.id)}
+                  className="h-8 px-3 text-sm font-semibold border border-slate-300 rounded hover:bg-slate-50 text-slate-700 flex items-center gap-2"
+                >
+                  <span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: emp.color }} />
+                  + Línea para {emp.nombre_completo}
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : (
+          <CronogramaTimeline
+            empleados={empleados.filter(e => e.lineas.length > 0)}
+            tareas={tareas}
+            rangoInicio={rangoInicio}
+            rangoFin={rangoFin}
+            zoom={zoom}
+            rowScale={rowScale}
+            tareasSeleccionadas={tareasSeleccionadas}
+            collapsedEmpleados={collapsedEmpleados}
+            onSeleccionarTarea={setTareasSeleccionadas}
+            onDobleClickTarea={handleDobleClickTarea}
+            onCrearTarea={handleCrearTarea}
+            onMoverTarea={handleMoverTarea}
+            onMoverMultiTareas={handleMoverMultiTareas}
+            onResizeTarea={handleResizeTarea}
+            onToggleCollapse={handleToggleCollapse}
+            onRenombrarLinea={handleRenombrarLinea}
+            onAgregarLinea={handleAgregarLinea}
+            onEliminarLinea={handleEliminarLinea}
+            onMoverLinea={handleMoverLinea}
+            onZoomChange={setZoom}
+            snapHorarioOriginal={snapHorarioOriginal}
+            onCambiarTamano={handleCambiarTamano}
+            onCambiarFila={handleCambiarFila}
+            onAgrupar={handleAgruparDesdeMenu}
+            onDesagrupar={handleDesagruparDesdeMenu}
+            onBloquear={handleBloquearDesdeMenu}
+            vistaAgrupacion={vistaAgrupacion}
+            modoInteligente={modoInteligente}
+            onMoverConConflicto={handleMoverConConflicto}
+            maquinasCapacidad={maquinasCapacidad}
+            horariosEmpleados={horariosDia}
+          />
+        )}
+      </div>
+
+      {/* Modal listado de tareas */}
+      {listadoModalVisible && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[200] backdrop-blur-sm" onClick={() => setListadoModalVisible(false)}>
+          <div className="bg-white w-[700px] max-w-[95vw] max-h-[85vh] rounded-lg shadow-2xl overflow-hidden flex flex-col" onClick={e => e.stopPropagation()}>
+            <div className="px-5 py-4 border-b border-slate-200 bg-slate-50 flex items-center justify-between">
+              <div>
+                <h2 className="text-lg font-bold text-slate-900">Listado de tareas - {DIAS_SEMANA_NOMBRES[diaActual]}</h2>
+                <p className="text-[12px] text-slate-500 mt-0.5">{tareasTabla.length} tareas</p>
+              </div>
+              <select
+                value={filtroEmpleado}
+                onChange={e => setFiltroEmpleado(e.target.value)}
+                className="h-8 px-3 text-[12px] font-semibold border border-slate-300 rounded-md bg-white text-slate-700 focus:outline-none focus:ring-1 focus:ring-blue-400"
+              >
+                <option value="todos">Todos los empleados</option>
+                {empleados.filter(e => e.lineas.length > 0).map(emp => (
+                  <option key={emp.id} value={emp.id}>{emp.nombre_completo}</option>
+                ))}
+              </select>
+            </div>
+            <div className="flex-1 overflow-y-auto">
+              <table className="w-full text-[12px]">
+                <thead className="sticky top-0 bg-slate-50 border-b border-slate-200 z-10">
+                  <tr>
+                    <th className="text-left px-3 py-2 font-bold text-slate-600 w-[70px]">Inicio</th>
+                    <th className="text-left px-3 py-2 font-bold text-slate-600 w-[70px]">Fin</th>
+                    <th className="text-left px-3 py-2 font-bold text-slate-600 w-[60px]">Tiempo</th>
+                    <th className="text-left px-3 py-2 font-bold text-slate-600 w-[120px]">Empleado</th>
+                    <th className="text-left px-3 py-2 font-bold text-slate-600">Tarea</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(() => {
+                    const maxDuracion = Math.max(...tareasTabla.map(t => t.duracionMin), 1)
+                    return tareasTabla.map(t => {
+                      const duracion = t.duracionMin >= 60 ? `${Math.floor(t.duracionMin / 60)}h ${t.duracionMin % 60 > 0 ? t.duracionMin % 60 + 'm' : ''}`.trim() : `${t.duracionMin}m`
+                      const porcentaje = (t.duracionMin / maxDuracion) * 100
+                      return (
+                        <tr key={t.id} className="border-b border-slate-50 hover:bg-slate-50/50">
+                          <td className="px-3 py-1.5 font-mono font-semibold text-slate-800">{t.hora_inicio}</td>
+                          <td className="px-3 py-1.5 font-mono font-semibold text-slate-800">{t.hora_fin}</td>
+                          <td className="px-3 py-1.5 font-mono text-slate-500">{duracion}</td>
+                          <td className="px-3 py-1.5 font-semibold" style={{ color: t.color_empleado }}>{t.empleado}</td>
+                          <td className="px-3 py-1.5">
+                            <div
+                              className="h-[4px] rounded-full mb-0.5"
+                              style={{ width: `${porcentaje}%`, backgroundColor: t.color_tarea }}
+                            />
+                            <span className="text-slate-900">{t.descripcion}</span>
+                          </td>
+                        </tr>
+                      )
+                    })
+                  })()}
+                  {tareasTabla.length === 0 && (
+                    <tr>
+                      <td colSpan={5} className="px-3 py-6 text-center text-slate-400">
+                        No hay tareas{filtroEmpleado !== 'todos' ? ' para este empleado' : ''}
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+            <div className="px-5 py-3 border-t border-slate-200 bg-slate-50 flex items-center justify-between">
+              <div>
+                {filtroEmpleado !== 'todos' && onSectionChange && (
+                  <button
+                    onClick={() => {
+                      setListadoModalVisible(false)
+                      onSectionChange(`cronograma-empleado/${filtroEmpleado}/${diaActual}`)
+                      window.history.pushState({}, '', `/cronograma-empleado/${filtroEmpleado}/${diaActual}`)
+                    }}
+                    className="h-8 px-3 text-sm font-semibold text-blue-700 border border-blue-200 rounded hover:bg-blue-50"
+                  >
+                    Ver línea de tiempo
+                  </button>
+                )}
+              </div>
+              <button onClick={() => setListadoModalVisible(false)} className="h-8 px-4 text-sm font-semibold text-slate-700 border border-slate-300 rounded hover:bg-slate-100">
+                Cerrar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modal guardar version */}
+      {guardarModalVisible && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[200] backdrop-blur-sm" onClick={() => setGuardarModalVisible(false)}>
+          <div className="bg-white w-[420px] max-w-[95vw] rounded-lg shadow-2xl overflow-hidden" onClick={e => e.stopPropagation()}>
+            <div className="px-5 py-4 border-b border-slate-200 bg-slate-50">
+              <h2 className="text-lg font-bold text-slate-900">Guardar versión</h2>
+              <p className="text-[12px] text-slate-500 mt-0.5">Guarda el estado actual del {DIAS_SEMANA_NOMBRES[diaActual]}</p>
+            </div>
+            <div className="px-5 py-4 space-y-3">
+              <div>
+                <label className="block text-[12px] font-semibold text-slate-700 mb-1">Nombre</label>
+                <input
+                  type="text"
+                  value={nombreVersion}
+                  onChange={e => setNombreVersion(e.target.value)}
+                  placeholder="Ej: Versión final semana 12"
+                  className="w-full h-9 px-3 text-sm border border-slate-300 rounded-md focus:outline-none focus:ring-1 focus:ring-blue-400"
+                  autoFocus
+                  onKeyDown={e => { if (e.key === 'Enter') handleGuardarVersion() }}
+                />
+              </div>
+              <div>
+                <label className="block text-[12px] font-semibold text-slate-700 mb-1">Notas (opcional)</label>
+                <textarea
+                  value={notasVersion}
+                  onChange={e => setNotasVersion(e.target.value)}
+                  placeholder="Descripción o cambios..."
+                  rows={2}
+                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded-md focus:outline-none focus:ring-1 focus:ring-blue-400 resize-none"
+                />
+              </div>
+            </div>
+            <div className="px-5 py-3 border-t border-slate-200 bg-slate-50 flex justify-end gap-2">
+              <button onClick={() => setGuardarModalVisible(false)} className="h-8 px-3 text-sm font-semibold text-slate-700 border border-slate-300 rounded hover:bg-slate-100">
+                Cancelar
+              </button>
+              <button
+                onClick={handleGuardarVersion}
+                disabled={!nombreVersion.trim()}
+                className="h-8 px-4 text-sm font-semibold text-white bg-slate-900 rounded hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                Guardar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modal abrir version */}
+      {abrirModalVisible && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[200] backdrop-blur-sm" onClick={() => setAbrirModalVisible(false)}>
+          <div className="bg-white w-[600px] max-w-[95vw] max-h-[80vh] rounded-lg shadow-2xl overflow-hidden flex flex-col" onClick={e => e.stopPropagation()}>
+            <div className="px-5 py-4 border-b border-slate-200 bg-slate-50 flex items-center justify-between">
+              <div>
+                <h2 className="text-lg font-bold text-slate-900">Versiones guardadas</h2>
+                <p className="text-[12px] text-slate-500 mt-0.5">{versionesFiltradas.length} versiones</p>
+              </div>
+              <select
+                value={filtroVersionDia === 'todos' ? 'todos' : String(filtroVersionDia)}
+                onChange={e => setFiltroVersionDia(e.target.value === 'todos' ? 'todos' : Number(e.target.value))}
+                className="h-8 px-3 text-[12px] font-semibold border border-slate-300 rounded-md bg-white text-slate-700 focus:outline-none focus:ring-1 focus:ring-blue-400"
+              >
+                <option value="todos">Todos los días</option>
+                {DIAS_SEMANA_NOMBRES.map((nombre, i) => (
+                  <option key={i} value={i}>{nombre}</option>
+                ))}
+              </select>
+            </div>
+            <div className="flex-1 overflow-y-auto">
+              {versionesLoading ? (
+                <div className="flex items-center justify-center py-12 text-slate-400 text-sm">Cargando...</div>
+              ) : versionesFiltradas.length === 0 ? (
+                <div className="flex items-center justify-center py-12 text-slate-400 text-sm">No hay versiones guardadas</div>
+              ) : (
+                <div className="divide-y divide-slate-100">
+                  {versionesFiltradas.map(v => (
+                    <div key={v.id} className="px-5 py-3 hover:bg-slate-50 flex items-center gap-3 group">
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2">
+                          <span className="font-semibold text-sm text-slate-900 truncate">{v.nombre}</span>
+                          <span className="text-[10px] font-bold text-slate-400 bg-slate-100 rounded px-1.5 py-0.5 flex-shrink-0">
+                            {DIAS_SEMANA_NOMBRES[v.dia_semana]}
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-2 mt-0.5">
+                          <span className="text-[11px] text-slate-400">
+                            {new Date(v.fecha_creacion).toLocaleDateString('es-AR')} {new Date(v.fecha_creacion).toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' })}
+                          </span>
+                          <span className="text-[11px] text-slate-400">
+                            {(v.snapshot_tareas as unknown[]).length} tareas
+                          </span>
+                        </div>
+                        {v.notas && <p className="text-[11px] text-slate-500 mt-0.5 truncate">{v.notas}</p>}
+                      </div>
+                      <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity flex-shrink-0">
+                        <button
+                          onClick={() => handleCargarVersion(v.id)}
+                          className="h-7 px-2.5 text-[11px] font-semibold text-white bg-slate-900 rounded hover:bg-slate-800"
+                        >
+                          Cargar
+                        </button>
+                        <button
+                          onClick={() => handleEliminarVersion(v.id)}
+                          className="h-7 px-2 text-[11px] font-semibold text-red-600 border border-red-200 rounded hover:bg-red-50"
+                        >
+                          <Trash2 size={12} />
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+            <div className="px-5 py-3 border-t border-slate-200 bg-slate-50 flex items-center justify-between">
+              <button
+                onClick={() => { setAbrirModalVisible(false); handleAbrirPapelera() }}
+                className="h-8 px-3 text-sm font-semibold text-slate-500 border border-slate-200 rounded hover:bg-slate-100 flex items-center gap-1.5"
+              >
+                <Trash2 size={14} /> Papelera
+              </button>
+              <button onClick={() => setAbrirModalVisible(false)} className="h-8 px-4 text-sm font-semibold text-slate-700 border border-slate-300 rounded hover:bg-slate-100">
+                Cerrar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modal papelera */}
+      {papeleraVisible && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[200] backdrop-blur-sm" onClick={() => setPapeleraVisible(false)}>
+          <div className="bg-white w-[600px] max-w-[95vw] max-h-[80vh] rounded-lg shadow-2xl overflow-hidden flex flex-col" onClick={e => e.stopPropagation()}>
+            <div className="px-5 py-4 border-b border-slate-200 bg-red-50 flex items-center gap-3">
+              <div className="w-9 h-9 rounded-full bg-red-100 flex items-center justify-center">
+                <Trash2 size={18} className="text-red-600" />
+              </div>
+              <div>
+                <h2 className="text-lg font-bold text-slate-900">Papelera</h2>
+                <p className="text-[12px] text-slate-500 mt-0.5">{versionesEliminadas.length} versiones eliminadas</p>
+              </div>
+            </div>
+            <div className="flex-1 overflow-y-auto">
+              {papeleraLoading ? (
+                <div className="flex items-center justify-center py-12 text-slate-400 text-sm">Cargando...</div>
+              ) : versionesEliminadas.length === 0 ? (
+                <div className="flex flex-col items-center justify-center py-12 text-slate-400">
+                  <Trash2 size={32} className="mb-2 opacity-30" />
+                  <span className="text-sm">La papelera esta vacia</span>
+                </div>
+              ) : (
+                <div className="divide-y divide-slate-100">
+                  {versionesEliminadas.map(v => (
+                    <div key={v.id} className="px-5 py-3 hover:bg-slate-50 flex items-center gap-3 group">
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2">
+                          <span className="font-semibold text-sm text-slate-900 truncate">{v.nombre}</span>
+                          <span className="text-[10px] font-bold text-slate-400 bg-slate-100 rounded px-1.5 py-0.5 flex-shrink-0">
+                            {DIAS_SEMANA_NOMBRES[v.dia_semana]}
+                          </span>
+                          {v.es_backup_auto && (
+                            <span className="text-[9px] font-bold text-amber-600 bg-amber-50 border border-amber-200 rounded px-1.5 py-0.5 flex-shrink-0">
+                              BACKUP
+                            </span>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-2 mt-0.5">
+                          <span className="text-[11px] text-slate-400">
+                            Eliminado: {v.eliminado_en ? new Date(v.eliminado_en).toLocaleDateString('es-AR') : ''}
+                            {' '}
+                            {v.eliminado_en ? new Date(v.eliminado_en).toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' }) : ''}
+                          </span>
+                          <span className="text-[11px] text-slate-400">
+                            {(v.snapshot_tareas as unknown[]).length} tareas
+                          </span>
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity flex-shrink-0">
+                        <button
+                          onClick={() => handleRestaurarVersion(v.id)}
+                          className="h-7 px-2.5 text-[11px] font-semibold text-emerald-700 border border-emerald-300 rounded hover:bg-emerald-50 flex items-center gap-1"
+                        >
+                          <ArchiveRestore size={12} /> Restaurar
+                        </button>
+                        <button
+                          onClick={() => handleEliminarPermanente(v.id)}
+                          className="h-7 px-2 text-[11px] font-semibold text-red-600 border border-red-200 rounded hover:bg-red-50"
+                          title="Eliminar permanentemente"
+                        >
+                          <Trash2 size={12} />
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+            <div className="px-5 py-3 border-t border-slate-200 bg-slate-50 flex justify-end">
+              <button onClick={() => setPapeleraVisible(false)} className="h-8 px-4 text-sm font-semibold text-slate-700 border border-slate-300 rounded hover:bg-slate-100">
+                Cerrar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Help strip */}
+      <div className="h-8 bg-slate-900 flex items-center justify-center gap-3 text-white/80 text-[11px] flex-shrink-0 print:hidden">
+        <span><strong>Click + arrastrar</strong> zona vacía = nueva tarea</span>
+        <span className="w-px h-3 bg-white/20" />
+        <span><strong>Doble click</strong> en tarea = editar</span>
+        <span className="w-px h-3 bg-white/20" />
+        <span><kbd className="px-1 py-0.5 bg-white/10 rounded text-[9px] font-mono">Ctrl+Click</kbd> selección múltiple</span>
+        <span className="w-px h-3 bg-white/20" />
+        <span><kbd className="px-1 py-0.5 bg-white/10 rounded text-[9px] font-mono">Del</kbd> eliminar · <kbd className="px-1 py-0.5 bg-white/10 rounded text-[9px] font-mono">L</kbd> bloquear</span>
+        <span className="w-px h-3 bg-white/20" />
+        <span><kbd className="px-1 py-0.5 bg-white/10 rounded text-[9px] font-mono">Ctrl+Z</kbd> deshacer · <kbd className="px-1 py-0.5 bg-white/10 rounded text-[9px] font-mono">Ctrl+Y</kbd> rehacer</span>
+      </div>
+
+      {/* Task modal */}
+      <TareaModal
+        visible={modalVisible}
+        tarea={modalTarea}
+        empleados={empleados}
+        onGuardar={handleGuardarModal}
+        onEliminar={modalTarea?.id ? handleEliminarModal : undefined}
+        onCerrar={() => { setModalVisible(false); setModalTarea(null) }}
+      />
+
+      {/* Copy modal */}
+      {copiarModalVisible && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[200] backdrop-blur-sm" onClick={() => setCopiarModalVisible(false)}>
+          <div className="bg-white w-[380px] rounded-lg shadow-2xl overflow-hidden" onClick={e => e.stopPropagation()}>
+            <div className="px-5 py-4 border-b border-slate-200 bg-slate-50">
+              <h2 className="text-lg font-bold text-slate-900">Importar tareas</h2>
+              <p className="text-[12px] text-slate-500 mt-0.5">
+                Importar todas las tareas de otro día al <strong>{DIAS_SEMANA_NOMBRES[diaActual]}</strong>
+              </p>
+            </div>
+            <div className="p-5">
+              <label className="block text-[10px] uppercase tracking-wider text-slate-500 font-bold mb-2">Copiar desde</label>
+              <div className="grid grid-cols-4 gap-1.5">
+                {DIAS_SEMANA_NOMBRES.map((nombre, idx) => (
+                  <button
+                    key={idx}
+                    disabled={idx === diaActual}
+                    onClick={() => setDiaOrigen(idx)}
+                    className={`h-9 text-[12px] font-semibold rounded border transition-all ${
+                      idx === diaActual ? 'opacity-30 cursor-not-allowed border-slate-200 text-slate-400' :
+                      diaOrigen === idx ? 'bg-slate-900 text-white border-slate-900' :
+                      'border-slate-300 text-slate-700 hover:bg-slate-50'
+                    }`}
+                  >
+                    {nombre.slice(0, 3)}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="px-5 py-3 border-t border-slate-200 bg-slate-50 flex justify-end gap-2">
+              <button onClick={() => setCopiarModalVisible(false)} className="h-8 px-3 text-sm font-semibold text-slate-700 border border-slate-300 rounded hover:bg-slate-100">
+                Cancelar
+              </button>
+              <button onClick={handleCopiarDia} className="h-8 px-4 text-sm font-semibold text-white bg-slate-900 rounded hover:bg-slate-800">
+                Copiar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modal confirmación eliminar */}
+      <ModalConfirmacionRapida
+        isOpen={!!confirmarEliminar}
+        onClose={() => setConfirmarEliminar(null)}
+        onConfirm={ejecutarEliminacion}
+        titulo={confirmarEliminar?.tipo === 'linea' ? 'Eliminar línea' : 'Eliminar tarea'}
+        mensaje={confirmarEliminar?.tipo === 'linea'
+          ? 'Se eliminará esta línea y todas sus tareas. Esta acción no se puede deshacer.'
+          : `Se eliminará la tarea "${confirmarEliminar?.nombre || ''}".`}
+        tipo="warning"
+        textoConfirmar="Eliminar"
+        textoCancelar="Cancelar"
+      />
+
+      {/* Agregar empleado modal */}
+      <ModuloPersonalModal
+        visible={moduloPersonalVisible}
+        onCerrar={() => setModuloPersonalVisible(false)}
+        onEmpleadoCreado={cargarDatos}
+      />
+
+      {/* Modal conflicto inteligente */}
+      {conflictoModal && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[300] backdrop-blur-sm" onClick={() => setConflictoModal(null)}>
+          <div className="bg-white w-[460px] max-w-[95vw] rounded-xl shadow-2xl overflow-hidden" onClick={e => e.stopPropagation()}>
+            <div className="px-5 py-4 border-b border-red-100 bg-red-50 flex items-start gap-3">
+              <div className="w-9 h-9 rounded-full bg-red-100 flex items-center justify-center flex-shrink-0 mt-0.5">
+                <AlertTriangle size={18} className="text-red-600" />
+              </div>
+              <div>
+                <h2 className="text-base font-bold text-slate-900">Conflicto detectado</h2>
+                <p className="text-[12px] text-slate-600 mt-0.5">
+                  {conflictoModal.tareasConflicto.length > 0
+                    ? `La tarea se superpone con ${conflictoModal.tareasConflicto.length === 1 ? 'otra tarea' : `${conflictoModal.tareasConflicto.length} tareas`}${conflictoModal.motivos.length > 0 ? ' y rompe otras restricciones' : ' en esa línea'}.`
+                    : 'El movimiento rompe restricciones del proceso.'}
+                </p>
+              </div>
+            </div>
+            <div className="px-5 py-4 space-y-3">
+              {/* Mover a */}
+              <div className="bg-slate-50 rounded-lg p-3 text-[12px]">
+                <div className="text-[10px] uppercase tracking-wider text-slate-400 font-bold mb-2">Tarea a mover</div>
+                <div className="flex items-center gap-2">
+                  <span className="font-semibold text-slate-800 truncate flex-1">
+                    {tareas.find(t => t.id === conflictoModal.tareaId)?.descripcion || 'Tarea'}
+                  </span>
+                  <span className="font-mono text-slate-500 flex-shrink-0">
+                    {conflictoModal.nuevaHoraInicio.slice(0,5)} → {conflictoModal.nuevaHoraFin.slice(0,5)}
+                  </span>
+                </div>
+              </div>
+              {/* Motivos (máquina / horario) */}
+              {conflictoModal.motivos.length > 0 && (
+                <div>
+                  <div className="text-[10px] uppercase tracking-wider text-slate-400 font-bold mb-1.5">
+                    Restricciones que se rompen
+                  </div>
+                  <div className="space-y-1">
+                    {conflictoModal.motivos.map((m, i) => (
+                      <div key={i} className="flex items-center gap-2 px-3 py-1.5 bg-amber-50 rounded border border-amber-200 text-[12px]">
+                        <AlertTriangle size={11} className="text-amber-600 flex-shrink-0" />
+                        <span className="font-medium text-slate-700 flex-1">{m}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {/* Conflictos */}
+              {conflictoModal.tareasConflicto.length > 0 && (
+                <div>
+                  <div className="text-[10px] uppercase tracking-wider text-slate-400 font-bold mb-1.5">
+                    {conflictoModal.tareasConflicto.length === 1 ? 'Tarea en conflicto' : 'Tareas en conflicto'}
+                  </div>
+                  <div className="space-y-1">
+                    {conflictoModal.tareasConflicto.map(t => (
+                      <div key={t.id} className="flex items-center gap-2 px-3 py-1.5 bg-red-50 rounded border border-red-100 text-[12px]">
+                        {t.bloqueada && <Lock size={11} className="text-red-500 flex-shrink-0" />}
+                        <span className="font-semibold text-slate-800 truncate flex-1">{t.descripcion}</span>
+                        <span className="font-mono text-slate-500 flex-shrink-0">
+                          {t.hora_inicio.slice(0,5)} → {t.hora_fin.slice(0,5)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                  {conflictoModal.tareasConflicto.every(t => t.bloqueada) && (
+                    <p className="text-[11px] text-amber-600 mt-1.5 flex items-center gap-1">
+                      <Lock size={10} /> Todas las tareas en conflicto están bloqueadas y no pueden desplazarse.
+                    </p>
+                  )}
+                </div>
+              )}
+            </div>
+            <div className="px-5 py-3 border-t border-slate-200 bg-slate-50 flex items-center justify-between gap-2">
+              <button
+                onClick={() => setConflictoModal(null)}
+                className="h-8 px-3 text-sm font-semibold text-slate-600 border border-slate-300 rounded-lg hover:bg-slate-100"
+              >
+                Cancelar
+              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={handleDesplazarConflicto}
+                  disabled={conflictoModal.tareasConflicto.every(t => t.bloqueada)}
+                  className="h-8 px-3 text-[12px] font-semibold text-white bg-violet-600 rounded-lg hover:bg-violet-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                  title="Mover la tarea y desplazar las tareas no bloqueadas que interfieren"
+                >
+                  Desplazar conflictos
+                </button>
+                <button
+                  onClick={handleForzarConflicto}
+                  className="h-8 px-3 text-[12px] font-semibold border border-slate-300 bg-white text-slate-700 rounded-lg hover:bg-slate-50 transition-colors"
+                  title="Mover la tarea ignorando los conflictos"
+                >
+                  Forzar igual
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modal planificar */}
+      <PlanificarModal
+        visible={planificarVisible}
+        diaActual={diaActual}
+        rangoInicio={rangoInicio}
+        rangoFin={rangoFin}
+        onCerrar={() => setPlanificarVisible(false)}
+        onAplicado={cargarDatos}
+      />
+
+      {agregarEmpleadoModalVisible && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[200] backdrop-blur-sm" onClick={() => setAgregarEmpleadoModalVisible(false)}>
+          <div className="bg-white w-[420px] max-h-[80vh] rounded-lg shadow-2xl overflow-hidden flex flex-col" onClick={e => e.stopPropagation()}>
+            <div className="px-5 py-4 border-b border-slate-200 bg-slate-50">
+              <h2 className="text-lg font-bold text-slate-900">Agregar empleado al cronograma</h2>
+              <p className="text-[12px] text-slate-500 mt-0.5">
+                Seleccioná un empleado para agregarlo con su primera línea de trabajo
+              </p>
+            </div>
+            <div className="p-5 overflow-y-auto flex-1">
+              {empleadosSinLineas.length === 0 ? (
+                <div className="text-center py-6">
+                  <p className="text-sm text-slate-500">Todos los empleados ya están en el cronograma.</p>
+                  <p className="text-xs text-slate-400 mt-1">Podés agregar más líneas haciendo click derecho sobre un empleado existente.</p>
+                </div>
+              ) : (
+                <div className="space-y-1.5">
+                  {empleadosSinLineas.map(emp => (
+                    <button
+                      key={emp.id}
+                      onClick={() => handleAgregarEmpleadoAlCronograma(emp.id)}
+                      className="w-full h-10 px-3 text-left text-[13px] font-semibold text-slate-800 border border-slate-200 rounded-md hover:bg-slate-50 hover:border-slate-300 flex items-center gap-3 transition-all"
+                    >
+                      <span className="w-3 h-3 rounded-full flex-shrink-0 border border-black/10" style={{ backgroundColor: emp.color }} />
+                      {emp.nombre_completo}
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              {empleados.filter(e => e.lineas.length > 0).length > 0 && (
+                <div className="mt-4 pt-4 border-t border-slate-200">
+                  <label className="block text-[10px] uppercase tracking-wider text-slate-400 font-bold mb-2">
+                    Ya en el cronograma - agregar línea
+                  </label>
+                  <div className="space-y-1.5">
+                    {empleados.filter(e => e.lineas.length > 0).map(emp => (
+                      <button
+                        key={emp.id}
+                        onClick={() => handleAgregarLinea(emp.id)}
+                        className="w-full h-9 px-3 text-left text-[12px] font-medium text-slate-600 border border-dashed border-slate-200 rounded-md hover:bg-slate-50 hover:border-slate-300 flex items-center gap-3 transition-all"
+                      >
+                        <span className="w-2.5 h-2.5 rounded-full flex-shrink-0" style={{ backgroundColor: emp.color }} />
+                        <span className="flex-1 truncate">{emp.nombre_completo}</span>
+                        <span className="text-[10px] text-slate-400">{emp.lineas.length} {emp.lineas.length === 1 ? 'línea' : 'líneas'}</span>
+                        <Plus size={12} className="text-slate-400" />
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+            <div className="px-5 py-3 border-t border-slate-200 bg-slate-50 flex justify-end">
+              <button onClick={() => setAgregarEmpleadoModalVisible(false)} className="h-8 px-3 text-sm font-semibold text-slate-700 border border-slate-300 rounded hover:bg-slate-100">
+                Cerrar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}

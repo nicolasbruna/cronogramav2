@@ -1,0 +1,1832 @@
+import { useState, useRef, useCallback, useEffect, useLayoutEffect, useMemo, KeyboardEvent as ReactKeyboardEvent } from 'react'
+import { Lock, Unlock, Plus, Trash2, ChevronUp, ChevronDown, Link, Unlink, Package, Users, Tag } from 'lucide-react'
+import { CronogramaTarea, EmpleadoConLineas, TamanoTexto, RecursoProgramadoCronograma } from '../../types/cronograma'
+import { timeToMin, minToTime, formatDuration, isLightColor } from './cronogramaHelpers'
+
+interface CronogramaTimelineProps {
+  empleados: EmpleadoConLineas[]
+  tareas: CronogramaTarea[]
+  rangoInicio: string
+  rangoFin: string
+  zoom: number
+  rowScale: number
+  tareasSeleccionadas: string[]
+  collapsedEmpleados: string[]
+  onSeleccionarTarea: (ids: string[]) => void
+  onDobleClickTarea: (tarea: CronogramaTarea) => void
+  onCrearTarea: (lineaId: string, horaInicio: string, horaFin: string) => void
+  onMoverTarea: (tareaId: string, nuevaHoraInicio: string, nuevaHoraFin: string, nuevaLineaId?: string) => void
+  onMoverMultiTareas: (movimientos: { tareaId: string; nuevaHoraInicio: string; nuevaHoraFin: string; nuevaLineaId?: string }[]) => void
+  onResizeTarea: (tareaId: string, nuevaHoraInicio: string, nuevaHoraFin: string) => void
+  onToggleCollapse: (empId: string) => void
+  onRenombrarLinea: (lineaId: string, nuevoNombre: string) => void
+  onAgregarLinea: (empleadoId: string) => void
+  onEliminarLinea: (lineaId: string) => void
+  onMoverLinea: (empleadoId: string, lineaId: string, direccion: 'up' | 'down') => void
+  onZoomChange: (newZoom: number) => void
+  snapHorarioOriginal?: boolean
+  onCambiarTamano?: (tareaIds: string[], delta: number) => void
+  onCambiarFila?: (tareaIds: string[], delta: number) => void
+  onAgrupar?: (tareaIds: string[]) => void
+  onDesagrupar?: (tareaIds: string[]) => void
+  onBloquear?: (tareaIds: string[]) => void
+  vistaAgrupacion?: 'secciones' | 'todos'
+  modoInteligente?: boolean
+  onMoverConConflicto?: (tareaId: string, nuevaHoraInicio: string, nuevaHoraFin: string, nuevaLineaId: string, tareasConflicto: CronogramaTarea[]) => void
+}
+
+const SLOT_PAD = 6
+const MIN_TASK_MIN = 1
+const MAGNET_PX = 8
+
+export function CronogramaTimeline({
+  empleados,
+  tareas,
+  rangoInicio,
+  rangoFin,
+  zoom,
+  rowScale,
+  tareasSeleccionadas,
+  collapsedEmpleados,
+  onSeleccionarTarea,
+  onDobleClickTarea,
+  onCrearTarea,
+  onMoverTarea,
+  onMoverMultiTareas,
+  onResizeTarea,
+  onToggleCollapse,
+  onRenombrarLinea,
+  onAgregarLinea,
+  onEliminarLinea,
+  onMoverLinea,
+  onZoomChange,
+  snapHorarioOriginal = true,
+  onCambiarTamano,
+  onCambiarFila,
+  onAgrupar,
+  onDesagrupar,
+  onBloquear,
+  vistaAgrupacion = 'secciones',
+  modoInteligente = false,
+  onMoverConConflicto
+}: CronogramaTimelineProps) {
+  const wrapRef = useRef<HTMLDivElement>(null)
+  const sidebarRef = useRef<HTMLDivElement>(null)
+  const contentRef = useRef<HTMLDivElement>(null)
+  const [dragState, setDragState] = useState<DragState | null>(null)
+  const [createState, setCreateState] = useState<CreateState | null>(null)
+  const dragRef = useRef<DragState | null>(null)
+  const createRef = useRef<CreateState | null>(null)
+  const didDragRef = useRef(false)
+  const [editingLineaId, setEditingLineaId] = useState<string | null>(null)
+  const [editingLineaNombre, setEditingLineaNombre] = useState('')
+  const editInputRef = useRef<HTMLInputElement>(null)
+  const [cursorMin, setCursorMin] = useState<number | null>(null)
+  const [hoveredTask, setHoveredTask] = useState<{ id: string; x: number; y: number } | null>(null)
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; tareaId: string } | null>(null)
+  const [internalZoom, setInternalZoom] = useState(zoom)
+  const pendingScrollRef = useRef<number | null>(null)
+  const isLocalZoomRef = useRef(false)
+  const [scrollLeft, setScrollLeft] = useState(0)
+  const scrollRafRef = useRef<number | null>(null)
+  const [colorMode, setColorMode] = useState<'empleado' | 'proceso'>('empleado')
+
+  if (zoom !== internalZoom && pendingScrollRef.current === null && !isLocalZoomRef.current) {
+    setInternalZoom(zoom)
+  }
+  if (zoom === internalZoom) {
+    isLocalZoomRef.current = false
+  }
+
+  const pxPerMinBase = 5
+  const pxPerMin = pxPerMinBase * internalZoom
+  const startMin = timeToMin(rangoInicio)
+  const endMin = timeToMin(rangoFin)
+  const totalMin = Math.max(30, endMin - startMin)
+  const chartWidth = totalMin * pxPerMin
+  const effRowH = Math.round(83 * rowScale)
+  const effSlotH = Math.round(86 * rowScale)
+
+  useLayoutEffect(() => {
+    if (pendingScrollRef.current !== null && wrapRef.current) {
+      wrapRef.current.scrollLeft = pendingScrollRef.current
+      pendingScrollRef.current = null
+    }
+  })
+
+  useEffect(() => {
+    const el = wrapRef.current
+    if (!el) return
+    const onScroll = () => {
+      if (scrollRafRef.current) cancelAnimationFrame(scrollRafRef.current)
+      scrollRafRef.current = requestAnimationFrame(() => {
+        setScrollLeft(el.scrollLeft)
+      })
+    }
+    el.addEventListener('scroll', onScroll, { passive: true })
+    setScrollLeft(el.scrollLeft)
+    return () => {
+      el.removeEventListener('scroll', onScroll)
+      if (scrollRafRef.current) cancelAnimationFrame(scrollRafRef.current)
+    }
+  }, [])
+
+  // Sync vertical scroll between sidebar and timeline
+  useEffect(() => {
+    const timeline = wrapRef.current
+    const sidebar = sidebarRef.current
+    if (!timeline || !sidebar) return
+    let isSyncing = false
+    const syncFromTimeline = () => {
+      if (isSyncing) return
+      isSyncing = true
+      sidebar.scrollTop = timeline.scrollTop
+      isSyncing = false
+    }
+    const syncFromSidebar = () => {
+      if (isSyncing) return
+      isSyncing = true
+      timeline.scrollTop = sidebar.scrollTop
+      isSyncing = false
+    }
+    timeline.addEventListener('scroll', syncFromTimeline, { passive: true })
+    sidebar.addEventListener('scroll', syncFromSidebar, { passive: true })
+    return () => {
+      timeline.removeEventListener('scroll', syncFromTimeline)
+      sidebar.removeEventListener('scroll', syncFromSidebar)
+    }
+  }, [])
+
+  const minToPx = useCallback((m: number) => (m - startMin) * pxPerMin, [startMin, pxPerMin])
+  const pxToMinFn = useCallback((px: number) => px / pxPerMin + startMin, [startMin, pxPerMin])
+
+  const tareasporLinea = useMemo(() => {
+    const map: Record<string, CronogramaTarea[]> = {}
+    tareas.forEach(t => {
+      if (!t.linea_id) return  // skip autonomous tasks (linea_id = null)
+      let lineaId = t.linea_id
+      if (dragState && dragState.moved && dragState.mode === 'move') {
+        if (dragState.tareaId === t.id) {
+          lineaId = dragState.currentLineaId
+        } else if (tareasSeleccionadas.length > 1 && tareasSeleccionadas.includes(t.id) && dragState.currentLineaId !== dragState.origLineaId) {
+          lineaId = dragState.currentLineaId
+        }
+      }
+      if (!map[lineaId]) map[lineaId] = []
+      map[lineaId].push(t)
+    })
+    return map
+  }, [tareas, dragState, tareasSeleccionadas])
+
+  const getTaskColor = useCallback((tarea: CronogramaTarea): string => {
+    if (colorMode === 'proceso') {
+      // En modo proceso: usar el color de la tarea (almacenado desde el scheduler / plantilla)
+      if (tarea.color) return tarea.color
+      // Fallback: asignar color consistente por descripción (hash)
+      const PROC_COLORS = ['#3b82f6','#10b981','#f59e0b','#8b5cf6','#ef4444','#06b6d4','#f97316','#84cc16','#ec4899','#14b8a6']
+      let hash = 0
+      for (let i = 0; i < tarea.descripcion.length; i++) { hash = ((hash << 5) - hash) + tarea.descripcion.charCodeAt(i); hash |= 0 }
+      return PROC_COLORS[Math.abs(hash) % PROC_COLORS.length]
+    }
+    // Modo empleado: color del empleado por linea_id, ignora tarea.color
+    for (const emp of empleados) {
+      if (emp.lineas.some(l => l.id === tarea.linea_id)) return emp.color
+    }
+    if (tarea.color) return tarea.color
+    return '#6b7280'
+  }, [empleados, colorMode])
+
+  const todasLasLineas = useMemo(() =>
+    empleados.flatMap(emp => emp.lineas.map(linea => ({ linea, emp }))),
+    [empleados]
+  )
+
+  const MAQUINA_ROW_H = 36
+
+  const machineRows = useMemo(() => {
+    const map = new Map<string, { maquinaId: string; maquinaNombre: string; blocks: { tarea: CronogramaTarea; r: RecursoProgramadoCronograma }[] }>()
+    for (const tarea of tareas) {
+      for (const r of (tarea.recursos_programados || [])) {
+        if (!map.has(r.maquina_id)) {
+          map.set(r.maquina_id, { maquinaId: r.maquina_id, maquinaNombre: r.maquina_nombre, blocks: [] })
+        }
+        map.get(r.maquina_id)!.blocks.push({ tarea, r })
+      }
+    }
+    return [...map.values()].sort((a, b) => a.maquinaNombre.localeCompare(b.maquinaNombre))
+  }, [tareas])
+
+  const procesosRows = useMemo(() => {
+    const autonomous = tareas.filter(t => !t.linea_id)
+    if (autonomous.length === 0) return []
+    const map = new Map<string, { nombre: string; color: string; blocks: CronogramaTarea[] }>()
+    for (const tarea of autonomous) {
+      const key = tarea.descripcion
+      if (!map.has(key)) {
+        map.set(key, { nombre: tarea.descripcion, color: tarea.color || '#6b7280', blocks: [] })
+      }
+      map.get(key)!.blocks.push(tarea)
+    }
+    return [...map.values()].sort((a, b) => a.nombre.localeCompare(b.nombre))
+  }, [tareas])
+
+  const GRUPO_COLORES = ['#0ea5e9', '#f59e0b', '#10b981', '#ef4444', '#8b5cf6', '#ec4899', '#14b8a6', '#f97316']
+  const getGrupoColor = useCallback((grupoId: string): string => {
+    let hash = 0
+    for (let i = 0; i < grupoId.length; i++) {
+      hash = ((hash << 5) - hash) + grupoId.charCodeAt(i)
+      hash |= 0
+    }
+    return GRUPO_COLORES[Math.abs(hash) % GRUPO_COLORES.length]
+  }, [])
+
+  // Axis ticks - labels based on zoom
+  const axisTicks = useMemo(() => {
+    const ticks: { min: number; type: 'hour' | 'half' | 'quarter' }[] = []
+    let step: number
+    if (pxPerMin * 60 < 50) step = 120
+    else if (pxPerMin * 60 < 110) step = 60
+    else if (pxPerMin * 60 < 220) step = 30
+    else step = 15
+
+    const first = Math.ceil(startMin / step) * step
+    for (let m = first; m <= endMin; m += step) {
+      const isHour = m % 60 === 0
+      const isHalf = m % 30 === 0
+      ticks.push({ min: m, type: isHour ? 'hour' : isHalf ? 'half' : 'quarter' })
+    }
+    return ticks
+  }, [startMin, endMin, pxPerMin])
+
+
+  // Slot assignment for collapsed mode
+  const assignSlots = useCallback((tasks: CronogramaTarea[]) => {
+    const sorted = [...tasks].sort((a, b) => timeToMin(a.hora_inicio) - timeToMin(b.hora_inicio))
+    const slotEnds: number[] = []
+    const byId: Record<string, number> = {}
+    sorted.forEach(t => {
+      const s = timeToMin(t.hora_inicio)
+      const e = timeToMin(t.hora_fin)
+      let assigned = -1
+      for (let i = 0; i < slotEnds.length; i++) {
+        if (slotEnds[i] <= s) { slotEnds[i] = e; assigned = i; break }
+      }
+      if (assigned === -1) { slotEnds.push(e); assigned = slotEnds.length - 1 }
+      byId[t.id] = assigned
+    })
+    return { byId, numSlots: Math.max(1, slotEnds.length) }
+  }, [])
+
+  // Magnet snap
+  const magnetSnap = useCallback((value: number, tareaId: string, lineaId: string) => {
+    const thresholdMin = MAGNET_PX / pxPerMin
+    let best = value
+    let bestDist = thresholdMin + 1
+    const lineTasks = tareasporLinea[lineaId] || []
+    for (const t of lineTasks) {
+      if (t.id === tareaId) continue
+      for (const ed of [timeToMin(t.hora_inicio), timeToMin(t.hora_fin)]) {
+        const d = Math.abs(ed - value)
+        if (d < bestDist) { bestDist = d; best = ed }
+      }
+    }
+    return bestDist <= thresholdMin ? best : value
+  }, [pxPerMin, tareasporLinea])
+
+  const magnetSnapFila = useCallback((fila: number, tamano: number, tareaId: string, lineaId: string): number => {
+    if (!snapHorarioOriginal) return fila
+    const lineTasks = tareasporLinea[lineaId] || []
+    let best = fila
+    let bestDist = 0.6
+    for (const t of lineTasks) {
+      if (t.id === tareaId) continue
+      const otherFila = t.fila ?? 0
+      const otherTamano = t.tamano ?? 5
+      // Snap al top de otra tarea
+      const d1 = Math.abs(fila - otherFila)
+      if (d1 < bestDist) { bestDist = d1; best = otherFila }
+      // Snap al bottom de otra tarea (mi top se alinea al bottom de otra)
+      const otherBottom = otherFila + otherTamano
+      const d2 = Math.abs(fila - otherBottom)
+      if (d2 < bestDist) { bestDist = d2; best = otherBottom }
+      // Snap mi bottom al top de otra
+      const myBottom = fila + tamano
+      const d3 = Math.abs(myBottom - otherFila)
+      if (d3 < bestDist) { bestDist = d3; best = otherFila - tamano }
+      // Snap mi bottom al bottom de otra
+      const d4 = Math.abs(myBottom - otherBottom)
+      if (d4 < bestDist) { bestDist = d4; best = otherBottom - tamano }
+    }
+    return Math.max(0, Math.min(5 - tamano, best))
+  }, [tareasporLinea, snapHorarioOriginal])
+
+  // --- Drag handlers ---
+  interface DragState {
+    tareaId: string
+    mode: 'move' | 'resize-left' | 'resize-right' | 'resize-top' | 'resize-bottom' | 'move-vertical'
+    startClientX: number
+    startClientY: number
+    origStart: number
+    origEnd: number
+    origLineaId: string
+    moved: boolean
+    currentStart: number
+    currentEnd: number
+    currentLineaId: string
+    origTamano: number
+    origFila: number
+    currentTamano: number
+    currentFila: number
+  }
+
+  interface CreateState {
+    lineaId: string
+    startClientX: number
+    startMin: number
+    currentEnd: number
+    moved: boolean
+  }
+
+  const handleTaskMouseDown = useCallback((e: React.MouseEvent, tarea: CronogramaTarea, mode: DragState['mode']) => {
+    if (e.button !== 0) return
+    if (!tarea.linea_id) return  // autonomous tasks are read-only
+    if (tarea.bloqueada && mode !== 'move') return
+    if (tarea.bloqueada) return
+    e.preventDefault()
+    e.stopPropagation()
+
+    // Ctrl+Click = solo selección (se maneja en onClick), no drag
+    if (e.ctrlKey || e.metaKey) return
+
+    // Si la tarea no está en la selección, seleccionar solo esta
+    if (!tareasSeleccionadas.includes(tarea.id)) {
+      onSeleccionarTarea([tarea.id])
+    }
+
+    const state: DragState = {
+      tareaId: tarea.id,
+      mode,
+      startClientX: e.clientX,
+      startClientY: e.clientY,
+      origStart: timeToMin(tarea.hora_inicio),
+      origEnd: timeToMin(tarea.hora_fin),
+      origLineaId: tarea.linea_id,
+      moved: false,
+      currentStart: timeToMin(tarea.hora_inicio),
+      currentEnd: timeToMin(tarea.hora_fin),
+      currentLineaId: tarea.linea_id,
+      origTamano: tarea.tamano ?? 5,
+      origFila: tarea.fila ?? 0,
+      currentTamano: tarea.tamano ?? 5,
+      currentFila: tarea.fila ?? 0
+    }
+    dragRef.current = state
+    setDragState(state)
+    setHoveredTask(null)
+  }, [tareasSeleccionadas, onSeleccionarTarea])
+
+  const handleTrackMouseDown = useCallback((e: React.MouseEvent, lineaId: string) => {
+    if (e.button !== 0) return
+    if (e.target !== e.currentTarget) return
+    e.preventDefault()
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
+    const x = e.clientX - rect.left
+    const sMin = Math.round(pxToMinFn(x))
+
+    const state: CreateState = {
+      lineaId,
+      startClientX: e.clientX,
+      startMin: sMin,
+      currentEnd: sMin,
+      moved: false
+    }
+    createRef.current = state
+    setCreateState(state)
+  }, [pxToMinFn])
+
+  const detectLineaUnderCursor = useCallback((clientY: number): string | null => {
+    const tracks = wrapRef.current?.querySelectorAll('[data-linea-track]')
+    if (!tracks) return null
+    for (const track of Array.from(tracks)) {
+      const rect = track.getBoundingClientRect()
+      if (clientY >= rect.top && clientY <= rect.bottom) {
+        return (track as HTMLElement).dataset.lineaTrack || null
+      }
+    }
+    return null
+  }, [])
+
+  useEffect(() => {
+    const handleMouseMove = (e: MouseEvent) => {
+      if (dragRef.current) {
+        const dx = e.clientX - dragRef.current.startClientX
+        const dy = e.clientY - dragRef.current.startClientY
+        if (!dragRef.current.moved && Math.abs(dx) < 3 && Math.abs(dy) < 3) return
+        dragRef.current.moved = true
+
+        const dMin = dx / pxPerMin
+        let ns = dragRef.current.origStart
+        let ne = dragRef.current.origEnd
+        const dur = ne - ns
+
+        const isVerticalMode = dragRef.current.mode === 'resize-top' || dragRef.current.mode === 'resize-bottom' || dragRef.current.mode === 'move-vertical'
+
+        if (isVerticalMode) {
+          const filaHeight = effRowH / 5
+          const dyFilas = Math.round(dy / filaHeight)
+
+          if (dragRef.current.mode === 'move-vertical') {
+            let newFila = Math.max(0, Math.min(5 - dragRef.current.origTamano, dragRef.current.origFila + dyFilas))
+            newFila = magnetSnapFila(newFila, dragRef.current.origTamano, dragRef.current.tareaId, dragRef.current.origLineaId)
+            dragRef.current.currentFila = newFila
+            dragRef.current.currentTamano = dragRef.current.origTamano
+          } else if (dragRef.current.mode === 'resize-top') {
+            // Estirar desde arriba: reduce fila, aumenta tamano
+            const deltaFilas = Math.max(-dragRef.current.origFila, Math.min(dragRef.current.origTamano - 1, dyFilas))
+            dragRef.current.currentFila = dragRef.current.origFila + deltaFilas
+            dragRef.current.currentTamano = dragRef.current.origTamano - deltaFilas
+          } else if (dragRef.current.mode === 'resize-bottom') {
+            // Estirar desde abajo: aumenta tamano sin cambiar fila
+            const maxGrow = 5 - dragRef.current.origFila - dragRef.current.origTamano
+            const deltaSize = Math.max(-(dragRef.current.origTamano - 1), Math.min(maxGrow, dyFilas))
+            dragRef.current.currentTamano = dragRef.current.origTamano + deltaSize
+            dragRef.current.currentFila = dragRef.current.origFila
+          }
+
+          // Clamp tamano 1-5
+          dragRef.current.currentTamano = Math.max(1, Math.min(5, dragRef.current.currentTamano))
+          dragRef.current.currentFila = Math.max(0, Math.min(5 - dragRef.current.currentTamano, dragRef.current.currentFila))
+        } else if (dragRef.current.mode === 'move') {
+          ns = dragRef.current.origStart + dMin
+          ne = ns + dur
+          if (ns < startMin) { ns = startMin; ne = ns + dur }
+          if (ne > endMin) { ne = endMin; ns = ne - dur }
+
+          // Detect target line: solo cambiar si el cursor salió del track original
+          const origTrackEl = wrapRef.current?.querySelector(`[data-linea-track="${dragRef.current.origLineaId}"]`) as HTMLElement | null
+          const origTrackRect = origTrackEl?.getBoundingClientRect()
+          const cursorInOrigTrack = origTrackRect && e.clientY >= origTrackRect.top && e.clientY <= origTrackRect.bottom
+          if (!cursorInOrigTrack) {
+            const targetLineaId = detectLineaUnderCursor(e.clientY)
+            if (targetLineaId) {
+              dragRef.current.currentLineaId = targetLineaId
+            }
+          } else {
+            dragRef.current.currentLineaId = dragRef.current.origLineaId
+          }
+
+          // Mover fila verticalmente (basado en dy)
+          const filaHeight = effRowH / 5
+          const dyFilas = Math.round(dy / filaHeight)
+          const maxFila = 5 - dragRef.current.origTamano
+          let newFila = Math.max(0, Math.min(maxFila, dragRef.current.origFila + dyFilas))
+          newFila = magnetSnapFila(newFila, dragRef.current.origTamano, dragRef.current.tareaId, dragRef.current.currentLineaId)
+          dragRef.current.currentFila = newFila
+
+          const snapLineaId = dragRef.current.currentLineaId
+          const sSnap = magnetSnap(ns, dragRef.current.tareaId, snapLineaId)
+          if (sSnap !== ns) { ns = sSnap; ne = ns + dur }
+
+          // Snap al horario original cuando se mueve a otra línea
+          if (snapHorarioOriginal && snapLineaId !== dragRef.current.origLineaId) {
+            const thresholdMin = MAGNET_PX / pxPerMin
+            const distToOrig = Math.abs(ns - dragRef.current.origStart)
+            if (distToOrig < thresholdMin * 2) {
+              ns = dragRef.current.origStart
+              ne = ns + dur
+            }
+          }
+        } else if (dragRef.current.mode === 'resize-left') {
+          ns = dragRef.current.origStart + dMin
+          if (ns < startMin) ns = startMin
+          if (ns > ne - MIN_TASK_MIN) ns = ne - MIN_TASK_MIN
+          ns = magnetSnap(ns, dragRef.current.tareaId, dragRef.current.origLineaId)
+        } else {
+          ne = dragRef.current.origEnd + dMin
+          if (ne > endMin) ne = endMin
+          if (ne < ns + MIN_TASK_MIN) ne = ns + MIN_TASK_MIN
+          ne = magnetSnap(ne, dragRef.current.tareaId, dragRef.current.origLineaId)
+        }
+
+        dragRef.current.currentStart = Math.round(ns)
+        dragRef.current.currentEnd = Math.round(ne)
+        setDragState({ ...dragRef.current })
+      }
+
+      if (createRef.current) {
+        const dx = e.clientX - createRef.current.startClientX
+        if (!createRef.current.moved && Math.abs(dx) < 4) return
+        createRef.current.moved = true
+        const rect = document.querySelector(`[data-linea-track="${createRef.current.lineaId}"]`)?.getBoundingClientRect()
+        if (rect) {
+          const x = e.clientX - rect.left
+          createRef.current.currentEnd = Math.round(pxToMinFn(x))
+        }
+        setCreateState({ ...createRef.current })
+      }
+    }
+
+    const handleMouseUp = () => {
+      didDragRef.current = !!(dragRef.current && dragRef.current.moved)
+      if (dragRef.current && dragRef.current.moved) {
+        const { tareaId, currentStart, currentEnd, mode, currentLineaId, origLineaId, origStart, currentTamano, currentFila, origTamano, origFila } = dragRef.current
+        const isVerticalMode = mode === 'resize-top' || mode === 'resize-bottom' || mode === 'move-vertical'
+
+        if (isVerticalMode) {
+          if (currentTamano !== origTamano || currentFila !== origFila) {
+            const ids = tareasSeleccionadas.includes(tareaId) ? tareasSeleccionadas : [tareaId]
+            if (currentTamano !== origTamano) {
+              onCambiarTamano?.(ids, currentTamano - origTamano)
+            }
+            if (currentFila !== origFila) {
+              onCambiarFila?.(ids, currentFila - origFila)
+            }
+          }
+        } else if (mode === 'move') {
+          const deltaMin = currentStart - origStart
+          const nuevaLinea = currentLineaId !== origLineaId ? currentLineaId : undefined
+          if (tareasSeleccionadas.length > 1 && tareasSeleccionadas.includes(tareaId)) {
+            const movimientos = tareasSeleccionadas
+              .map(id => tareas.find(t => t.id === id))
+              .filter((t): t is CronogramaTarea => !!t && !t.bloqueada)
+              .map(t => {
+                const tStart = timeToMin(t.hora_inicio) + deltaMin
+                const tEnd = timeToMin(t.hora_fin) + deltaMin
+                return {
+                  tareaId: t.id,
+                  nuevaHoraInicio: minToTime(Math.max(startMin, tStart)),
+                  nuevaHoraFin: minToTime(Math.min(endMin, tEnd)),
+                  nuevaLineaId: nuevaLinea
+                }
+              })
+            onMoverMultiTareas(movimientos)
+          } else {
+            onMoverTarea(tareaId, minToTime(currentStart), minToTime(currentEnd), nuevaLinea)
+          }
+          // Aplicar cambio de fila si hubo movimiento vertical
+          if (currentFila !== origFila) {
+            const ids = tareasSeleccionadas.includes(tareaId) ? tareasSeleccionadas : [tareaId]
+            onCambiarFila?.(ids, currentFila - origFila)
+          }
+        } else {
+          onResizeTarea(tareaId, minToTime(currentStart), minToTime(currentEnd))
+        }
+      }
+      dragRef.current = null
+      setDragState(null)
+
+      if (createRef.current) {
+        if (createRef.current.moved) {
+          const s = Math.min(createRef.current.startMin, createRef.current.currentEnd)
+          const f = Math.max(createRef.current.startMin, createRef.current.currentEnd)
+          const clampS = Math.max(startMin, s)
+          const clampF = Math.min(endMin, f)
+          if (clampF - clampS >= 1) {
+            onCrearTarea(createRef.current.lineaId, minToTime(clampS), minToTime(clampF))
+          }
+        } else {
+          onSeleccionarTarea([])
+        }
+      }
+      createRef.current = null
+      setCreateState(null)
+    }
+
+    document.addEventListener('mousemove', handleMouseMove)
+    document.addEventListener('mouseup', handleMouseUp)
+    return () => {
+      document.removeEventListener('mousemove', handleMouseMove)
+      document.removeEventListener('mouseup', handleMouseUp)
+    }
+  }, [pxPerMin, startMin, endMin, magnetSnap, magnetSnapFila, pxToMinFn, onMoverTarea, onMoverMultiTareas, onResizeTarea, onCrearTarea, detectLineaUnderCursor, onSeleccionarTarea, tareasSeleccionadas, tareas, effRowH, onCambiarTamano, onCambiarFila, snapHorarioOriginal])
+
+  // Get task position (considering drag state)
+  const getTaskPos = (tarea: CronogramaTarea) => {
+    if (dragState && dragState.tareaId === tarea.id && dragState.moved) {
+      return { start: dragState.currentStart, end: dragState.currentEnd }
+    }
+    if (dragState && dragState.moved && dragState.mode === 'move' && tareasSeleccionadas.length > 1 && tareasSeleccionadas.includes(tarea.id) && dragState.tareaId !== tarea.id) {
+      const deltaMin = dragState.currentStart - dragState.origStart
+      const s = timeToMin(tarea.hora_inicio) + deltaMin
+      const e = timeToMin(tarea.hora_fin) + deltaMin
+      return { start: Math.max(startMin, s), end: Math.min(endMin, e) }
+    }
+    return { start: timeToMin(tarea.hora_inicio), end: timeToMin(tarea.hora_fin) }
+  }
+
+  // Now line
+  const [nowMin, setNowMin] = useState(() => {
+    const n = new Date()
+    return n.getHours() * 60 + n.getMinutes()
+  })
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const n = new Date()
+      setNowMin(n.getHours() * 60 + n.getMinutes())
+    }, 60000)
+    return () => clearInterval(interval)
+  }, [])
+
+  const showNow = nowMin >= startMin && nowMin <= endMin
+
+  const getTamanoTextoClass = (tamano: TamanoTexto | undefined): string => {
+    switch (tamano) {
+      case 'xs': return 'text-[9px]'
+      case 'sm': return 'text-[10.5px]'
+      case 'lg': return 'text-[14px]'
+      case 'xl': return 'text-[16px]'
+      default: return 'text-[12px]'
+    }
+  }
+
+  const getAdjacentBorders = (tarea: CronogramaTarea) => {
+    const { start, end } = getTaskPos(tarea)
+    const effectiveLineaId = (dragState && dragState.tareaId === tarea.id && dragState.moved && dragState.mode === 'move')
+      ? dragState.currentLineaId
+      : (tarea.linea_id || '')
+    const lineTasks = tareasporLinea[effectiveLineaId] || []
+    let touchesLeft = false
+    let touchesRight = false
+    for (const other of lineTasks) {
+      if (other.id === tarea.id) continue
+      const otherPos = getTaskPos(other)
+      if (Math.abs(otherPos.end - start) < 1) touchesLeft = true
+      if (Math.abs(end - otherPos.start) < 1) touchesRight = true
+    }
+    return { touchesLeft, touchesRight }
+  }
+
+  const getTaskTamano = (tarea: CronogramaTarea): number => {
+    if (dragState && dragState.tareaId === tarea.id && dragState.moved) {
+      return dragState.currentTamano
+    }
+    return tarea.tamano ?? 5
+  }
+
+  const getTaskFila = (tarea: CronogramaTarea): number => {
+    if (dragState && dragState.tareaId === tarea.id && dragState.moved) {
+      return dragState.currentFila
+    }
+    return tarea.fila ?? 0
+  }
+
+  const darkenColor = (hex: string, amount: number): string => {
+    const c = hex.replace('#', '')
+    const r = Math.max(0, parseInt(c.slice(0, 2), 16) - amount)
+    const g = Math.max(0, parseInt(c.slice(2, 4), 16) - amount)
+    const b = Math.max(0, parseInt(c.slice(4, 6), 16) - amount)
+    return `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}`
+  }
+
+  const getTaskZIndex = (tarea: CronogramaTarea, isDragging: boolean, isPartOfMultiDrag: boolean, isSelected: boolean, duration: number): number => {
+    if (isDragging || isPartOfMultiDrag) return 50
+    if (isSelected) return 40
+    const tamano = tarea.tamano ?? 5
+    const durationPenalty = Math.min(Math.floor(duration / 10), 20)
+    // Tareas mas chicas (menor tamano) van arriba visualmente
+    return 2 + (5 - tamano) * 5 + (20 - durationPenalty)
+  }
+
+  const getTextPosition = (tarea: CronogramaTarea, taskStart: number, taskEnd: number, taskWidth: number, taskLeft: number, taskHeight: number): { x: number; y: number; gapWidth: number } => {
+    const effectiveLineaId = (dragState && dragState.tareaId === tarea.id && dragState.moved && dragState.mode === 'move')
+      ? dragState.currentLineaId : (tarea.linea_id || '')
+    const lineTasks = tareasporLinea[effectiveLineaId] || []
+    const taskDuration = taskEnd - taskStart
+    const taskTamano = getTaskTamano(tarea)
+    const taskFila = getTaskFila(tarea)
+
+    // Determinar tareas que visualmente tapan a esta (mayor z-index + solapamiento horizontal y vertical)
+    const coveringRanges: { startPx: number; endPx: number; verticalOverlapRatio: number }[] = []
+
+    for (const other of lineTasks) {
+      if (other.id === tarea.id) continue
+      const otherPos = getTaskPos(other)
+      if (otherPos.start >= taskEnd || otherPos.end <= taskStart) continue
+
+      const otherTamano = getTaskTamano(other)
+      const otherFila = getTaskFila(other)
+
+      const thisTop = taskFila
+      const thisBottom = taskFila + taskTamano
+      const otherTop = otherFila
+      const otherBottom = otherFila + otherTamano
+      if (otherTop >= thisBottom || otherBottom <= thisTop) continue
+
+      const otherDuration = otherPos.end - otherPos.start
+      if (otherTamano < taskTamano) {
+        // Menor tamano = mayor z-index
+      } else if (otherTamano === taskTamano) {
+        if (otherDuration >= taskDuration) continue
+      } else {
+        continue
+      }
+
+      const overlapStart = Math.max(otherPos.start, taskStart)
+      const overlapEnd = Math.min(otherPos.end, taskEnd)
+      const vOverlapTop = Math.max(thisTop, otherTop)
+      const vOverlapBottom = Math.min(thisBottom, otherBottom)
+      const verticalOverlapRatio = (vOverlapBottom - vOverlapTop) / taskTamano
+
+      coveringRanges.push({
+        startPx: (overlapStart - taskStart) * pxPerMin,
+        endPx: (overlapEnd - taskStart) * pxPerMin,
+        verticalOverlapRatio
+      })
+    }
+
+    // Sin superposiciones: alineado a la izquierda, centrado verticalmente
+    if (coveringRanges.length === 0) {
+      return { x: 0, y: 0, gapWidth: taskWidth }
+    }
+
+    coveringRanges.sort((a, b) => a.startPx - b.startPx)
+
+    // Merge rangos cubiertos horizontalmente
+    const merged: { startPx: number; endPx: number }[] = []
+    for (const range of coveringRanges) {
+      if (merged.length > 0 && range.startPx <= merged[merged.length - 1].endPx) {
+        merged[merged.length - 1].endPx = Math.max(merged[merged.length - 1].endPx, range.endPx)
+      } else {
+        merged.push({ startPx: range.startPx, endPx: range.endPx })
+      }
+    }
+
+    // Calcular zona libre vertical: buscar franjas arriba/abajo no cubiertas
+    const slotH = taskHeight / taskTamano
+    const coveringTasks = lineTasks.filter(other => {
+      if (other.id === tarea.id) return false
+      const otherPos = getTaskPos(other)
+      if (otherPos.start >= taskEnd || otherPos.end <= taskStart) return false
+      const otherTamano = getTaskTamano(other)
+      const otherFila = getTaskFila(other)
+      const thisTop = taskFila
+      const thisBottom = taskFila + taskTamano
+      const otherTop = otherFila
+      const otherBottom = otherFila + otherTamano
+      if (otherTop >= thisBottom || otherBottom <= thisTop) return false
+      const otherDuration = otherPos.end - otherPos.start
+      if (otherTamano < taskTamano) return true
+      if (otherTamano === taskTamano && otherDuration < taskDuration) return true
+      return false
+    })
+
+    let yOffset = 0
+    let verticallyFree = false
+    if (coveringTasks.length > 0) {
+      const coveredTopPx = Math.min(...coveringTasks.map(t => (getTaskFila(t) - taskFila) * slotH))
+      const coveredBottomPx = Math.max(...coveringTasks.map(t => (getTaskFila(t) + getTaskTamano(t) - taskFila) * slotH))
+
+      const freeAbovePx = Math.max(0, coveredTopPx)
+      const freeBelowPx = Math.max(0, taskHeight - coveredBottomPx)
+
+      if (freeBelowPx > 4) {
+        const freeCenterPx = (coveredBottomPx + taskHeight) / 2
+        yOffset = freeCenterPx - taskHeight / 2
+        verticallyFree = true
+      } else if (freeAbovePx > 4) {
+        const freeCenterPx = coveredTopPx / 2
+        yOffset = freeCenterPx - taskHeight / 2
+        verticallyFree = true
+      }
+    }
+
+    // Si el texto se movio verticalmente a zona libre, usar ancho completo centrado
+    if (verticallyFree) {
+      return { x: 0, y: yOffset, gapWidth: taskWidth }
+    }
+
+    // Buscar mejor posicion horizontal libre
+    const viewportWidth = wrapRef.current?.clientWidth || taskWidth
+    const visibleStart = Math.max(0, scrollLeft - taskLeft)
+    const visibleEnd = Math.min(taskWidth, scrollLeft - taskLeft + viewportWidth)
+
+    const allCuts: number[] = [0, taskWidth]
+    for (const range of merged) {
+      if (range.startPx > 0 && range.startPx < taskWidth) allCuts.push(range.startPx)
+      if (range.endPx > 0 && range.endPx < taskWidth) allCuts.push(range.endPx)
+    }
+    allCuts.sort((a, b) => a - b)
+
+    type FreeGap = { start: number; end: number; size: number; visiblePortion: number }
+    const gaps: FreeGap[] = []
+    for (let i = 0; i < allCuts.length - 1; i++) {
+      const segStart = allCuts[i]
+      const segEnd = allCuts[i + 1]
+      const segMid = (segStart + segEnd) / 2
+      const isCovered = merged.some(r => segMid >= r.startPx && segMid < r.endPx)
+      if (!isCovered) {
+        const size = segEnd - segStart
+        const vStart = Math.max(segStart, visibleStart)
+        const vEnd = Math.min(segEnd, visibleEnd)
+        const visiblePortion = Math.max(0, vEnd - vStart)
+        gaps.push({ start: segStart, end: segEnd, size, visiblePortion })
+      }
+    }
+
+    gaps.sort((a, b) => {
+      if (a.visiblePortion >= 30 && b.visiblePortion < 30) return -1
+      if (b.visiblePortion >= 30 && a.visiblePortion < 30) return 1
+      if (a.visiblePortion >= 30 && b.visiblePortion >= 30) return b.visiblePortion - a.visiblePortion
+      return b.size - a.size
+    })
+
+    const bestGap = gaps[0]
+    if (bestGap && bestGap.size >= 20) {
+      // Centrar dentro del gap visible
+      const gapVisStart = Math.max(bestGap.start, visibleStart)
+      const gapVisEnd = Math.min(bestGap.end, visibleEnd)
+      const gapVisMid = (gapVisStart + gapVisEnd) / 2
+      const x = Math.max(bestGap.start, Math.min(gapVisMid, bestGap.end - 20))
+      return { x, y: 0, gapWidth: bestGap.size }
+    }
+
+    return { x: visibleStart, y: 0, gapWidth: 20 }
+  }
+
+  const renderTask = (tarea: CronogramaTarea, top: number, height: number) => {
+    const { start, end } = getTaskPos(tarea)
+    const left = minToPx(start)
+    const width = Math.max(3, (end - start) * pxPerMin)
+    const duration = end - start
+    const color = getTaskColor(tarea)
+    const tamano = getTaskTamano(tarea)
+    const fila = getTaskFila(tarea)
+    const effectiveColor = tamano < 5 ? darkenColor(color, (5 - tamano) * 20) : color
+    const light = isLightColor(effectiveColor)
+    const isSelected = tareasSeleccionadas.includes(tarea.id)
+    const isGrupoHighlight = !isSelected && tarea.grupo_id && tareasSeleccionadas.some(id => {
+      const t = tareas.find(ta => ta.id === id)
+      return t?.grupo_id === tarea.grupo_id
+    })
+    const isDragging = !!(dragState?.tareaId === tarea.id && dragState?.moved)
+    const isPartOfMultiDrag = !!(dragState?.moved && dragState.mode === 'move' && tareasSeleccionadas.length > 1 && tareasSeleccionadas.includes(tarea.id) && dragState.tareaId !== tarea.id)
+    const isTiny = width < 30
+    const { touchesLeft, touchesRight } = getAdjacentBorders(tarea)
+
+    const slotHeight = height / 5
+    const effectiveHeight = Math.round(slotHeight * tamano)
+    const effectiveTop = top + Math.round(fila * slotHeight)
+
+    const defaultBorder = '1px solid rgba(0,0,0,0.75)'
+    const connectedBorder = '2px solid #000000'
+
+    return (
+      <div
+        key={tarea.id}
+        className={`absolute flex flex-col justify-center ${tarea.orientacion_texto === 'vertical' ? 'items-center' : ''} select-none transition-[opacity,shadow,ring,outline,filter] duration-150
+          ${isDragging || isPartOfMultiDrag ? 'overflow-visible' : 'overflow-hidden'}
+          ${isSelected ? 'ring-2 ring-blue-500 ring-offset-1' : isGrupoHighlight ? 'outline outline-2 outline-dashed outline-blue-400/60 outline-offset-1' : ''}
+          ${isDragging || isPartOfMultiDrag ? 'opacity-90 shadow-xl cursor-grabbing' : tamano < 5 ? 'cursor-grab shadow-md' : 'cursor-grab shadow-sm'}
+          ${!isDragging && !isPartOfMultiDrag ? 'hover:shadow-xl hover:brightness-105' : ''}
+          ${tarea.bloqueada ? 'cursor-default' : ''}
+        `}
+        style={{
+          left: `${left}px`,
+          width: `${width}px`,
+          top: `${effectiveTop}px`,
+          height: `${effectiveHeight}px`,
+          backgroundColor: effectiveColor,
+          borderRadius: 0,
+          borderTop: defaultBorder,
+          borderBottom: defaultBorder,
+          borderLeft: tarea.grupo_id ? `4px solid ${getGrupoColor(tarea.grupo_id)}` : touchesLeft ? connectedBorder : defaultBorder,
+          borderRight: touchesRight ? connectedBorder : defaultBorder,
+          zIndex: getTaskZIndex(tarea, isDragging, isPartOfMultiDrag, isSelected, duration)
+        }}
+        onMouseDown={e => handleTaskMouseDown(e, tarea, 'move')}
+        onMouseEnter={e => setHoveredTask({ id: tarea.id, x: e.clientX, y: e.clientY })}
+        onMouseMove={e => { if (hoveredTask?.id === tarea.id) setHoveredTask({ id: tarea.id, x: e.clientX, y: e.clientY }) }}
+        onMouseLeave={() => setHoveredTask(null)}
+        onClick={e => {
+          e.stopPropagation()
+          if (didDragRef.current) { didDragRef.current = false; return }
+          if (e.ctrlKey || e.metaKey) {
+            if (tareasSeleccionadas.includes(tarea.id)) {
+              onSeleccionarTarea(tareasSeleccionadas.filter(id => id !== tarea.id))
+            } else {
+              onSeleccionarTarea([...tareasSeleccionadas, tarea.id])
+            }
+          } else {
+            onSeleccionarTarea([tarea.id])
+          }
+        }}
+        onDoubleClick={e => { e.stopPropagation(); onDobleClickTarea(tarea) }}
+        onContextMenu={e => {
+          e.preventDefault()
+          e.stopPropagation()
+          if (!tareasSeleccionadas.includes(tarea.id)) {
+            onSeleccionarTarea([tarea.id])
+          }
+          setContextMenu({ x: e.clientX, y: e.clientY, tareaId: tarea.id })
+        }}
+      >
+        {!isTiny && tarea.orientacion_texto === 'vertical' ? (
+          <span
+            className={`${getTamanoTextoClass(tarea.tamano_texto)} font-semibold pointer-events-none relative z-[1] ${light ? 'text-slate-900' : 'text-white'}`}
+            style={{
+              writingMode: 'vertical-rl',
+              textOrientation: 'mixed',
+              transform: 'rotate(180deg)',
+              maxHeight: `${width}px`,
+              lineHeight: 1,
+              padding: 0
+            }}
+          >
+            {tarea.descripcion}
+          </span>
+        ) : !isTiny ? (() => {
+          const { x: textX, y: textY, gapWidth } = getTextPosition(tarea, start, end, width, left, effectiveHeight)
+          const lineH = tarea.tamano_texto === 'xl' ? 18 : tarea.tamano_texto === 'lg' ? 16 : tarea.tamano_texto === 'sm' ? 12 : tarea.tamano_texto === 'xs' ? 10 : 14
+          const isCentered = textX === -1
+          const clampedLeft = isCentered ? 0 : Math.min(textX, width - 20)
+          const availableWidth = isCentered ? width : Math.min(gapWidth, width - Math.max(0, clampedLeft))
+          return (
+            <span
+              className={`absolute px-1 ${getTamanoTextoClass(tarea.tamano_texto)} font-semibold leading-[1.15] pointer-events-none overflow-hidden z-[1] transition-[left,top] duration-200 ease-out ${light ? 'text-slate-900' : 'text-white'}`}
+              style={{
+                left: isCentered ? '50%' : `${Math.max(0, clampedLeft)}px`,
+                transform: isCentered ? `translate(-50%, ${textY}px)` : `translateY(${textY}px)`,
+                top: 0,
+                bottom: 0,
+                display: 'flex',
+                alignItems: 'center',
+                maxWidth: `${availableWidth}px`,
+                wordBreak: 'break-word'
+              }}
+            >
+              <span
+                style={{
+                  display: '-webkit-box',
+                  WebkitBoxOrient: 'vertical',
+                  WebkitLineClamp: Math.max(1, Math.floor(effectiveHeight / lineH)),
+                  overflow: 'hidden',
+                  textAlign: isCentered ? 'center' : undefined
+                }}
+              >
+                {tarea.descripcion}
+              </span>
+            </span>
+          )
+        })() : null}
+        {tarea.bloqueada && (
+          <span className={`absolute top-1 right-1 ${light ? 'text-slate-600' : 'text-white/70'}`}>
+            <Lock size={10} />
+          </span>
+        )}
+        {tarea.grupo_id && (
+          <span
+            className="absolute top-0.5 left-0.5 flex items-center justify-center rounded-sm pointer-events-none"
+            style={{ backgroundColor: getGrupoColor(tarea.grupo_id), width: '16px', height: '16px' }}
+          >
+            <Link size={10} className="text-white" />
+          </span>
+        )}
+        {!tarea.bloqueada && (
+          <>
+            <div
+              className="absolute top-0 bottom-0 left-0 w-1.5 cursor-ew-resize hover:bg-white/20"
+              onMouseDown={e => { e.stopPropagation(); handleTaskMouseDown(e, tarea, 'resize-left') }}
+            />
+            <div
+              className="absolute top-0 bottom-0 right-0 w-1.5 cursor-ew-resize hover:bg-white/20"
+              onMouseDown={e => { e.stopPropagation(); handleTaskMouseDown(e, tarea, 'resize-right') }}
+            />
+            <div
+              className="absolute top-0 left-1.5 right-1.5 h-1.5 cursor-ns-resize hover:bg-white/20"
+              onMouseDown={e => { e.stopPropagation(); handleTaskMouseDown(e, tarea, 'resize-top') }}
+            />
+            <div
+              className="absolute bottom-0 left-1.5 right-1.5 h-1.5 cursor-ns-resize hover:bg-white/20"
+              onMouseDown={e => { e.stopPropagation(); handleTaskMouseDown(e, tarea, 'resize-bottom') }}
+            />
+          </>
+        )}
+        {isDragging && (dragState.mode === 'move' || dragState.mode === 'resize-left') && (
+          <div className="absolute -top-5 left-0 pointer-events-none z-[60]">
+            <span className="bg-slate-800 text-white text-[10px] font-mono font-bold px-1.5 py-0.5 rounded shadow-lg whitespace-nowrap">
+              {minToTime(dragState.currentStart)}
+            </span>
+          </div>
+        )}
+        {isDragging && (dragState.mode === 'move' || dragState.mode === 'resize-right') && (
+          <div className="absolute -top-5 right-0 pointer-events-none z-[60]">
+            <span className="bg-slate-800 text-white text-[10px] font-mono font-bold px-1.5 py-0.5 rounded shadow-lg whitespace-nowrap">
+              {minToTime(dragState.currentEnd)}
+            </span>
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  const handleLineaDblClick = useCallback((e: React.MouseEvent, lineaId: string, nombreActual: string) => {
+    e.stopPropagation()
+    setEditingLineaId(lineaId)
+    setEditingLineaNombre(nombreActual)
+    setTimeout(() => editInputRef.current?.select(), 0)
+  }, [])
+
+  const handleLineaRenameConfirm = useCallback(() => {
+    if (editingLineaId && editingLineaNombre.trim()) {
+      onRenombrarLinea(editingLineaId, editingLineaNombre.trim())
+    }
+    setEditingLineaId(null)
+  }, [editingLineaId, editingLineaNombre, onRenombrarLinea])
+
+  const handleLineaRenameKeyDown = useCallback((e: ReactKeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter') handleLineaRenameConfirm()
+    if (e.key === 'Escape') setEditingLineaId(null)
+  }, [handleLineaRenameConfirm])
+
+  const handleTrackDblClick = useCallback((e: React.MouseEvent, lineaId: string) => {
+    if (e.target !== e.currentTarget) return
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
+    const x = e.clientX - rect.left
+    const sM = Math.round(pxToMinFn(x))
+    const eM = Math.min(sM + 30, endMin)
+    onCrearTarea(lineaId, minToTime(Math.max(sM, startMin)), minToTime(eM))
+  }, [pxToMinFn, endMin, startMin, onCrearTarea])
+
+  useEffect(() => {
+    if (!contextMenu) return
+    const close = () => setContextMenu(null)
+    window.addEventListener('click', close)
+    window.addEventListener('contextmenu', close)
+    window.addEventListener('scroll', close, true)
+    return () => {
+      window.removeEventListener('click', close)
+      window.removeEventListener('contextmenu', close)
+      window.removeEventListener('scroll', close, true)
+    }
+  }, [contextMenu])
+
+  const onZoomChangeRef = useRef(onZoomChange)
+  onZoomChangeRef.current = onZoomChange
+
+  useEffect(() => {
+    const el = wrapRef.current
+    if (!el) return
+    const handleWheel = (e: WheelEvent) => {
+      if (e.deltaY !== 0) {
+        if (e.ctrlKey || e.metaKey) {
+          e.preventDefault()
+          const dir: 1 | -1 = e.deltaY > 0 ? -1 : 1
+          const newZoom = Math.max(0.2, Math.min(10, +(internalZoom + dir * 0.1).toFixed(1)))
+          if (newZoom === internalZoom) return
+          const newPxPerMin = pxPerMinBase * newZoom
+          const rect = el.getBoundingClientRect()
+          const offsetFromLeft = e.clientX - rect.left
+          const xInContent = el.scrollLeft + offsetFromLeft
+          const minAtCursor = xInContent / pxPerMin + startMin
+          const newXInContent = (minAtCursor - startMin) * newPxPerMin
+          pendingScrollRef.current = newXInContent - offsetFromLeft
+          isLocalZoomRef.current = true
+          setInternalZoom(newZoom)
+          onZoomChangeRef.current(newZoom)
+        } else {
+          e.preventDefault()
+          el.scrollLeft += e.deltaY
+        }
+      }
+    }
+    el.addEventListener('wheel', handleWheel, { passive: false })
+    return () => el.removeEventListener('wheel', handleWheel)
+  }, [pxPerMin, startMin, internalZoom])
+
+  const handleChartMouseMove = useCallback((e: React.MouseEvent) => {
+    const target = e.currentTarget as HTMLElement
+    const rect = target.getBoundingClientRect()
+    const x = e.clientX - rect.left
+    if (x < 0 || x > chartWidth) {
+      setCursorMin(null)
+      return
+    }
+    setCursorMin(Math.round(x / pxPerMin + startMin))
+  }, [chartWidth, pxPerMin, startMin])
+
+  const handleChartMouseLeave = useCallback(() => {
+    setCursorMin(null)
+  }, [])
+
+  const contextTarea = contextMenu ? tareas.find(t => t.id === contextMenu.tareaId) : null
+  const contextBloqueada = contextTarea?.bloqueada ?? false
+  const contextPuedeAgrupar = tareasSeleccionadas.length >= 2
+  const contextPuedeDesagrupar = tareasSeleccionadas.some(id => tareas.find(t => t.id === id)?.grupo_id)
+
+  return (
+    <>
+    <div className="flex-1 flex overflow-hidden bg-white relative">
+      {/* Left panel: fixed employee/linea column */}
+      <div ref={sidebarRef} className="w-[200px] flex-shrink-0 overflow-y-auto overflow-x-hidden border-r border-slate-200 z-[60] [&::-webkit-scrollbar]:hidden" style={{ scrollbarWidth: 'none' }}>
+        {/* Sidebar header */}
+        <div className="h-11 flex items-center px-3 bg-white border-b border-slate-200 sticky top-0 z-10 gap-2">
+          <span className="text-[9px] uppercase tracking-widest text-slate-400 font-extrabold flex-1">
+            {vistaAgrupacion === 'todos' ? 'Líneas' : 'Empleado / Línea'}
+          </span>
+          {/* Toggle color mode */}
+          <div className="flex items-center gap-0.5 bg-slate-100 rounded p-0.5 flex-shrink-0">
+            <button
+              onClick={() => setColorMode('empleado')}
+              title="Color por empleado"
+              className={`w-6 h-5 flex items-center justify-center rounded text-[9px] transition-colors ${colorMode === 'empleado' ? 'bg-white shadow text-slate-700' : 'text-slate-400 hover:text-slate-600'}`}
+            >
+              <Users size={10} />
+            </button>
+            <button
+              onClick={() => setColorMode('proceso')}
+              title="Color por proceso"
+              className={`w-6 h-5 flex items-center justify-center rounded text-[9px] transition-colors ${colorMode === 'proceso' ? 'bg-white shadow text-slate-700' : 'text-slate-400 hover:text-slate-600'}`}
+            >
+              <Tag size={10} />
+            </button>
+          </div>
+        </div>
+
+        {/* Sidebar rows - vista plana (todos) */}
+        {vistaAgrupacion === 'todos' && todasLasLineas.map(({ linea, emp }) => (
+          <div
+            key={linea.id}
+            className="relative border-b border-slate-200 flex items-center group/linea bg-white"
+            style={{ minHeight: effRowH + 'px' }}
+          >
+            <div className="absolute left-3 top-0 bottom-0 w-0.5 opacity-50" style={{ backgroundColor: emp.color }} />
+            <div className="flex items-center flex-1 px-3 pl-6 min-h-0">
+              {editingLineaId === linea.id ? (
+                <input
+                  ref={editInputRef}
+                  value={editingLineaNombre}
+                  onChange={e => setEditingLineaNombre(e.target.value)}
+                  onBlur={handleLineaRenameConfirm}
+                  onKeyDown={handleLineaRenameKeyDown}
+                  className="text-[11.5px] font-semibold text-slate-800 bg-white border border-blue-400 rounded px-1.5 py-0.5 w-full outline-none ring-1 ring-blue-200"
+                  autoFocus
+                />
+              ) : (
+                <>
+                  <div className="flex flex-col flex-1 min-w-0">
+                    <span
+                      className="text-[11px] font-bold truncate leading-none"
+                      style={{ color: emp.color }}
+                    >
+                      {emp.nombre_completo}
+                    </span>
+                    <span
+                      className="text-[11.5px] font-semibold text-slate-600 truncate cursor-text hover:text-slate-900"
+                      onDoubleClick={e => handleLineaDblClick(e, linea.id, linea.nombre)}
+                    >
+                      {linea.nombre}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-0.5 opacity-0 group-hover/linea:opacity-100 transition-opacity flex-shrink-0">
+                    <button
+                      onClick={e => { e.stopPropagation(); onEliminarLinea(linea.id) }}
+                      className="w-5 h-5 flex items-center justify-center rounded hover:bg-red-100 text-slate-400 hover:text-red-600"
+                      title="Eliminar línea"
+                    >
+                      <Trash2 size={11} />
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        ))}
+
+        {/* Sidebar rows - vista por secciones */}
+        {vistaAgrupacion === 'secciones' && empleados.map(emp => {
+          const isCollapsed = collapsedEmpleados.includes(emp.id)
+          const empTareas = tareas.filter(t => {
+            const effectiveLineaId = (dragState && dragState.tareaId === t.id && dragState.moved && dragState.mode === 'move')
+              ? dragState.currentLineaId
+              : t.linea_id
+            return emp.lineas.some(l => l.id === effectiveLineaId)
+          })
+
+          return (
+            <div key={emp.id} className="border-b-2 border-slate-900">
+              {isCollapsed ? (() => {
+                const { numSlots } = assignSlots(empTareas)
+                const rowH = numSlots * effSlotH + SLOT_PAD * 2
+                return (
+                  <div className="bg-slate-700 flex flex-col" style={{ height: rowH + 'px' }}>
+                    <div
+                      className="flex items-center gap-2 px-2 py-1 cursor-pointer hover:bg-slate-600 group/emp flex-shrink-0"
+                      onClick={() => onToggleCollapse(emp.id)}
+                    >
+                      <span className="font-mono text-[11px] font-bold text-slate-300 w-3 text-center">{'\u25B8'}</span>
+                      <span className="w-3 h-3 rounded-full flex-shrink-0 border border-white/30" style={{ backgroundColor: emp.color }} />
+                      <span className="font-bold text-[12px] text-white tracking-tight truncate flex-1">{emp.nombre_completo}</span>
+                      <button
+                        onClick={e => { e.stopPropagation(); onAgregarLinea(emp.id) }}
+                        className="w-5 h-5 flex items-center justify-center rounded opacity-0 group-hover/emp:opacity-100 hover:bg-slate-500 text-slate-300 hover:text-white transition-opacity"
+                        title="Agregar línea"
+                      >
+                        <Plus size={12} />
+                      </button>
+                    </div>
+                    <div className="flex items-center flex-1 px-3 pl-7 min-h-0">
+                      <span className="text-[11px] font-semibold text-slate-400">
+                        {numSlots} {numSlots === 1 ? 'fila' : 'filas'} · {emp.lineas.length} líneas
+                      </span>
+                    </div>
+                  </div>
+                )
+              })() : (
+                emp.lineas.map((linea, idx) => {
+                  const isFirstRow = idx === 0
+                  return (
+                    <div
+                      key={linea.id}
+                      className={`relative ${idx > 0 ? 'border-t border-slate-200' : ''} flex flex-col group/linea ${
+                        isFirstRow ? 'bg-white' : idx % 2 === 1 ? 'bg-slate-50/80' : 'bg-white'
+                      }`}
+                      style={{ minHeight: effRowH + 'px' }}
+                    >
+                      {isFirstRow ? (
+                        <div className="flex flex-col h-full">
+                          <div
+                            className="flex items-center gap-2 px-2 py-1 cursor-pointer bg-slate-700 hover:bg-slate-600 group/emp flex-shrink-0"
+                            onClick={() => onToggleCollapse(emp.id)}
+                          >
+                            <span className="font-mono text-[11px] font-bold text-slate-300 w-3 text-center">{'\u25BE'}</span>
+                            <span className="w-3 h-3 rounded-full flex-shrink-0 border border-white/30" style={{ backgroundColor: emp.color }} />
+                            <span className="font-bold text-[12px] text-white tracking-tight truncate flex-1">{emp.nombre_completo}</span>
+                            <button
+                              onClick={e => { e.stopPropagation(); onAgregarLinea(emp.id) }}
+                              className="w-5 h-5 flex items-center justify-center rounded opacity-0 group-hover/emp:opacity-100 hover:bg-slate-500 text-slate-300 hover:text-white transition-opacity"
+                              title="Agregar línea"
+                            >
+                              <Plus size={12} />
+                            </button>
+                          </div>
+                          <div className="flex items-center flex-1 px-3 pl-7 min-h-0">
+                            <div className="absolute left-3 top-0 bottom-0 w-0.5 opacity-50" style={{ backgroundColor: emp.color }} />
+                            {editingLineaId === linea.id ? (
+                              <input
+                                ref={editInputRef}
+                                value={editingLineaNombre}
+                                onChange={e => setEditingLineaNombre(e.target.value)}
+                                onBlur={handleLineaRenameConfirm}
+                                onKeyDown={handleLineaRenameKeyDown}
+                                className="text-[11.5px] font-semibold text-slate-800 bg-white border border-blue-400 rounded px-1.5 py-0.5 w-full outline-none ring-1 ring-blue-200"
+                                autoFocus
+                              />
+                            ) : (
+                              <>
+                                <span
+                                  className="text-[11.5px] font-semibold text-slate-600 truncate cursor-text hover:text-slate-900 flex-1"
+                                  onDoubleClick={e => handleLineaDblClick(e, linea.id, linea.nombre)}
+                                >
+                                  {linea.nombre}
+                                </span>
+                                <div className="flex items-center gap-0.5 opacity-0 group-hover/linea:opacity-100 transition-opacity flex-shrink-0">
+                                  {emp.lineas.length > 1 && idx < emp.lineas.length - 1 && (
+                                    <button
+                                      onClick={e => { e.stopPropagation(); onMoverLinea(emp.id, linea.id, 'down') }}
+                                      className="w-5 h-5 flex items-center justify-center rounded hover:bg-slate-200 text-slate-400 hover:text-slate-700"
+                                      title="Bajar línea"
+                                    >
+                                      <ChevronDown size={12} />
+                                    </button>
+                                  )}
+                                  <button
+                                    onClick={e => { e.stopPropagation(); onEliminarLinea(linea.id) }}
+                                    className="w-5 h-5 flex items-center justify-center rounded hover:bg-red-100 text-slate-400 hover:text-red-600"
+                                    title="Eliminar línea"
+                                  >
+                                    <Trash2 size={11} />
+                                  </button>
+                                </div>
+                              </>
+                            )}
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="flex items-center flex-1 px-3 pl-7">
+                          <div className="absolute left-3 top-0 bottom-0 w-0.5 opacity-50" style={{ backgroundColor: emp.color }} />
+                          {editingLineaId === linea.id ? (
+                            <input
+                              ref={editInputRef}
+                              value={editingLineaNombre}
+                              onChange={e => setEditingLineaNombre(e.target.value)}
+                              onBlur={handleLineaRenameConfirm}
+                              onKeyDown={handleLineaRenameKeyDown}
+                              className="text-[12.5px] font-semibold text-slate-800 bg-white border border-blue-400 rounded px-1.5 py-0.5 w-full outline-none ring-1 ring-blue-200"
+                              autoFocus
+                            />
+                          ) : (
+                            <>
+                              <span
+                                className="text-[12.5px] font-semibold text-slate-600 truncate cursor-text hover:text-slate-900 flex-1"
+                                onDoubleClick={e => handleLineaDblClick(e, linea.id, linea.nombre)}
+                              >
+                                {linea.nombre}
+                              </span>
+                              <div className="flex items-center gap-0.5 opacity-0 group-hover/linea:opacity-100 transition-opacity flex-shrink-0">
+                                {idx > 0 && (
+                                  <button
+                                    onClick={e => { e.stopPropagation(); onMoverLinea(emp.id, linea.id, 'up') }}
+                                    className="w-5 h-5 flex items-center justify-center rounded hover:bg-slate-200 text-slate-400 hover:text-slate-700"
+                                    title="Subir línea"
+                                  >
+                                    <ChevronUp size={12} />
+                                  </button>
+                                )}
+                                {idx < emp.lineas.length - 1 && (
+                                  <button
+                                    onClick={e => { e.stopPropagation(); onMoverLinea(emp.id, linea.id, 'down') }}
+                                    className="w-5 h-5 flex items-center justify-center rounded hover:bg-slate-200 text-slate-400 hover:text-slate-700"
+                                    title="Bajar línea"
+                                  >
+                                    <ChevronDown size={12} />
+                                  </button>
+                                )}
+                                <button
+                                  onClick={e => { e.stopPropagation(); onEliminarLinea(linea.id) }}
+                                  className="w-5 h-5 flex items-center justify-center rounded hover:bg-red-100 text-slate-400 hover:text-red-600"
+                                  title="Eliminar línea"
+                                >
+                                  <Trash2 size={11} />
+                                </button>
+                              </div>
+                            </>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )
+                })
+              )}
+            </div>
+          )
+        })}
+        {/* Sección de procesos autónomos en sidebar */}
+        {procesosRows.length > 0 && (
+          <>
+            <div className="h-8 flex items-center gap-1.5 px-3 bg-slate-700 border-t-2 border-slate-800">
+              <span className="text-[9px] uppercase tracking-widest text-slate-300 font-extrabold">Procesos</span>
+            </div>
+            {procesosRows.map(proc => (
+              <div key={proc.nombre} className="border-b border-slate-200 flex items-center gap-2 px-3 bg-white" style={{ height: MAQUINA_ROW_H + 'px' }}>
+                <span className="w-2 h-2 rounded-full flex-shrink-0" style={{ backgroundColor: proc.color }} />
+                <span className="text-[11px] font-semibold text-slate-700 truncate">{proc.nombre}</span>
+              </div>
+            ))}
+          </>
+        )}
+        {/* Sección de máquinas en sidebar */}
+        {machineRows.length > 0 && (
+          <>
+            <div className="h-8 flex items-center gap-1.5 px-3 bg-slate-800 border-t-2 border-slate-900">
+              <Package size={11} className="text-slate-400 flex-shrink-0" />
+              <span className="text-[9px] uppercase tracking-widest text-slate-400 font-extrabold">Máquinas</span>
+            </div>
+            {machineRows.map(maq => (
+              <div key={maq.maquinaId} className="border-b border-slate-200 flex items-center gap-2 px-3 bg-white" style={{ height: MAQUINA_ROW_H + 'px' }}>
+                <Package size={11} className="text-slate-400 flex-shrink-0" />
+                <span className="text-[11px] font-semibold text-slate-700 truncate">{maq.maquinaNombre}</span>
+              </div>
+            ))}
+          </>
+        )}
+      </div>
+
+      {/* Right panel: scrollable timeline */}
+      <div ref={wrapRef} className="flex-1 overflow-x-auto overflow-y-auto relative">
+        <div
+          ref={contentRef}
+          className="relative"
+          style={{ minWidth: chartWidth + 'px' }}
+          onMouseMove={handleChartMouseMove}
+          onMouseLeave={handleChartMouseLeave}
+        >
+          {/* Axis row */}
+          <div className="h-11 sticky top-0 z-40 bg-white border-b border-slate-200">
+            <div className="relative" style={{ width: chartWidth + 'px', height: '100%' }}>
+              {axisTicks.map(tick => (
+                <div
+                  key={tick.min}
+                  className={`absolute top-0 bottom-0 ${
+                    tick.type === 'hour' ? 'border-l border-slate-900/20' :
+                    tick.type === 'half' ? 'border-l border-slate-900/10' :
+                    'border-l border-dashed border-slate-900/5'
+                  }`}
+                  style={{ left: minToPx(tick.min) + 'px' }}
+                >
+                  <span className={`absolute left-1 whitespace-nowrap font-mono ${
+                    tick.type === 'hour' ? 'top-2.5 text-[12px] font-bold text-slate-800' :
+                    tick.type === 'half' ? 'top-3 text-[10.5px] font-semibold text-slate-500' :
+                    'top-3 text-[9.5px] font-medium text-slate-400'
+                  }`}>
+                    {minToTime(tick.min)}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Timeline rows - vista plana (todos) */}
+          {vistaAgrupacion === 'todos' && todasLasLineas.map(({ linea }) => {
+            const lineTasks = tareasporLinea[linea.id] || []
+            return (
+              <div
+                key={linea.id}
+                data-linea-track={linea.id}
+                className={`relative cursor-crosshair border-b border-slate-200 transition-colors duration-150 ${
+                  dragState && dragState.moved && dragState.mode === 'move' && dragState.currentLineaId === linea.id && dragState.origLineaId !== linea.id
+                    ? 'bg-blue-50'
+                    : 'bg-white'
+                }`}
+                style={{
+                  width: chartWidth + 'px',
+                  minHeight: effRowH + 'px',
+                  backgroundImage: `
+                    repeating-linear-gradient(to right, transparent 0, transparent ${10 * pxPerMin - 1}px, rgba(11,16,32,0.04) ${10 * pxPerMin - 1}px, rgba(11,16,32,0.04) ${10 * pxPerMin}px),
+                    repeating-linear-gradient(to right, transparent 0, transparent ${30 * pxPerMin - 1}px, rgba(11,16,32,0.08) ${30 * pxPerMin - 1}px, rgba(11,16,32,0.08) ${30 * pxPerMin}px),
+                    repeating-linear-gradient(to right, transparent 0, transparent ${60 * pxPerMin - 1}px, rgba(11,16,32,0.15) ${60 * pxPerMin - 1}px, rgba(11,16,32,0.15) ${60 * pxPerMin}px)
+                  `
+                }}
+                onMouseDown={e => handleTrackMouseDown(e, linea.id)}
+                onDoubleClick={e => handleTrackDblClick(e, linea.id)}
+              >
+                {lineTasks.map(tarea => renderTask(tarea, 0, effRowH))}
+                {snapHorarioOriginal && dragState && dragState.moved && dragState.mode === 'move' && dragState.currentLineaId === linea.id && dragState.origLineaId !== linea.id && (
+                  <div
+                    className="absolute top-0 bottom-0 border-2 border-dashed border-emerald-400 bg-emerald-400/10 rounded-sm pointer-events-none z-[3] transition-opacity"
+                    style={{
+                      left: minToPx(dragState.origStart) + 'px',
+                      width: (dragState.origEnd - dragState.origStart) * pxPerMin + 'px',
+                      opacity: Math.abs(dragState.currentStart - dragState.origStart) < (MAGNET_PX / pxPerMin * 2) ? 1 : 0.4
+                    }}
+                  >
+                    <span className="absolute inset-0 flex items-center justify-center font-mono text-[10px] font-bold text-emerald-600">
+                      {minToTime(dragState.origStart)} – {minToTime(dragState.origEnd)}
+                    </span>
+                  </div>
+                )}
+                {createState && createState.moved && createState.lineaId === linea.id && (
+                  <GhostTask
+                    startMin={Math.min(createState.startMin, createState.currentEnd)}
+                    endMin={Math.max(createState.startMin, createState.currentEnd)}
+                    minToPx={minToPx}
+                    pxPerMin={pxPerMin}
+                    rangoStartMin={startMin}
+                    rangoEndMin={endMin}
+                  />
+                )}
+              </div>
+            )
+          })}
+
+          {/* Employee timeline rows - vista por secciones */}
+          {vistaAgrupacion === 'secciones' && empleados.map(emp => {
+            const isCollapsed = collapsedEmpleados.includes(emp.id)
+            const empTareas = tareas.filter(t => {
+              const effectiveLineaId = (dragState && dragState.tareaId === t.id && dragState.moved && dragState.mode === 'move')
+                ? dragState.currentLineaId
+                : t.linea_id
+              return emp.lineas.some(l => l.id === effectiveLineaId)
+            })
+
+            return (
+              <div key={emp.id} className="border-b-2 border-slate-900">
+                {isCollapsed ? (() => {
+                  const { byId, numSlots } = assignSlots(empTareas)
+                  const rowH = numSlots * effSlotH + SLOT_PAD * 2
+                  const defaultLaneId = emp.lineas[0]?.id || ''
+                  return (
+                    <div
+                      data-linea-track={defaultLaneId}
+                      className="relative cursor-crosshair"
+                      style={{
+                        width: chartWidth + 'px',
+                        height: rowH + 'px',
+                        backgroundImage: `
+                          repeating-linear-gradient(to right, transparent 0, transparent ${10 * pxPerMin - 1}px, rgba(11,16,32,0.04) ${10 * pxPerMin - 1}px, rgba(11,16,32,0.04) ${10 * pxPerMin}px),
+                          repeating-linear-gradient(to right, transparent 0, transparent ${30 * pxPerMin - 1}px, rgba(11,16,32,0.08) ${30 * pxPerMin - 1}px, rgba(11,16,32,0.08) ${30 * pxPerMin}px),
+                          repeating-linear-gradient(to right, transparent 0, transparent ${60 * pxPerMin - 1}px, rgba(11,16,32,0.15) ${60 * pxPerMin - 1}px, rgba(11,16,32,0.15) ${60 * pxPerMin}px)
+                        `
+                      }}
+                      onMouseDown={e => handleTrackMouseDown(e, defaultLaneId)}
+                      onDoubleClick={e => handleTrackDblClick(e, defaultLaneId)}
+                    >
+                      {empTareas.map(tarea => {
+                        const slot = byId[tarea.id] || 0
+                        const top = SLOT_PAD + slot * effSlotH
+                        return renderTask(tarea, top, effSlotH - 2)
+                      })}
+                      {createState && createState.moved && createState.lineaId === defaultLaneId && (
+                        <GhostTask
+                          startMin={Math.min(createState.startMin, createState.currentEnd)}
+                          endMin={Math.max(createState.startMin, createState.currentEnd)}
+                          minToPx={minToPx}
+                          pxPerMin={pxPerMin}
+                          rangoStartMin={0}
+                          rangoEndMin={1440}
+                        />
+                      )}
+                    </div>
+                  )
+                })() : (
+                  emp.lineas.map((linea, idx) => {
+                    const lineTasks = tareasporLinea[linea.id] || []
+                    return (
+                      <div
+                        key={linea.id}
+                        data-linea-track={linea.id}
+                        className={`relative cursor-crosshair transition-colors duration-150 ${idx > 0 ? 'border-t border-slate-200' : ''} ${
+                          dragState && dragState.moved && dragState.mode === 'move' && dragState.currentLineaId === linea.id && dragState.origLineaId !== linea.id
+                            ? 'bg-blue-50'
+                            : 'bg-white'
+                        }`}
+                        style={{
+                          width: chartWidth + 'px',
+                          minHeight: effRowH + 'px',
+                          backgroundImage: `
+                            repeating-linear-gradient(to right, transparent 0, transparent ${10 * pxPerMin - 1}px, rgba(11,16,32,0.04) ${10 * pxPerMin - 1}px, rgba(11,16,32,0.04) ${10 * pxPerMin}px),
+                            repeating-linear-gradient(to right, transparent 0, transparent ${30 * pxPerMin - 1}px, rgba(11,16,32,0.08) ${30 * pxPerMin - 1}px, rgba(11,16,32,0.08) ${30 * pxPerMin}px),
+                            repeating-linear-gradient(to right, transparent 0, transparent ${60 * pxPerMin - 1}px, rgba(11,16,32,0.15) ${60 * pxPerMin - 1}px, rgba(11,16,32,0.15) ${60 * pxPerMin}px)
+                          `
+                        }}
+                        onMouseDown={e => handleTrackMouseDown(e, linea.id)}
+                        onDoubleClick={e => handleTrackDblClick(e, linea.id)}
+                      >
+                        {lineTasks.map(tarea => renderTask(tarea, 0, effRowH))}
+                        {snapHorarioOriginal && dragState && dragState.moved && dragState.mode === 'move' && dragState.currentLineaId === linea.id && dragState.origLineaId !== linea.id && (
+                          <div
+                            className="absolute top-0 bottom-0 border-2 border-dashed border-emerald-400 bg-emerald-400/10 rounded-sm pointer-events-none z-[3] transition-opacity"
+                            style={{
+                              left: minToPx(dragState.origStart) + 'px',
+                              width: (dragState.origEnd - dragState.origStart) * pxPerMin + 'px',
+                              opacity: Math.abs(dragState.currentStart - dragState.origStart) < (MAGNET_PX / pxPerMin * 2) ? 1 : 0.4
+                            }}
+                          >
+                            <span className="absolute inset-0 flex items-center justify-center font-mono text-[10px] font-bold text-emerald-600">
+                              {minToTime(dragState.origStart)} – {minToTime(dragState.origEnd)}
+                            </span>
+                          </div>
+                        )}
+                        {createState && createState.moved && createState.lineaId === linea.id && (
+                          <GhostTask
+                            startMin={Math.min(createState.startMin, createState.currentEnd)}
+                            endMin={Math.max(createState.startMin, createState.currentEnd)}
+                            minToPx={minToPx}
+                            pxPerMin={pxPerMin}
+                            rangoStartMin={startMin}
+                            rangoEndMin={endMin}
+                          />
+                        )}
+                      </div>
+                    )
+                  })
+                )}
+              </div>
+            )
+          })}
+
+          {/* Filas de procesos autónomos */}
+          {procesosRows.length > 0 && (
+            <>
+              <div
+                className="flex items-center gap-1.5 px-3 bg-slate-700 border-t-2 border-slate-800"
+                style={{ width: chartWidth + 'px', height: '32px' }}
+              >
+                <span className="text-[9px] uppercase tracking-widest text-slate-300 font-extrabold">Procesos</span>
+              </div>
+              {procesosRows.map(proc => (
+                <div
+                  key={proc.nombre}
+                  className="relative border-b border-slate-200 bg-slate-50"
+                  style={{ width: chartWidth + 'px', height: MAQUINA_ROW_H + 'px' }}
+                >
+                  {axisTicks.map(tick => (
+                    <div
+                      key={tick.min}
+                      className={`absolute top-0 bottom-0 ${tick.type === 'hour' ? 'border-l border-slate-200' : 'border-l border-slate-100'}`}
+                      style={{ left: minToPx(tick.min) + 'px' }}
+                    />
+                  ))}
+                  {proc.blocks.map((tarea, i) => {
+                    const left = minToPx(timeToMin(tarea.hora_inicio))
+                    const width = Math.max(4, (timeToMin(tarea.hora_fin) - timeToMin(tarea.hora_inicio)) * pxPerMin)
+                    const color = proc.color
+                    return (
+                      <div
+                        key={i}
+                        className="absolute rounded overflow-hidden flex items-center px-1 cursor-default"
+                        style={{ left, width, top: 4, bottom: 4, backgroundColor: color + 'cc', border: `1.5px solid ${color}` }}
+                        title={`${tarea.descripcion} · ${tarea.hora_inicio} – ${tarea.hora_fin}`}
+                      >
+                        {width > 40 && (
+                          <span className="text-[9px] font-bold text-white truncate leading-none drop-shadow-sm">
+                            {tarea.descripcion}
+                          </span>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+              ))}
+            </>
+          )}
+
+          {/* Filas de máquinas */}
+          {machineRows.length > 0 && (
+            <>
+              <div
+                className="flex items-center gap-1.5 px-3 bg-slate-800 border-t-2 border-slate-900"
+                style={{ width: chartWidth + 'px', height: '32px' }}
+              >
+                <span className="text-[9px] uppercase tracking-widest text-slate-400 font-extrabold">Recursos de máquinas</span>
+              </div>
+              {machineRows.map(maq => (
+                <div
+                  key={maq.maquinaId}
+                  className="relative border-b border-slate-200 bg-slate-50"
+                  style={{ width: chartWidth + 'px', height: MAQUINA_ROW_H + 'px' }}
+                >
+                  {axisTicks.map(tick => (
+                    <div
+                      key={tick.min}
+                      className={`absolute top-0 bottom-0 ${tick.type === 'hour' ? 'border-l border-slate-200' : 'border-l border-slate-100'}`}
+                      style={{ left: minToPx(tick.min) + 'px' }}
+                    />
+                  ))}
+                  {maq.blocks.map(({ tarea, r }, i) => {
+                    const left = minToPx(timeToMin(r.hora_inicio))
+                    const width = Math.max(4, (timeToMin(r.hora_fin) - timeToMin(r.hora_inicio)) * pxPerMin)
+                    const color = getTaskColor(tarea)
+                    return (
+                      <div
+                        key={i}
+                        className="absolute rounded overflow-hidden flex items-center px-1 cursor-default"
+                        style={{ left, width, top: 5, bottom: 5, backgroundColor: color + 'cc', border: `1.5px solid ${color}` }}
+                        title={`${tarea.descripcion} · ${r.hora_inicio} – ${r.hora_fin}`}
+                      >
+                        {width > 40 && (
+                          <span className="text-[9px] font-bold text-white truncate leading-none drop-shadow-sm">
+                            {tarea.descripcion}
+                          </span>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+              ))}
+            </>
+          )}
+
+          {/* Cursor guide line */}
+          {cursorMin !== null && cursorMin >= startMin && cursorMin <= endMin && (
+            <div
+              className="absolute top-11 bottom-0 pointer-events-none z-[20]"
+              style={{ left: minToPx(cursorMin) + 'px' }}
+            >
+              <div className="absolute top-0 bottom-0 border-l border-dashed border-black/40" />
+              <div className="absolute -top-5 -translate-x-1/2 left-0">
+                <span className="bg-black/80 text-white text-[10px] font-mono font-bold px-1.5 py-0.5 rounded shadow whitespace-nowrap">
+                  {minToTime(cursorMin)}
+                </span>
+              </div>
+            </div>
+          )}
+
+          {/* Now line */}
+          {showNow && (
+            <div
+              className="absolute top-0 bottom-0 border-l-2 border-red-500 pointer-events-none z-[25]"
+              style={{ left: minToPx(nowMin) + 'px' }}
+            >
+              <div className="absolute -top-0 -left-[5px] w-[10px] h-[10px] bg-red-500 rounded-full shadow-[0_0_0_3px_rgba(239,68,68,0.2)]" />
+              <div className="absolute top-3 left-1 bg-red-500 text-white text-[10px] font-mono font-bold px-1.5 py-0.5 rounded whitespace-nowrap">
+                {minToTime(nowMin)}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+
+    {/* Hover tooltip */}
+    {hoveredTask && !dragState && (() => {
+      const tarea = tareas.find(t => t.id === hoveredTask.id)
+      if (!tarea) return null
+      // Separar etapa y plantilla del campo descripcion ("Amasar · Pan francés")
+      const partes = tarea.descripcion.split(' · ')
+      const nombreEtapa = partes[0]
+      const nombrePlantilla = partes.length > 1 ? partes.slice(1).join(' · ') : null
+      const empNombre = (() => {
+        for (const emp of empleados) {
+          if (emp.lineas.some(l => l.id === tarea.linea_id)) return emp.nombre_completo
+        }
+        return null
+      })()
+      return (
+        <div
+          className="fixed pointer-events-none z-[100]"
+          style={{ left: hoveredTask.x + 12, top: hoveredTask.y - 32 }}
+        >
+          <div className="bg-slate-900 text-white text-[11px] font-semibold px-2.5 py-1.5 rounded-md shadow-lg max-w-[360px] leading-tight">
+            {tarea.es_provisoria && (
+              <div className="text-[9px] font-bold text-amber-400 mb-0.5 flex items-center gap-1">
+                ⚠️ PROVISORIA
+              </div>
+            )}
+            <div>{nombreEtapa}</div>
+            {nombrePlantilla && (
+              <div className="text-[10px] text-blue-300 font-medium mt-0.5">{nombrePlantilla}</div>
+            )}
+            {empNombre && (
+              <div className="text-[10px] text-slate-400 mt-0.5">{empNombre}</div>
+            )}
+            <div className="text-[10px] text-slate-300 font-mono mt-0.5">
+              {tarea.hora_inicio} – {tarea.hora_fin} · {formatDuration(timeToMin(tarea.hora_fin) - timeToMin(tarea.hora_inicio))}
+            </div>
+            {tarea.notas_provisoria && (
+              <div className="text-[10px] text-amber-300 mt-0.5 italic">{tarea.notas_provisoria}</div>
+            )}
+          </div>
+        </div>
+      )
+    })()}
+
+    {contextMenu && (
+      <div
+        className="fixed z-[9999] bg-white border border-slate-200 shadow-xl py-1 min-w-[180px] text-[12px]"
+        style={{ left: contextMenu.x, top: contextMenu.y }}
+        onClick={e => e.stopPropagation()}
+        onContextMenu={e => e.preventDefault()}
+      >
+        <button
+          className="w-full px-3 py-1.5 text-left flex items-center gap-2 hover:bg-slate-100 text-slate-700"
+          onClick={() => { onCambiarTamano?.(tareasSeleccionadas, 1); setContextMenu(null) }}
+        >
+          <ChevronUp size={14} /> Agrandar
+        </button>
+        <button
+          className="w-full px-3 py-1.5 text-left flex items-center gap-2 hover:bg-slate-100 text-slate-700"
+          onClick={() => { onCambiarTamano?.(tareasSeleccionadas, -1); setContextMenu(null) }}
+        >
+          <ChevronDown size={14} /> Achicar
+        </button>
+        <button
+          className="w-full px-3 py-1.5 text-left flex items-center gap-2 hover:bg-slate-100 text-slate-700"
+          onClick={() => { onCambiarFila?.(tareasSeleccionadas, -1); setContextMenu(null) }}
+        >
+          <ChevronUp size={14} /> Subir fila
+        </button>
+        <button
+          className="w-full px-3 py-1.5 text-left flex items-center gap-2 hover:bg-slate-100 text-slate-700"
+          onClick={() => { onCambiarFila?.(tareasSeleccionadas, 1); setContextMenu(null) }}
+        >
+          <ChevronDown size={14} /> Bajar fila
+        </button>
+        <div className="border-t border-slate-100 my-1" />
+        <button
+          className="w-full px-3 py-1.5 text-left flex items-center gap-2 hover:bg-slate-100 text-slate-700 disabled:opacity-40 disabled:cursor-not-allowed"
+          disabled={!contextPuedeAgrupar}
+          onClick={() => { onAgrupar?.(tareasSeleccionadas); setContextMenu(null) }}
+        >
+          <Link size={14} /> Agrupar
+        </button>
+        <button
+          className="w-full px-3 py-1.5 text-left flex items-center gap-2 hover:bg-slate-100 text-slate-700 disabled:opacity-40 disabled:cursor-not-allowed"
+          disabled={!contextPuedeDesagrupar}
+          onClick={() => { onDesagrupar?.(tareasSeleccionadas); setContextMenu(null) }}
+        >
+          <Unlink size={14} /> Desagrupar
+        </button>
+        <div className="border-t border-slate-100 my-1" />
+        <button
+          className="w-full px-3 py-1.5 text-left flex items-center gap-2 hover:bg-slate-100 text-slate-700"
+          onClick={() => { onBloquear?.(tareasSeleccionadas); setContextMenu(null) }}
+        >
+          {contextBloqueada ? <><Unlock size={14} /> Desbloquear</> : <><Lock size={14} /> Bloquear</>}
+        </button>
+      </div>
+    )}
+    </>
+  )
+}
+
+
+function GhostTask({ startMin: s, endMin: e, minToPx, pxPerMin, rangoStartMin, rangoEndMin }: {
+  startMin: number; endMin: number; minToPx: (m: number) => number; pxPerMin: number; rangoStartMin: number; rangoEndMin: number
+}) {
+  const clampS = Math.max(rangoStartMin, s)
+  const clampE = Math.min(rangoEndMin, e)
+  if (clampE - clampS < 1) return null
+  return (
+    <div
+      className="absolute top-1.5 bottom-1.5 border-2 border-dashed border-blue-500 bg-blue-500/10 rounded-md flex items-center justify-center pointer-events-none z-[4]"
+      style={{
+        left: minToPx(clampS) + 'px',
+        width: (clampE - clampS) * pxPerMin + 'px'
+      }}
+    >
+      <span className="font-mono text-[11px] font-bold text-blue-600">
+        {minToTime(clampS)} – {minToTime(clampE)} · {formatDuration(clampE - clampS)}
+      </span>
+    </div>
+  )
+}

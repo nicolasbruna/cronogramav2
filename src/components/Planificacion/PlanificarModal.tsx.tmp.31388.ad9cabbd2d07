@@ -1,0 +1,1067 @@
+import { useState, useEffect, useCallback } from 'react'
+import { X, Plus, Trash2, Play, Check, AlertTriangle, User, Package, ChevronUp, ChevronDown, Layers, LayoutList, Timer, ChevronRight, RefreshCw } from 'lucide-react'
+import { PlanDia, PlantillaProceso, EtapaScheduled, Maquina } from '../../types/planificacion'
+import { planificacionService } from '../../services/planificacionService'
+import { generarCronograma, minToTimeStr } from '../../services/schedulerService'
+import { cronogramaService } from '../../services/cronogramaService'
+import { DIAS_SEMANA_NOMBRES } from '../../types/cronograma'
+import { supabase } from '../../config/supabase'
+
+// ---- Tipos locales ----
+
+interface ResolucionConflicto {
+  empleadoId: string | null    // ID del empleado del sistema, '__otro__' = libre, null = autónomo
+  empleadoTexto: string        // nombre a mostrar/usar
+  horaInicio: string           // HH:MM
+  horaFin: string              // HH:MM
+  maquinaId: string | null
+  notas: string
+  esProvisoria: boolean
+}
+
+// ---- Helpers ----
+
+const PALETTE = [
+  '#3b82f6', '#10b981', '#f59e0b', '#8b5cf6', '#ef4444',
+  '#06b6d4', '#f97316', '#84cc16', '#ec4899', '#14b8a6'
+]
+const LABEL_W = 112
+const ROW_H = 36
+const PX_PER_MIN = 2.2
+
+interface PlanificarModalProps {
+  visible: boolean
+  diaActual: number
+  rangoInicio: string
+  rangoFin: string
+  onCerrar: () => void
+  onAplicado: () => void
+}
+
+function timeStrToMin(t: string): number {
+  const [h, m] = t.split(':').map(Number)
+  return h * 60 + m
+}
+function minToHHMM(min: number | null | undefined): string {
+  if (min == null) return ''
+  const h = Math.floor(min / 60)
+  const m = min % 60
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`
+}
+function HHMMtoMin(hhmm: string): number | null {
+  if (!hhmm) return null
+  const [h, m] = hhmm.split(':').map(Number)
+  return h * 60 + m
+}
+
+// ---- Componente principal ----
+
+export function PlanificarModal({ visible, diaActual, rangoInicio, rangoFin, onCerrar, onAplicado }: PlanificarModalProps) {
+  const [plan, setPlan] = useState<PlanDia[]>([])
+  const [plantillas, setPlantillas] = useState<PlantillaProceso[]>([])
+  const [loading, setLoading] = useState(false)
+  const [agregandoId, setAgregandoId] = useState<string>('')
+  const [generando, setGenerando] = useState(false)
+  const [resultado, setResultado] = useState<EtapaScheduled[] | null>(null)
+  const [conflictos, setConflictos] = useState<EtapaScheduled[]>([])
+  const [aplicando, setAplicando] = useState(false)
+  const [paso, setPaso] = useState<'plan' | 'preview'>('plan')
+
+  // Datos para resolución de conflictos
+  const [empleadosState, setEmpleadosState] = useState<{ id: string; nombre_completo: string }[]>([])
+  const [maquinasState, setMaquinasState] = useState<Maquina[]>([])
+  const [resoluciones, setResoluciones] = useState<Map<string, ResolucionConflicto>>(new Map())
+
+  // Dialog Option C (provisorias existentes)
+  const [provisoriasExistentes, setProvisoriasExistentes] = useState(0)
+  const [showOpcionC, setShowOpcionC] = useState(false)
+  const [pendingGenerar, setPendingGenerar] = useState(false)
+
+  const cargar = useCallback(async () => {
+    if (!visible) return
+    setLoading(true)
+    setPaso('plan')
+    setResultado(null)
+    setConflictos([])
+    setResoluciones(new Map())
+    try {
+      const [planData, plantillasData] = await Promise.all([
+        planificacionService.listarPlanDia(diaActual),
+        planificacionService.listarPlantillasConEtapas()
+      ])
+      setPlan(planData)
+      setPlantillas(plantillasData)
+    } finally {
+      setLoading(false)
+    }
+  }, [visible, diaActual])
+
+  useEffect(() => { cargar() }, [cargar])
+
+  if (!visible) return null
+
+  const plantillasDisponibles = plantillas.filter(
+    p => p.activa && !plan.some(pd => pd.plantilla_id === p.id)
+  )
+
+  const agregarPlantilla = async () => {
+    if (!agregandoId) return
+    await planificacionService.crearPlanDia({
+      dia_semana: diaActual, plantilla_id: agregandoId, cantidad_lotes: 1, prioridad: 5, hora_inicio_deseada: null
+    })
+    setAgregandoId('')
+    await cargar()
+  }
+
+  const quitarDelPlan = async (id: string) => {
+    await planificacionService.eliminarPlanDia(id)
+    setPlan(prev => prev.filter(p => p.id !== id))
+  }
+
+  const cambiarLotes = async (id: string, delta: number) => {
+    const item = plan.find(p => p.id === id)
+    if (!item) return
+    const nuevaCantidad = Math.max(1, item.cantidad_lotes + delta)
+    await planificacionService.actualizarPlanDia(id, { cantidad_lotes: nuevaCantidad })
+    setPlan(prev => prev.map(p => p.id === id ? { ...p, cantidad_lotes: nuevaCantidad } : p))
+  }
+
+  const cambiarPrioridad = async (id: string, delta: number) => {
+    const item = plan.find(p => p.id === id)
+    if (!item) return
+    const nueva = Math.max(1, Math.min(10, item.prioridad + delta))
+    await planificacionService.actualizarPlanDia(id, { prioridad: nueva })
+    setPlan(prev => prev.map(p => p.id === id ? { ...p, prioridad: nueva } : p))
+  }
+
+  const cambiarHorarios = async (id: string, hora_inicio_min: number | null, hora_fin_max: number | null) => {
+    await planificacionService.actualizarPlanDia(id, { hora_inicio_min, hora_fin_max })
+    setPlan(prev => prev.map(p => p.id === id ? { ...p, hora_inicio_min, hora_fin_max } : p))
+  }
+
+  const ejecutarGenerar = async () => {
+    if (plan.length === 0) return
+    setGenerando(true)
+    setShowOpcionC(false)
+    setPendingGenerar(false)
+    try {
+      const [empleados, maquinas] = await Promise.all([
+        planificacionService.listarEmpleadosParaScheduler(diaActual),
+        planificacionService.listarMaquinas()
+      ])
+      setEmpleadosState(empleados.map(e => ({ id: e.id, nombre_completo: e.nombre_completo })))
+      setMaquinasState(maquinas)
+
+      const planConEtapas: PlanDia[] = plan.map(pd => ({
+        ...pd,
+        plantilla: plantillas.find(p => p.id === pd.plantilla_id)
+      }))
+      const res = generarCronograma(
+        planConEtapas, empleados, maquinas.filter(m => m.activa),
+        timeStrToMin(rangoInicio), timeStrToMin(rangoFin)
+      )
+      setResultado(res.etapas)
+      setConflictos(res.conflictos)
+      setResoluciones(new Map())
+      setPaso('preview')
+    } catch (err) {
+      console.error('[Scheduler] Error al generar cronograma:', err)
+      alert(`Error al generar: ${err instanceof Error ? err.message : String(err)}`)
+    } finally {
+      setGenerando(false)
+    }
+  }
+
+  const generar = async () => {
+    // Verificar si hay provisorias existentes en DB para este día
+    const { data, error } = await supabase
+      .from('cronograma_tareas')
+      .select('id', { count: 'exact', head: true })
+      .eq('dia_semana', diaActual)
+      .eq('es_provisoria', true)
+      .eq('eliminada', false)
+
+    const count = (data as unknown as { count: number } | null)?.count ?? 0
+    const cantProvisoria = error ? 0 : count
+
+    if (cantProvisoria > 0) {
+      setProvisoriasExistentes(cantProvisoria)
+      setShowOpcionC(true)
+      setPendingGenerar(true)
+    } else {
+      await ejecutarGenerar()
+    }
+  }
+
+  const aplicar = async () => {
+    if (!resultado) return
+    setAplicando(true)
+    try {
+      const tareasConEmpleado = resultado.filter(et => et.lineaId && et.inicio >= 0)
+      const tareasAutonomas = resultado.filter(et => !et.lineaId && et.inicio >= 0)
+
+      if (tareasConEmpleado.length === 0 && tareasAutonomas.length === 0 && resoluciones.size === 0) {
+        alert('No hay tareas para aplicar.')
+        return
+      }
+
+      const getPlantilla = (et: EtapaScheduled) => plantillas.find(p => p.id === et.plantillaId)
+      const getColorTarea = (et: EtapaScheduled) => getPlantilla(et)?.color || et.etapa.color || null
+      const getDesc = (et: EtapaScheduled) => {
+        const base = et.lote > 1 ? `${et.etapa.nombre} (lote ${et.lote})` : et.etapa.nombre
+        const nombre = getPlantilla(et)?.nombre
+        return nombre ? `${base} · ${nombre}` : base
+      }
+      const getRecursos = (et: EtapaScheduled) => (et.recursosProgramados || []).map(r => ({
+        maquina_id: r.maquinaId, maquina_nombre: r.maquinaNombre,
+        hora_inicio: minToTimeStr(r.inicio), hora_fin: minToTimeStr(r.fin)
+      }))
+      const getTraza = (et: EtapaScheduled) => ({
+        etapa_orden: et.etapa?.orden ?? null,
+        lote: et.lote ?? null,
+        dependencias: et.etapa?.dependencias ?? [],
+        prerequisitos: et.etapa?.prerequisitos ?? []
+      })
+
+      const promesas: Promise<unknown>[] = []
+
+      // Auto-crear líneas
+      const empleadosACrear = new Map<string, string>()
+      for (const et of tareasConEmpleado) {
+        if (et.empleadoId && !empleadosACrear.has(et.empleadoId)) {
+          const lineaId = await cronogramaService.asegurarLineaExiste(et.empleadoId, diaActual)
+          empleadosACrear.set(et.empleadoId, lineaId)
+        }
+      }
+
+      // Tareas normales con empleado
+      for (const et of tareasConEmpleado) {
+        const lineaId = et.empleadoId ? (empleadosACrear.get(et.empleadoId) ?? et.lineaId!) : et.lineaId!
+        promesas.push(cronogramaService.crearTarea({
+          linea_id: lineaId, dia_semana: diaActual,
+          hora_inicio: minToTimeStr(et.inicio), hora_fin: minToTimeStr(et.fin),
+          descripcion: getDesc(et), color: getColorTarea(et), bloqueada: false,
+          tamano: 5, fila: 0, recursos_programados: getRecursos(et),
+          plantilla_id: et.plantillaId || null,
+          ...getTraza(et)
+        }))
+      }
+
+      // Tareas autónomas
+      for (const et of tareasAutonomas) {
+        promesas.push(cronogramaService.crearTarea({
+          linea_id: null, dia_semana: diaActual,
+          hora_inicio: minToTimeStr(et.inicio), hora_fin: minToTimeStr(et.fin),
+          descripcion: getDesc(et), color: getColorTarea(et), bloqueada: false,
+          tamano: 5, fila: 0, recursos_programados: getRecursos(et),
+          plantilla_id: et.plantillaId || null,
+          ...getTraza(et)
+        }))
+      }
+
+      await Promise.all(promesas)
+
+      // Aplicar resoluciones de conflictos como tareas provisorias
+      for (const [key, resolucion] of resoluciones.entries()) {
+        const conflicto = conflictos.find(c => c.key === key)
+        if (!conflicto) continue
+
+        let lineaId: string | null = null
+        const empIdReal = resolucion.empleadoId && resolucion.empleadoId !== '__otro__'
+          ? resolucion.empleadoId : null
+
+        if (empIdReal) {
+          lineaId = await cronogramaService.asegurarLineaExiste(empIdReal, diaActual)
+        }
+
+        const desc = getDesc(conflicto)
+        const notasExtra = resolucion.empleadoTexto && !empIdReal
+          ? `Asignado a: ${resolucion.empleadoTexto}${resolucion.notas ? ' · ' + resolucion.notas : ''}`
+          : resolucion.notas
+
+        const recursosProv = resolucion.maquinaId
+          ? [{ maquina_id: resolucion.maquinaId, maquina_nombre: maquinasState.find(m => m.id === resolucion.maquinaId)?.nombre ?? '', hora_inicio: resolucion.horaInicio, hora_fin: resolucion.horaFin }]
+          : []
+
+        await cronogramaService.crearTarea({
+          linea_id: lineaId,
+          dia_semana: diaActual,
+          hora_inicio: resolucion.horaInicio,
+          hora_fin: resolucion.horaFin,
+          descripcion: desc,
+          color: getColorTarea(conflicto) || '#f59e0b',
+          bloqueada: false,
+          tamano: 5, fila: 0,
+          recursos_programados: recursosProv,
+          plantilla_id: conflicto.plantillaId || null,
+          es_provisoria: resolucion.esProvisoria,
+          notas_provisoria: notasExtra || null,
+          ...getTraza(conflicto)
+        })
+      }
+
+      onAplicado()
+      onCerrar()
+    } catch (err) {
+      console.error('[Scheduler] Error al aplicar cronograma:', err)
+      alert(`Error al guardar las tareas: ${err instanceof Error ? err.message : String(err)}`)
+    } finally {
+      setAplicando(false)
+    }
+  }
+
+  const resueltos = resoluciones.size
+  const sinResolver = conflictos.length - resueltos
+
+  return (
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[300] backdrop-blur-sm" onClick={onCerrar}>
+      <div
+        className="bg-white w-[95vw] max-w-[1100px] max-h-[92vh] rounded-xl shadow-2xl overflow-hidden flex flex-col"
+        onClick={e => e.stopPropagation()}
+      >
+        {/* Header */}
+        <div className="px-5 py-4 border-b border-slate-200 bg-slate-50 flex items-center justify-between flex-shrink-0">
+          <div>
+            <h2 className="text-[15px] font-bold text-slate-900">Planificar producción</h2>
+            <p className="text-[11px] text-slate-500 mt-0.5">{DIAS_SEMANA_NOMBRES[diaActual]} · {rangoInicio} – {rangoFin}</p>
+          </div>
+          <button onClick={onCerrar} className="w-8 h-8 flex items-center justify-center rounded-md hover:bg-slate-200 text-slate-500">
+            <X size={16} />
+          </button>
+        </div>
+
+        {/* Tabs */}
+        <div className="flex border-b border-slate-200 flex-shrink-0">
+          <button onClick={() => setPaso('plan')}
+            className={`px-5 py-2.5 text-[12px] font-semibold border-b-2 transition-colors ${paso === 'plan' ? 'border-slate-900 text-slate-900' : 'border-transparent text-slate-500 hover:text-slate-700'}`}>
+            1. Plan del día
+          </button>
+          <button onClick={() => resultado && setPaso('preview')} disabled={!resultado}
+            className={`px-5 py-2.5 text-[12px] font-semibold border-b-2 transition-colors disabled:opacity-30 ${paso === 'preview' ? 'border-slate-900 text-slate-900' : 'border-transparent text-slate-500 hover:text-slate-700'}`}>
+            2. Cronograma
+            {resultado && conflictos.length > 0 && (
+              <span className={`ml-2 text-[10px] font-bold px-1.5 py-0.5 rounded-full ${
+                sinResolver === 0 ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-700'
+              }`}>
+                {sinResolver === 0 ? `✓ ${resueltos}` : `⚠ ${sinResolver}`}
+              </span>
+            )}
+          </button>
+        </div>
+
+        {/* Dialog Option C */}
+        {showOpcionC && (
+          <div className="flex-shrink-0 bg-amber-50 border-b border-amber-200 px-5 py-4">
+            <div className="flex items-start gap-3">
+              <AlertTriangle size={18} className="text-amber-600 flex-shrink-0 mt-0.5" />
+              <div className="flex-1">
+                <p className="text-[13px] font-bold text-amber-900">
+                  Hay {provisoriasExistentes} tarea{provisoriasExistentes !== 1 ? 's' : ''} provisoria{provisoriasExistentes !== 1 ? 's' : ''} del plan anterior
+                </p>
+                <p className="text-[11px] text-amber-700 mt-0.5">
+                  ¿Querés regenerar el cronograma? Las tareas provisorias existentes se mantendrán en el cronograma — podés eliminarlas manualmente desde la timeline.
+                </p>
+              </div>
+              <div className="flex items-center gap-2 flex-shrink-0">
+                <button
+                  onClick={() => { setShowOpcionC(false); setPendingGenerar(false) }}
+                  className="h-8 px-3 text-[12px] font-semibold text-amber-700 border border-amber-300 rounded-md hover:bg-amber-100"
+                >
+                  Cancelar
+                </button>
+                <button
+                  onClick={ejecutarGenerar}
+                  disabled={generando}
+                  className="h-8 px-3 text-[12px] font-semibold text-white bg-amber-600 rounded-md hover:bg-amber-700 disabled:opacity-40 flex items-center gap-1.5"
+                >
+                  <RefreshCw size={12} />{generando ? 'Generando...' : 'Regenerar igual'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Body */}
+        <div className="flex-1 overflow-y-auto p-5 min-h-0">
+          {loading ? (
+            <div className="flex items-center justify-center py-12 text-slate-400 text-sm">Cargando...</div>
+          ) : paso === 'plan' ? (
+            <PasoPlan
+              plan={plan} plantillasDisponibles={plantillasDisponibles}
+              agregandoId={agregandoId} onSetAgregandoId={setAgregandoId}
+              onAgregar={agregarPlantilla} onQuitar={quitarDelPlan}
+              onCambiarLotes={cambiarLotes} onCambiarPrioridad={cambiarPrioridad}
+              onCambiarHorarios={cambiarHorarios}
+            />
+          ) : (
+            <GanttPreview
+              resultado={resultado!}
+              conflictos={conflictos}
+              resoluciones={resoluciones}
+              onActualizarResolucion={(key, res) => {
+                setResoluciones(prev => {
+                  const next = new Map(prev)
+                  if (res === null) next.delete(key)
+                  else next.set(key, res)
+                  return next
+                })
+              }}
+              empleados={empleadosState}
+              maquinas={maquinasState}
+              rangoInicioMin={timeStrToMin(rangoInicio)}
+              rangoFinMin={timeStrToMin(rangoFin)}
+            />
+          )}
+        </div>
+
+        {/* Footer */}
+        <div className="px-5 py-3 border-t border-slate-200 bg-slate-50 flex items-center justify-between flex-shrink-0">
+          <div className="text-[11px] text-slate-500">
+            {paso === 'plan' && `${plan.length} producciones · ${plan.reduce((s, p) => s + p.cantidad_lotes, 0)} lotes totales`}
+            {paso === 'preview' && resultado && (
+              <>
+                {resultado.length} tareas generadas
+                {conflictos.length > 0 && (
+                  <span className={`ml-2 font-semibold ${sinResolver === 0 ? 'text-emerald-600' : 'text-amber-600'}`}>
+                    · {conflictos.length} conflictos ({resueltos} resueltos)
+                  </span>
+                )}
+              </>
+            )}
+          </div>
+          <div className="flex items-center gap-2">
+            {paso === 'plan' && (
+              <>
+                <button onClick={onCerrar} className="h-8 px-3 text-[12px] font-semibold text-slate-600 border border-slate-300 rounded-md hover:bg-slate-100">
+                  Cancelar
+                </button>
+                <button onClick={generar} disabled={plan.length === 0 || generando || (showOpcionC && pendingGenerar)}
+                  className="h-8 px-4 text-[12px] font-semibold text-white bg-slate-900 rounded-md hover:bg-slate-700 disabled:opacity-40 flex items-center gap-1.5">
+                  <Play size={12} />{generando ? 'Generando...' : 'Generar cronograma'}
+                </button>
+              </>
+            )}
+            {paso === 'preview' && (
+              <>
+                <button onClick={() => setPaso('plan')} className="h-8 px-3 text-[12px] font-semibold text-slate-600 border border-slate-300 rounded-md hover:bg-slate-100">
+                  Volver
+                </button>
+                {sinResolver > 0 && (
+                  <span className="text-[11px] text-amber-600 font-medium">
+                    {sinResolver} conflicto{sinResolver !== 1 ? 's' : ''} sin resolver
+                  </span>
+                )}
+                <button
+                  onClick={aplicar}
+                  disabled={!resultado || (resultado.length === 0 && resueltos === 0) || aplicando}
+                  className="h-8 px-4 text-[12px] font-semibold text-white bg-emerald-600 rounded-md hover:bg-emerald-700 disabled:opacity-40 flex items-center gap-1.5"
+                >
+                  <Check size={12} />{aplicando ? 'Aplicando...' : `Aplicar${resueltos > 0 ? ` (+${resueltos} provisoria${resueltos !== 1 ? 's' : ''})` : ''}`}
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ---- Paso 1: Plan del día ----
+
+function PasoPlan({ plan, plantillasDisponibles, agregandoId, onSetAgregandoId, onAgregar, onQuitar, onCambiarLotes, onCambiarPrioridad, onCambiarHorarios }: {
+  plan: PlanDia[]
+  plantillasDisponibles: PlantillaProceso[]
+  agregandoId: string
+  onSetAgregandoId: (id: string) => void
+  onAgregar: () => void
+  onQuitar: (id: string) => void
+  onCambiarLotes: (id: string, delta: number) => void
+  onCambiarPrioridad: (id: string, delta: number) => void
+  onCambiarHorarios: (id: string, horaInicioMin: number | null, horaFinMax: number | null) => void
+}) {
+  return (
+    <div className="space-y-3">
+      {plantillasDisponibles.length > 0 && (
+        <div className="flex gap-2">
+          <select value={agregandoId} onChange={e => onSetAgregandoId(e.target.value)}
+            className="flex-1 h-9 px-3 text-[13px] border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-400 bg-white">
+            <option value="">Seleccioná una producción para agregar...</option>
+            {plantillasDisponibles.map(p => (
+              <option key={p.id} value={p.id}>{p.nombre}{p.categoria ? ` · ${p.categoria}` : ''}</option>
+            ))}
+          </select>
+          <button onClick={onAgregar} disabled={!agregandoId}
+            className="h-9 px-3 text-[12px] font-semibold bg-slate-900 text-white rounded-md hover:bg-slate-700 disabled:opacity-40 flex items-center gap-1">
+            <Plus size={13} />Agregar
+          </button>
+        </div>
+      )}
+      {plan.length === 0 && (
+        <div className="text-center py-12 text-slate-400 border border-dashed border-slate-200 rounded-lg">
+          <p className="text-[13px] font-medium">Sin producciones para este día</p>
+          <p className="text-[11px] mt-1">Agregá las producciones que se van a hacer hoy</p>
+        </div>
+      )}
+      {plan.map(pd => (
+        <div key={pd.id} className="bg-white border border-slate-200 rounded-lg px-4 py-3 hover:border-slate-300">
+          <div className="flex items-center gap-3">
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center gap-2">
+                {pd.plantilla?.color && <div className="w-3 h-3 rounded-full flex-shrink-0" style={{ backgroundColor: pd.plantilla.color }} />}
+                <p className="text-[13px] font-bold text-slate-900 truncate">{pd.plantilla?.nombre || 'Plantilla eliminada'}</p>
+              </div>
+              {pd.plantilla?.categoria && <p className="text-[11px] text-slate-500">{pd.plantilla.categoria}</p>}
+              <p className="text-[11px] text-slate-400 mt-0.5">{pd.plantilla?.etapas?.length ?? 0} etapas</p>
+            </div>
+            <div className="flex flex-col items-center gap-0.5">
+              <span className="text-[9px] font-bold text-slate-400 uppercase tracking-wider">Lotes</span>
+              <div className="flex items-center gap-1">
+                <button onClick={() => onCambiarLotes(pd.id, -1)} className="w-6 h-6 flex items-center justify-center rounded hover:bg-slate-100 text-slate-500"><ChevronDown size={12} /></button>
+                <span className="text-[15px] font-bold text-slate-900 min-w-[20px] text-center">{pd.cantidad_lotes}</span>
+                <button onClick={() => onCambiarLotes(pd.id, 1)} className="w-6 h-6 flex items-center justify-center rounded hover:bg-slate-100 text-slate-500"><ChevronUp size={12} /></button>
+              </div>
+            </div>
+            <div className="flex flex-col items-center gap-0.5">
+              <span className="text-[9px] font-bold text-slate-400 uppercase tracking-wider">Prioridad</span>
+              <div className="flex items-center gap-1">
+                <button onClick={() => onCambiarPrioridad(pd.id, -1)} className="w-6 h-6 flex items-center justify-center rounded hover:bg-slate-100 text-slate-500"><ChevronDown size={12} /></button>
+                <span className="text-[15px] font-bold text-slate-900 min-w-[20px] text-center">{pd.prioridad}</span>
+                <button onClick={() => onCambiarPrioridad(pd.id, 1)} className="w-6 h-6 flex items-center justify-center rounded hover:bg-slate-100 text-slate-500"><ChevronUp size={12} /></button>
+              </div>
+            </div>
+            <button onClick={() => onQuitar(pd.id)} className="w-7 h-7 flex items-center justify-center rounded hover:bg-red-50 text-slate-400 hover:text-red-600 flex-shrink-0">
+              <Trash2 size={13} />
+            </button>
+          </div>
+          <div className="mt-2 pt-2 border-t border-slate-100 flex items-center gap-3 flex-wrap">
+            <span className="text-[9px] font-bold text-slate-400 uppercase tracking-wider flex items-center gap-1"><Timer size={9} />Override horario</span>
+            <div className="flex items-center gap-1.5">
+              <span className="text-[10px] text-slate-500">Desde</span>
+              <input type="time" value={minToHHMM(pd.hora_inicio_min)}
+                onChange={e => onCambiarHorarios(pd.id, HHMMtoMin(e.target.value), pd.hora_fin_max ?? null)}
+                className="h-7 px-1.5 text-[11px] border border-slate-200 rounded focus:outline-none focus:ring-1 focus:ring-blue-400 bg-white" />
+            </div>
+            <div className="flex items-center gap-1.5">
+              <span className="text-[10px] text-slate-500">Hasta</span>
+              <input type="time" value={minToHHMM(pd.hora_fin_max)}
+                onChange={e => onCambiarHorarios(pd.id, pd.hora_inicio_min ?? null, HHMMtoMin(e.target.value))}
+                className="h-7 px-1.5 text-[11px] border border-slate-200 rounded focus:outline-none focus:ring-1 focus:ring-blue-400 bg-white" />
+            </div>
+            {(pd.hora_inicio_min != null || pd.hora_fin_max != null) && (
+              <button onClick={() => onCambiarHorarios(pd.id, null, null)} className="text-[10px] text-red-400 hover:text-red-600">Quitar</button>
+            )}
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+// ---- Gantt: tipos de datos ----
+
+interface GanttBlockData {
+  key: string
+  inicio: number
+  fin: number
+  color: string
+  label: string
+  faded?: boolean
+  isDraft?: boolean   // resolución manual (borde punteado)
+}
+
+interface GanttRowData {
+  id: string
+  nombre: string
+  blocks: GanttBlockData[]
+}
+
+// ---- GanttRowComp ----
+
+function GanttRowComp({ row, timeMarks, ganttWidth, rangoInicioMin }: {
+  row: GanttRowData
+  timeMarks: { min: number; label: string }[]
+  ganttWidth: number
+  rangoInicioMin: number
+}) {
+  return (
+    <div className="flex border-b border-slate-100 last:border-0 group">
+      <div className="sticky left-0 z-10 flex-shrink-0 flex items-center px-3 bg-white group-hover:bg-slate-50 border-r border-slate-200"
+        style={{ width: LABEL_W, minWidth: LABEL_W, height: ROW_H }}>
+        <span className="text-[11px] font-semibold text-slate-700 truncate" title={row.nombre}>{row.nombre}</span>
+      </div>
+      <div className="relative flex-shrink-0" style={{ width: ganttWidth, height: ROW_H }}>
+        {timeMarks.map(mark => (
+          <div key={mark.min} className="absolute top-0 bottom-0 w-px bg-slate-100" style={{ left: mark.min * PX_PER_MIN }} />
+        ))}
+        {row.blocks.map(block => {
+          const left = (block.inicio - rangoInicioMin) * PX_PER_MIN
+          const width = Math.max(4, (block.fin - block.inicio) * PX_PER_MIN)
+          const tooltip = `${block.label} · ${minToTimeStr(block.inicio)} – ${minToTimeStr(block.fin)} (${block.fin - block.inicio} min)`
+          return (
+            <div key={block.key}
+              className="absolute rounded flex items-center px-1 overflow-hidden cursor-default"
+              style={{
+                left, width, top: 5, bottom: 5,
+                backgroundColor: block.isDraft ? block.color + '25' : block.faded ? block.color + '28' : block.color + 'dd',
+                border: block.isDraft
+                  ? `1.5px dashed ${block.color}cc`
+                  : `1.5px solid ${block.color}${block.faded ? '60' : 'ff'}`,
+              }}
+              title={tooltip}
+            >
+              {width > 38 && !block.faded && !block.isDraft && (
+                <span className="text-[9px] font-bold text-white truncate leading-none drop-shadow-sm">{block.label}</span>
+              )}
+              {width > 20 && block.isDraft && (
+                <span className="text-[8px] font-bold truncate leading-none" style={{ color: block.color }}>⚠ {block.label}</span>
+              )}
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+// ---- GanttSectionComp ----
+
+function GanttSectionComp({ title, icon, rows, timeMarks, ganttWidth, rangoInicioMin }: {
+  title: string; icon: React.ReactNode; rows: GanttRowData[]
+  timeMarks: { min: number; label: string }[]
+  ganttWidth: number; rangoInicioMin: number
+}) {
+  return (
+    <div className="mb-5">
+      <div className="flex items-center gap-2 mb-2">
+        {icon}
+        <span className="text-[11px] font-bold text-slate-500 uppercase tracking-widest">{title}</span>
+        <span className="text-[10px] text-slate-400">{rows.length} {rows.length === 1 ? 'recurso' : 'recursos'}</span>
+      </div>
+      <div className="border border-slate-200 rounded-lg overflow-hidden bg-white">
+        <div className="overflow-x-auto">
+          <div style={{ minWidth: LABEL_W + ganttWidth }}>
+            <div className="flex border-b border-slate-200 bg-slate-50">
+              <div className="sticky left-0 z-10 flex-shrink-0 bg-slate-50 border-r border-slate-200" style={{ width: LABEL_W, minWidth: LABEL_W, height: 22 }} />
+              <div className="relative flex-shrink-0" style={{ width: ganttWidth, height: 22 }}>
+                {timeMarks.map(mark => (
+                  <div key={mark.min} className="absolute top-0 bottom-0" style={{ left: mark.min * PX_PER_MIN }}>
+                    <div className="absolute top-0 bottom-0 w-px bg-slate-200" />
+                    <span className="absolute top-1 left-1 text-[9px] text-slate-400 font-mono whitespace-nowrap select-none">{mark.label}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+            {rows.length === 0 ? (
+              <div className="flex items-center px-4 py-3 text-[11px] text-slate-400">Sin datos para mostrar</div>
+            ) : (
+              rows.map(row => (
+                <GanttRowComp key={row.id} row={row} timeMarks={timeMarks} ganttWidth={ganttWidth} rangoInicioMin={rangoInicioMin} />
+              ))
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ---- ConflictoItem: form de resolución por conflicto ----
+
+function ConflictoItem({
+  conflicto, resolucion, onResolucion, empleados, maquinas, rangoInicioMin, rangoFinMin
+}: {
+  conflicto: EtapaScheduled
+  resolucion: ResolucionConflicto | null
+  onResolucion: (r: ResolucionConflicto | null) => void
+  empleados: { id: string; nombre_completo: string }[]
+  maquinas: Maquina[]
+  rangoInicioMin: number
+  rangoFinMin: number
+}) {
+  const defaultInicio = minToTimeStr(rangoInicioMin)
+  const defaultFin = minToTimeStr(Math.min(rangoInicioMin + conflicto.etapa.duracion_proceso, rangoFinMin))
+
+  const [expandido, setExpandido] = useState(false)
+  const [form, setForm] = useState<ResolucionConflicto>(resolucion ?? {
+    empleadoId: null, empleadoTexto: '',
+    horaInicio: defaultInicio, horaFin: defaultFin,
+    maquinaId: null, notas: '', esProvisoria: true
+  })
+
+  const esOtro = form.empleadoId === '__otro__'
+
+  const resolver = () => {
+    if (!form.horaInicio || !form.horaFin) return
+    const empId = esOtro ? null : (form.empleadoId || null)
+    const empTexto = esOtro
+      ? form.empleadoTexto
+      : (empleados.find(e => e.id === form.empleadoId)?.nombre_completo || '')
+    onResolucion({ ...form, empleadoId: empId, empleadoTexto: empTexto })
+    setExpandido(false)
+  }
+
+  const quitarResolucion = () => {
+    onResolucion(null)
+    setExpandido(false)
+  }
+
+  const durMin = form.horaInicio && form.horaFin
+    ? timeStrToMin(form.horaFin) - timeStrToMin(form.horaInicio)
+    : null
+
+  return (
+    <div className={`rounded-lg border transition-colors ${resolucion ? 'border-emerald-200 bg-emerald-50/30' : 'border-amber-200 bg-amber-50/30'}`}>
+      {/* Header del conflicto */}
+      <div className="flex items-center gap-2 px-3 py-2.5 cursor-pointer select-none" onClick={() => setExpandido(v => !v)}>
+        {resolucion
+          ? <Check size={13} className="text-emerald-500 flex-shrink-0" />
+          : <AlertTriangle size={13} className="text-amber-500 flex-shrink-0" />}
+        <div className="flex-1 min-w-0">
+          <p className="text-[12px] font-semibold text-slate-800 truncate">
+            {conflicto.etapa.nombre} · {conflicto.plantillaNombre}
+            {conflicto.lote > 1 && <span className="text-slate-500"> (lote {conflicto.lote})</span>}
+          </p>
+          <p className="text-[10px] text-amber-600 truncate">{conflicto.mensajeConflicto}</p>
+        </div>
+        {resolucion ? (
+          <span className="text-[10px] font-bold text-emerald-700 bg-emerald-100 border border-emerald-200 rounded px-1.5 py-0.5 flex-shrink-0 whitespace-nowrap">
+            ✓ {resolucion.horaInicio}–{resolucion.horaFin}{resolucion.empleadoTexto ? ` · ${resolucion.empleadoTexto.split(' ')[0]}` : ''}
+            {resolucion.esProvisoria && ' ⚠'}
+          </span>
+        ) : (
+          <span className="text-[10px] text-amber-500 flex-shrink-0">Resolver →</span>
+        )}
+        <ChevronRight size={12} className={`text-slate-400 flex-shrink-0 transition-transform ${expandido ? 'rotate-90' : ''}`} />
+      </div>
+
+      {/* Formulario de resolución */}
+      {expandido && (
+        <div className="border-t border-slate-200 px-4 py-3 bg-white rounded-b-lg space-y-3">
+
+          {/* Empleado */}
+          <div className="grid grid-cols-2 gap-2">
+            <div>
+              <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">Empleado / Responsable</label>
+              <select
+                value={form.empleadoId ?? ''}
+                onChange={e => setForm(f => ({ ...f, empleadoId: e.target.value || null, empleadoTexto: '' }))}
+                className="w-full h-8 px-2 text-[12px] border border-slate-300 rounded focus:outline-none focus:ring-1 focus:ring-amber-400 bg-white"
+              >
+                <option value="">Sin asignar (tarea autónoma)</option>
+                {empleados.map(e => (
+                  <option key={e.id} value={e.id}>{e.nombre_completo}</option>
+                ))}
+                <option value="__otro__">Otro — texto libre...</option>
+              </select>
+            </div>
+            {esOtro && (
+              <div>
+                <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">Nombre (libre)</label>
+                <input
+                  type="text" value={form.empleadoTexto} autoFocus
+                  onChange={e => setForm(f => ({ ...f, empleadoTexto: e.target.value }))}
+                  placeholder="Ej: El dueño, Colaborador..."
+                  className="w-full h-8 px-2 text-[12px] border border-slate-300 rounded focus:outline-none focus:ring-1 focus:ring-amber-400 bg-white"
+                />
+              </div>
+            )}
+          </div>
+
+          {/* Horario */}
+          <div className="flex items-end gap-3 flex-wrap">
+            <div>
+              <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">Hora inicio</label>
+              <input type="time" value={form.horaInicio}
+                onChange={e => setForm(f => ({ ...f, horaInicio: e.target.value }))}
+                className="h-8 px-2 text-[12px] border border-slate-300 rounded focus:outline-none focus:ring-1 focus:ring-amber-400 bg-white" />
+            </div>
+            <div>
+              <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">Hora fin</label>
+              <input type="time" value={form.horaFin}
+                onChange={e => setForm(f => ({ ...f, horaFin: e.target.value }))}
+                className="h-8 px-2 text-[12px] border border-slate-300 rounded focus:outline-none focus:ring-1 focus:ring-amber-400 bg-white" />
+            </div>
+            {durMin !== null && (
+              <span className="text-[10px] text-slate-400 pb-1.5">
+                {durMin > 0 ? `${durMin} min` : <span className="text-red-500">Hora fin antes que inicio</span>}
+              </span>
+            )}
+            <span className="text-[10px] text-slate-400 pb-1.5">
+              Duración original: <strong>{conflicto.etapa.duracion_proceso} min</strong>
+            </span>
+          </div>
+
+          {/* Máquina */}
+          {maquinas.filter(m => m.activa).length > 0 && (
+            <div>
+              <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">Máquina (opcional)</label>
+              <select
+                value={form.maquinaId ?? ''}
+                onChange={e => setForm(f => ({ ...f, maquinaId: e.target.value || null }))}
+                className="w-full h-8 px-2 text-[12px] border border-slate-300 rounded focus:outline-none focus:ring-1 focus:ring-amber-400 bg-white"
+              >
+                <option value="">Sin máquina</option>
+                {maquinas.filter(m => m.activa).map(m => (
+                  <option key={m.id} value={m.id}>
+                    {m.grupo ? `[${m.grupo.nombre}] ` : ''}{m.nombre}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+
+          {/* Notas */}
+          <div>
+            <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">Notas (opcional)</label>
+            <input type="text" value={form.notas}
+              onChange={e => setForm(f => ({ ...f, notas: e.target.value }))}
+              placeholder="Ej: Confirmar disponibilidad, ajustar si es necesario..."
+              className="w-full h-8 px-2 text-[12px] border border-slate-300 rounded focus:outline-none focus:ring-1 focus:ring-amber-400 bg-white"
+            />
+          </div>
+
+          {/* Provisoria */}
+          <label className="flex items-start gap-2 cursor-pointer">
+            <input type="checkbox" checked={form.esProvisoria}
+              onChange={e => setForm(f => ({ ...f, esProvisoria: e.target.checked }))}
+              className="mt-0.5 w-3.5 h-3.5 rounded border-slate-300 accent-amber-500" />
+            <span className="text-[11px] text-slate-700 leading-tight">
+              Marcar como <strong>provisoria</strong> — aparecerá con ⚠ en el cronograma hasta ser confirmada
+            </span>
+          </label>
+
+          {/* Botones */}
+          <div className="flex items-center justify-between pt-1 border-t border-slate-100">
+            <div>
+              {resolucion && (
+                <button onClick={quitarResolucion}
+                  className="h-7 px-2.5 text-[11px] font-semibold text-red-500 border border-red-200 rounded hover:bg-red-50">
+                  Quitar resolución
+                </button>
+              )}
+            </div>
+            <div className="flex gap-2">
+              <button onClick={() => setExpandido(false)}
+                className="h-7 px-2.5 text-[11px] font-semibold text-slate-600 border border-slate-300 rounded hover:bg-slate-50">
+                Cancelar
+              </button>
+              <button
+                onClick={resolver}
+                disabled={!form.horaInicio || !form.horaFin || (durMin !== null && durMin <= 0)}
+                className="h-7 px-3 text-[11px] font-bold text-white bg-amber-600 rounded hover:bg-amber-700 disabled:opacity-40 flex items-center gap-1"
+              >
+                <Check size={11} /> Resolver conflicto
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ---- GanttPreview ----
+
+function GanttPreview({ resultado, conflictos, resoluciones, onActualizarResolucion, empleados, maquinas, rangoInicioMin, rangoFinMin }: {
+  resultado: EtapaScheduled[]
+  conflictos: EtapaScheduled[]
+  resoluciones: Map<string, ResolucionConflicto>
+  onActualizarResolucion: (key: string, res: ResolucionConflicto | null) => void
+  empleados: { id: string; nombre_completo: string }[]
+  maquinas: Maquina[]
+  rangoInicioMin: number
+  rangoFinMin: number
+}) {
+  const [vista, setVista] = useState<'secciones' | 'unificado'>('secciones')
+
+  const totalMin = rangoFinMin - rangoInicioMin
+  const ganttWidth = totalMin * PX_PER_MIN
+
+  const plantillaIds = [...new Set(resultado.map(e => e.plantillaId))]
+  const colorByPlantilla: Record<string, string> = {}
+  plantillaIds.forEach((id, idx) => { colorByPlantilla[id] = PALETTE[idx % PALETTE.length] })
+
+  // Filas de empleados (tareas programadas)
+  const empMap = new Map<string, GanttRowData>()
+
+  for (const et of resultado) {
+    if (!et.empleadoId) continue
+    if (!empMap.has(et.empleadoId)) {
+      empMap.set(et.empleadoId, { id: et.empleadoId, nombre: et.empleadoNombre!, blocks: [] })
+    }
+    const row = empMap.get(et.empleadoId)!
+    const color = colorByPlantilla[et.plantillaId] || '#64748b'
+    const loteLabel = et.lote > 1 ? ` L${et.lote}` : ''
+    const label = et.etapa.nombre + loteLabel
+
+    const ventanas = (et.etapa.ventanas_empleado && et.etapa.ventanas_empleado.length > 0)
+      ? et.etapa.ventanas_empleado.map(v => ({ desde: et.inicio + v.desde, hasta: et.inicio + v.hasta }))
+      : et.etapa.bloquea_empleado_total
+        ? [{ desde: et.inicio, hasta: et.fin }]
+        : [
+            ...(et.etapa.tiempo_empleado_inicio > 0 ? [{ desde: et.inicio, hasta: et.inicio + et.etapa.tiempo_empleado_inicio }] : []),
+            ...(et.etapa.tiempo_empleado_fin > 0 ? [{ desde: et.fin - et.etapa.tiempo_empleado_fin, hasta: et.fin }] : [])
+          ]
+
+    if (ventanas.length === 0) {
+      row.blocks.push({ key: et.key + '_proc', inicio: et.inicio, fin: et.fin, color, label, faded: true })
+    } else if (ventanas.length === 1 && ventanas[0].desde === et.inicio && ventanas[0].hasta === et.fin) {
+      row.blocks.push({ key: et.key, inicio: et.inicio, fin: et.fin, color, label })
+    } else {
+      row.blocks.push({ key: et.key + '_proc', inicio: et.inicio, fin: et.fin, color, label, faded: true })
+      ventanas.forEach((v, i) => {
+        row.blocks.push({ key: et.key + '_v' + i, inicio: v.desde, fin: v.hasta, color, label })
+      })
+    }
+  }
+
+  // Agregar resoluciones manuales como bloques draft al empMap
+  for (const [key, resolucion] of resoluciones.entries()) {
+    const conflicto = conflictos.find(c => c.key === key)
+    if (!conflicto) continue
+    const horaIni = timeStrToMin(resolucion.horaInicio)
+    const horaFin = timeStrToMin(resolucion.horaFin)
+    if (isNaN(horaIni) || isNaN(horaFin) || horaFin <= horaIni) continue
+
+    const color = colorByPlantilla[conflicto.plantillaId] || '#f59e0b'
+    const label = conflicto.etapa.nombre + (conflicto.lote > 1 ? ` L${conflicto.lote}` : '')
+    const empIdReal = resolucion.empleadoId && resolucion.empleadoId !== '__otro__' ? resolucion.empleadoId : null
+
+    const rowId = empIdReal ?? (resolucion.empleadoTexto ? '__libre__' + resolucion.empleadoTexto : null)
+    if (rowId) {
+      const rowNombre = empIdReal
+        ? (empleados.find(e => e.id === empIdReal)?.nombre_completo ?? resolucion.empleadoTexto)
+        : `⚠ ${resolucion.empleadoTexto}`
+      if (!empMap.has(rowId)) {
+        empMap.set(rowId, { id: rowId, nombre: rowNombre, blocks: [] })
+      }
+      empMap.get(rowId)!.blocks.push({ key: key + '_draft', inicio: horaIni, fin: horaFin, color, label, isDraft: true })
+    }
+  }
+
+  // Filas de máquinas y procesos autónomos
+  const maqMap = new Map<string, GanttRowData>()
+  for (const et of resultado) {
+    const color = colorByPlantilla[et.plantillaId] || '#64748b'
+    const loteLabel = et.lote > 1 ? ` L${et.lote}` : ''
+    const label = et.etapa.nombre + loteLabel
+
+    if (!et.empleadoId && et.inicio >= 0) {
+      const rowId = `__proc_${et.plantillaId}`
+      if (!maqMap.has(rowId)) maqMap.set(rowId, { id: rowId, nombre: `${et.plantillaNombre} (proceso)`, blocks: [] })
+      maqMap.get(rowId)!.blocks.push({ key: et.key + '_proc', inicio: et.inicio, fin: et.fin, color, label, faded: true })
+    }
+
+    const recursos = et.recursosProgramados?.length > 0
+      ? et.recursosProgramados
+      : (et.maquinaId && et.maquinaNombre ? [{ maquinaId: et.maquinaId, maquinaNombre: et.maquinaNombre, inicio: et.inicio, fin: et.fin }] : [])
+
+    for (const r of recursos) {
+      if (!maqMap.has(r.maquinaId)) maqMap.set(r.maquinaId, { id: r.maquinaId, nombre: r.maquinaNombre, blocks: [] })
+      maqMap.get(r.maquinaId)!.blocks.push({ key: `${et.key}_m_${r.maquinaId}`, inicio: r.inicio, fin: r.fin, color, label })
+    }
+  }
+
+  const empRows = [...empMap.values()].sort((a, b) => a.nombre.localeCompare(b.nombre))
+  const maqRows = [...maqMap.values()].sort((a, b) => a.nombre.localeCompare(b.nombre))
+  const unifiedRows: GanttRowData[] = [
+    ...empRows.map(r => ({ ...r, nombre: `👤 ${r.nombre}` })),
+    ...maqRows.map(r => ({ ...r, nombre: `⚙ ${r.nombre}` }))
+  ]
+
+  const timeMarks: { min: number; label: string }[] = []
+  const step = totalMin <= 300 ? 30 : 60
+  for (let m = 0; m <= totalMin; m += step) {
+    timeMarks.push({ min: m, label: minToTimeStr(rangoInicioMin + m) })
+  }
+
+  const legend = plantillaIds.map(id => ({
+    id, nombre: resultado.find(e => e.plantillaId === id)?.plantillaNombre || id, color: colorByPlantilla[id]
+  }))
+
+  const resueltos = resoluciones.size
+
+  return (
+    <div>
+      {/* Panel de conflictos con resolución */}
+      {conflictos.length > 0 && (
+        <div className="mb-5">
+          <div className="flex items-center justify-between mb-2">
+            <div className="flex items-center gap-2">
+              <AlertTriangle size={14} className={resueltos === conflictos.length ? 'text-emerald-500' : 'text-amber-600'} />
+              <span className="text-[12px] font-bold text-slate-700">
+                {conflictos.length - resueltos === 0
+                  ? `Todos los conflictos resueltos (${resueltos}/${conflictos.length})`
+                  : `${conflictos.length - resueltos} conflicto${conflictos.length - resueltos !== 1 ? 's' : ''} sin resolver · ${resueltos} resuelto${resueltos !== 1 ? 's' : ''}`
+                }
+              </span>
+            </div>
+            {resueltos > 0 && (
+              <span className="text-[10px] text-slate-400">Las resoluciones aparecen en el Gantt con borde punteado</span>
+            )}
+          </div>
+          <div className="space-y-1.5">
+            {conflictos.map(c => (
+              <ConflictoItem
+                key={c.key}
+                conflicto={c}
+                resolucion={resoluciones.get(c.key) ?? null}
+                onResolucion={res => onActualizarResolucion(c.key, res)}
+                empleados={empleados}
+                maquinas={maquinas}
+                rangoInicioMin={rangoInicioMin}
+                rangoFinMin={rangoFinMin}
+              />
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Leyenda + toggle */}
+      {legend.length > 0 && (
+        <div className="flex items-center justify-between gap-3 mb-4 p-3 bg-slate-50 rounded-lg border border-slate-200">
+          <div className="flex flex-wrap gap-x-4 gap-y-1.5 min-w-0">
+            {legend.map(l => (
+              <div key={l.id} className="flex items-center gap-1.5">
+                <div className="w-3 h-3 rounded flex-shrink-0" style={{ backgroundColor: l.color }} />
+                <span className="text-[11px] text-slate-700 font-medium">{l.nombre}</span>
+              </div>
+            ))}
+            <div className="flex items-center gap-1.5 border-l border-slate-300 pl-4">
+              <div className="w-10 h-3 rounded border border-slate-400 flex-shrink-0" style={{ backgroundColor: '#64748b28' }} />
+              <span className="text-[10px] text-slate-500 whitespace-nowrap">Proceso libre</span>
+            </div>
+            {resueltos > 0 && (
+              <div className="flex items-center gap-1.5 border-l border-slate-300 pl-4">
+                <div className="w-10 h-3 rounded flex-shrink-0" style={{ border: '1.5px dashed #f59e0b', backgroundColor: '#f59e0b25' }} />
+                <span className="text-[10px] text-slate-500 whitespace-nowrap">Provisoria ⚠</span>
+              </div>
+            )}
+          </div>
+          <div className="flex items-center gap-1 bg-white border border-slate-200 rounded-lg p-1 flex-shrink-0">
+            <button onClick={() => setVista('secciones')}
+              className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded text-[11px] font-semibold transition-colors ${vista === 'secciones' ? 'bg-slate-900 text-white' : 'text-slate-500 hover:text-slate-700 hover:bg-slate-100'}`}
+              title="Ver empleados y máquinas por separado">
+              <LayoutList size={13} />Secciones
+            </button>
+            <button onClick={() => setVista('unificado')}
+              className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded text-[11px] font-semibold transition-colors ${vista === 'unificado' ? 'bg-slate-900 text-white' : 'text-slate-500 hover:text-slate-700 hover:bg-slate-100'}`}
+              title="Ver todos los recursos juntos">
+              <Layers size={13} />Todos
+            </button>
+          </div>
+        </div>
+      )}
+
+      {vista === 'secciones' ? (
+        <>
+          <GanttSectionComp title="Empleados" icon={<User size={13} className="text-slate-500" />} rows={empRows} timeMarks={timeMarks} ganttWidth={ganttWidth} rangoInicioMin={rangoInicioMin} />
+          <GanttSectionComp title="Máquinas" icon={<Package size={13} className="text-slate-500" />} rows={maqRows} timeMarks={timeMarks} ganttWidth={ganttWidth} rangoInicioMin={rangoInicioMin} />
+        </>
+      ) : (
+        <GanttSectionComp title="Todos los recursos" icon={<Layers size={13} className="text-slate-500" />} rows={unifiedRows} timeMarks={timeMarks} ganttWidth={ganttWidth} rangoInicioMin={rangoInicioMin} />
+      )}
+    </div>
+  )
+}
