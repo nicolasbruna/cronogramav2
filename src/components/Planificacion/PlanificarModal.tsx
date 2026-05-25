@@ -788,26 +788,26 @@ function ConflictoItem({
   return (
     <div className={`rounded-lg border transition-colors ${resolucion ? 'border-emerald-200 bg-emerald-50/30' : 'border-amber-200 bg-amber-50/30'}`}>
       {/* Header del conflicto */}
-      <div className="flex items-center gap-2 px-3 py-2.5 cursor-pointer select-none" onClick={() => setExpandido(v => !v)}>
+      <div className="flex items-start gap-2 px-3 py-2.5 cursor-pointer select-none" onClick={() => setExpandido(v => !v)}>
         {resolucion
-          ? <Check size={13} className="text-emerald-500 flex-shrink-0" />
-          : <AlertTriangle size={13} className="text-amber-500 flex-shrink-0" />}
+          ? <Check size={13} className="text-emerald-500 flex-shrink-0 mt-0.5" />
+          : <AlertTriangle size={13} className="text-amber-500 flex-shrink-0 mt-0.5" />}
         <div className="flex-1 min-w-0">
           <p className="text-[12px] font-semibold text-slate-800 truncate">
             {conflicto.etapa.nombre} · {conflicto.plantillaNombre}
             {conflicto.lote > 1 && <span className="text-slate-500"> (lote {conflicto.lote})</span>}
           </p>
-          <p className="text-[10px] text-amber-600 truncate">{conflicto.mensajeConflicto}</p>
+          <p className="text-[10px] text-amber-600 break-words">{conflicto.mensajeConflicto}</p>
         </div>
         {resolucion ? (
-          <span className="text-[10px] font-bold text-emerald-700 bg-emerald-100 border border-emerald-200 rounded px-1.5 py-0.5 flex-shrink-0 whitespace-nowrap">
+          <span className="text-[10px] font-bold text-emerald-700 bg-emerald-100 border border-emerald-200 rounded px-1.5 py-0.5 flex-shrink-0 whitespace-nowrap mt-0.5">
             ✓ {resolucion.horaInicio}–{resolucion.horaFin}{resolucion.empleadoTexto ? ` · ${resolucion.empleadoTexto.split(' ')[0]}` : ''}
             {resolucion.esProvisoria && ' ⚠'}
           </span>
         ) : (
-          <span className="text-[10px] text-amber-500 flex-shrink-0">Resolver →</span>
+          <span className="text-[10px] text-amber-500 flex-shrink-0 mt-0.5">Resolver →</span>
         )}
-        <ChevronRight size={12} className={`text-slate-400 flex-shrink-0 transition-transform ${expandido ? 'rotate-90' : ''}`} />
+        <ChevronRight size={12} className={`text-slate-400 flex-shrink-0 transition-transform mt-0.5 ${expandido ? 'rotate-90' : ''}`} />
       </div>
 
       {/* Formulario de resolución */}

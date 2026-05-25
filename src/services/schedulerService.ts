@@ -15,8 +15,9 @@ interface EmpleadoScheduler {
   busyIntervals: [number, number][]
   parallelIntervals: [number, number][]   // ocupaciones de tareas paralelas (no bloquean tareas normales)
   exclusiveIntervals: [number, number][]  // ocupaciones de tareas con atención exclusiva (bloquean paralelas)
-  horarioInicio: number | null   // minutos del día — hora de entrada (null = sin restricción)
+  horarioInicio: number | null   // minutos del día — hora de entrada (null = sin turno ese día)
   horarioFin: number | null      // minutos del día — hora de salida
+  trabajaHoy: boolean            // false = el empleado no tiene turno configurado ese día → no disponible
 }
 
 interface UsageSlot {
@@ -71,6 +72,22 @@ interface ChainPlacement {
   recursosProgramados: RecursoProgramado[]
 }
 
+// Motivo por el cual un bloque no pudo ubicarse — usado para construir un mensaje
+// de conflicto específico en lugar del genérico.
+interface ChainFailReason {
+  tipo: 'ventana' | 'maquina' | 'empleado'
+  etapaNombre?: string
+  recursoNombre?: string
+  empMinStart?: number | null   // hora de entrada del primer empleado candidato
+  deadlineStart?: number        // tope de comienzo del bloque (effectiveMax), si es finito
+  earliest?: number             // primer comienzo posible del bloque (effectiveEarliest)
+  // Datos para identificar al "culpable" (qué bloque ya ubicado ocupa el recurso):
+  inicioIntentado?: number      // inicio de la etapa que falló, en el último t probado
+  finIntentado?: number         // fin de la etapa que falló
+  candidatoIds?: string[]       // ids de empleados candidatos de la etapa que falló
+  maquinaIdBloqueada?: string   // id de la máquina que faltó (caso 'maquina')
+}
+
 // ---- Helpers recursos ----
 
 function getRecursosEfectivos(etapa: PlantillaEtapa): RecursoEfectivo[] {
@@ -113,6 +130,8 @@ function addInterval(intervals: [number, number][], start: number, end: number):
 }
 
 function empleadoDisponible(emp: EmpleadoScheduler, inicio: number, fin: number, etapa: PlantillaEtapa): boolean {
+  // Sin turno configurado ese día → el empleado no trabaja, no está disponible.
+  if (!emp.trabajaHoy) return false
   // Verificar ventana horaria del empleado (hora de entrada / salida)
   const ventanas = getVentanasEmpleado(etapa, inicio, fin)
   const esParalela = etapa.permite_solape === true
@@ -170,6 +189,7 @@ function buildCandidatosSlot(slot: EmpleadoEtapaSlot, empleados: EmpleadoSchedul
 }
 
 function slotLibre(emp: EmpleadoScheduler, intervals: [number, number][], esParalela: boolean, esExclusiva: boolean): boolean {
+  if (!emp.trabajaHoy) return false
   for (const [s, e] of intervals) {
     if (emp.horarioInicio !== null && s < emp.horarioInicio) return false
     if (emp.horarioFin !== null && e > emp.horarioFin) return false
@@ -473,7 +493,8 @@ function findBestSlotForChain(
   rangoFin: number,
   empleados: EmpleadoScheduler[],
   maquinas: MaquinaScheduler[],
-  maxInicio: number = Infinity
+  maxInicio: number = Infinity,
+  diag?: { reason: ChainFailReason | null }
 ): { placements: ChainPlacement[] } | null {
   const { tasks, offsets, totalDuration } = chain
 
@@ -501,6 +522,7 @@ function findBestSlotForChain(
   }
 
   let t = effectiveEarliest
+  let lastReason: ChainFailReason | null = null
 
   while (t <= effectiveMax && t + totalDuration <= rangoFin) {
 
@@ -525,6 +547,15 @@ function findBestSlotForChain(
           const nextFree = nextFreeInGroup(maquinas, r.maquinaId, rStart, r.hasta - r.desde, r.usoRecurso)
           tAdvance = Math.max(tAdvance, nextFree - offsets[i] - r.desde)
           allMachinesOk = false
+          lastReason = {
+            tipo: 'maquina',
+            etapaNombre: etapa.nombre,
+            recursoNombre: maquinas.find(m => m.id === r.maquinaId)?.nombre,
+            maquinaIdBloqueada: r.maquinaId,
+            inicioIntentado: rStart,
+            finIntentado: rEnd,
+            deadlineStart: Number.isFinite(effectiveMax) ? effectiveMax : undefined
+          }
           break outer
         }
 
@@ -584,6 +615,18 @@ function findBestSlotForChain(
           emp.parallelIntervals.length = pl
           emp.exclusiveIntervals.length = el
         }
+        const startsCandidatos = candidatos
+          .map(e => e.horarioInicio)
+          .filter((x): x is number => x != null)
+        lastReason = {
+          tipo: 'empleado',
+          etapaNombre: etapa.nombre,
+          empMinStart: startsCandidatos.length ? Math.min(...startsCandidatos) : null,
+          inicioIntentado: inicio,
+          finIntentado: fin,
+          candidatoIds: candidatos.map(e => e.id),
+          deadlineStart: Number.isFinite(effectiveMax) ? effectiveMax : undefined
+        }
         // Avanzar buscando cuándo libera el mejor empleado
         let minNext = t + 1
         for (const emp of candidatos) {
@@ -605,6 +648,13 @@ function findBestSlotForChain(
     // Si no: t ya fue avanzado en el bloque de employee-not-found
   }
 
+  if (diag) {
+    diag.reason = lastReason ?? {
+      tipo: 'ventana',
+      deadlineStart: Number.isFinite(effectiveMax) ? effectiveMax : undefined,
+      earliest: effectiveEarliest
+    }
+  }
   return null
 }
 
@@ -831,6 +881,65 @@ function findPreworkSet(etapas: EtapaExpandida[]): Set<string> {
 //    primer horario donde ninguna de sus etapas pise una máquina o empleado ya
 //    ocupado por otro proceso. El timing interno del proceso se preserva intacto.
 
+// Identifica qué bloques ya planificados ("culpables") están ocupando el recurso
+// que le faltó al bloque que falló, escaneando las etapas ya ubicadas (scheduled).
+function identificarCulpables(reason: ChainFailReason | null, scheduled: EtapaScheduled[]): string[] {
+  if (!reason || reason.inicioIntentado == null || reason.finIntentado == null) return []
+  const s = reason.inicioIntentado
+  const e = reason.finIntentado
+  const pisa = (a: EtapaScheduled) => a.inicio >= 0 && a.inicio < e && a.fin > s
+
+  let ocupantes: EtapaScheduled[] = []
+  if (reason.tipo === 'empleado' && reason.candidatoIds?.length) {
+    const ids = new Set(reason.candidatoIds)
+    ocupantes = scheduled.filter(a => a.empleadoId != null && ids.has(a.empleadoId) && pisa(a))
+  } else if (reason.tipo === 'maquina' && reason.maquinaIdBloqueada) {
+    ocupantes = scheduled.filter(a => pisa(a) && a.recursosProgramados.some(r => r.maquinaId === reason.maquinaIdBloqueada))
+  }
+
+  const vistos = new Set<string>()
+  const out: string[] = []
+  for (const o of ocupantes) {
+    const proc = `"${o.plantillaNombre}"${o.lote > 1 ? ` (lote ${o.lote})` : ''}`
+    const detalle = reason.tipo === 'empleado' && o.empleadoNombre
+      ? `${proc} (usa a ${o.empleadoNombre} de ${minToTimeStr(o.inicio)} a ${minToTimeStr(o.fin)})`
+      : proc
+    if (!vistos.has(detalle)) { vistos.add(detalle); out.push(detalle) }
+  }
+  return out
+}
+
+// Construye un mensaje de conflicto legible a partir del motivo de fallo del bloque.
+function mensajeConflictoBloque(reason: ChainFailReason | null, plantillaNombre: string, lote: number, culpables: string[] = []): string {
+  const proc = `"${plantillaNombre}"${lote > 1 ? ` (lote ${lote})` : ''}`
+  const tope = reason?.deadlineStart != null ? ` El proceso debe arrancar antes de las ${minToTimeStr(reason.deadlineStart)}.` : ''
+  const ocupado = culpables.length ? ` Ese horario está ocupado por: ${culpables.join(', ')}.` : ''
+  if (!reason) {
+    return `El proceso ${proc} no encontró un horario libre sin pisar otros procesos.`
+  }
+  switch (reason.tipo) {
+    case 'empleado': {
+      const etapa = reason.etapaNombre ? `la etapa "${reason.etapaNombre}"` : 'una de sus etapas'
+      const entrada = reason.empMinStart != null
+        ? ` El primer empleado habilitado entra a las ${minToTimeStr(reason.empMinStart)}.`
+        : ''
+      return `No hay ningún empleado disponible para ${etapa} dentro de la ventana del proceso ${proc}.${ocupado}${entrada}${tope}`
+    }
+    case 'maquina': {
+      const etapa = reason.etapaNombre ? `la etapa "${reason.etapaNombre}"` : 'una de sus etapas'
+      const maq = reason.recursoNombre ? ` "${reason.recursoNombre}" (y sus reemplazos)` : ''
+      return `La máquina${maq} está ocupada y no se libera a tiempo para ${etapa} del proceso ${proc}.${ocupado}${tope}`
+    }
+    case 'ventana':
+    default: {
+      if (reason.deadlineStart != null && reason.earliest != null && reason.earliest > reason.deadlineStart) {
+        return `El proceso ${proc} no entra en su ventana horaria: debe arrancar antes de las ${minToTimeStr(reason.deadlineStart)} pero sus dependencias/recursos no están listos hasta las ${minToTimeStr(reason.earliest)}.`
+      }
+      return `El proceso ${proc} no encontró un horario libre sin pisar otros procesos.${tope}`
+    }
+  }
+}
+
 export function generarCronograma(
   planDia: PlanDia[],
   empleados: { id: string; nombre_completo: string; habilidades: string[]; lineas: { id: string; nombre: string }[]; horario?: { hora_inicio: string; hora_fin: string } | null }[],
@@ -848,7 +957,8 @@ export function generarCronograma(
     parallelIntervals: [],
     exclusiveIntervals: [],
     horarioInicio: timeStrToMin(e.horario?.hora_inicio),
-    horarioFin: timeStrToMin(e.horario?.hora_fin)
+    horarioFin: timeStrToMin(e.horario?.hora_fin),
+    trabajaHoy: e.horario != null   // sin turno configurado ese día → no disponible
   }))
   const maquinasState: MaquinaScheduler[] = maquinas.map(m => ({
     id: m.id, nombre: m.nombre, cantidad: m.cantidad,
@@ -913,8 +1023,29 @@ export function generarCronograma(
 
   if (bloques.length === 0) return { etapas: [], conflictos: [], duracionTotal: 0 }
 
-  // Mayor prioridad primero; a igual prioridad, respetar orden del plan y el lote
-  bloques.sort((a, b) => (b.prioridad - a.prioridad) || (a.orden - b.orden) || (a.lote - b.lote))
+  // Deadline efectivo de un bloque: el instante más temprano en que ALGUNA de sus
+  // restricciones obliga a arrancar (hora_inicio_max de proceso/etapa, o hora_fin_max
+  // menos la duración). Infinity = sin restricción horaria.
+  const blockDeadline = (b: Bloque): number => {
+    let d = Infinity
+    for (const e of b.etapas) {
+      if (e.horaInicioMaxProceso != null) d = Math.min(d, e.horaInicioMaxProceso)
+      if (e.horaInicioMaxEtapa != null) d = Math.min(d, e.horaInicioMaxEtapa)
+      if (e.horaFinMax != null) d = Math.min(d, e.horaFinMax - e.etapa.duracion_proceso)
+    }
+    return d
+  }
+  const deadlineByBloque = new Map<Bloque, number>(bloques.map(b => [b, blockDeadline(b)]))
+
+  // Mayor prioridad primero; a igual prioridad, el de deadline más ajustado (EDF) para
+  // que los procesos con ventana horaria reserven los recursos escasos antes que los
+  // que pueden ubicarse en cualquier momento; luego orden del plan y lote.
+  bloques.sort((a, b) =>
+    (b.prioridad - a.prioridad) ||
+    (deadlineByBloque.get(a)! - deadlineByBloque.get(b)!) ||
+    (a.orden - b.orden) ||
+    (a.lote - b.lote)
+  )
 
   const scheduled: EtapaScheduled[] = []
   const conflictos: EtapaScheduled[] = []
@@ -1089,11 +1220,14 @@ export function generarCronograma(
     }
 
     // 3) Ubicar el bloque principal contra el estado global (desde blockEarliest)
-    const resultado = findBestSlotForChain(blockChain, blockEarliest, rangoFin, empleadosState, maquinasState, Infinity)
+    const diag: { reason: ChainFailReason | null } = { reason: null }
+    const resultado = findBestSlotForChain(blockChain, blockEarliest, rangoFin, empleadosState, maquinasState, Infinity, diag)
 
     if (!resultado) {
-      console.warn(`[Scheduler] Bloque "${bloque.plantillaNombre}" (lote ${bloque.lote}) no encontró horario libre`)
-      pushConflictoBloque({ ...bloque, etapas: mainEtapas }, t => `El proceso "${t.plantillaNombre}" (lote ${t.lote}) no encontró un horario libre sin pisar otros procesos`)
+      console.warn(`[Scheduler] Bloque "${bloque.plantillaNombre}" (lote ${bloque.lote}) no encontró horario libre`, diag.reason)
+      const culpables = identificarCulpables(diag.reason, scheduled)
+      const mensaje = mensajeConflictoBloque(diag.reason, bloque.plantillaNombre, bloque.lote, culpables)
+      pushConflictoBloque({ ...bloque, etapas: mainEtapas }, () => mensaje)
       continue
     }
 

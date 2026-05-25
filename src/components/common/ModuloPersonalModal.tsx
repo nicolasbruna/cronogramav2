@@ -1,11 +1,13 @@
 import { useState, useEffect, useRef } from 'react'
 import { X, Plus, Search, UserCheck, UserX, CreditCard as Edit2, Check, Brain, Clock } from 'lucide-react'
 import { supabase } from '../../config/supabase'
-import { Empleado } from '../../types/cronograma'
+import { Empleado, DIAS_SEMANA_NOMBRES } from '../../types/cronograma'
 import { Habilidad } from '../../types/planificacion'
 import { planificacionService } from '../../services/planificacionService'
 
-const DIAS_SEMANA = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo']
+// dia_semana se guarda con la convención de la app (Domingo=0 … Sábado=6, igual que
+// JS getDay()). Para mostrar, ordenamos con el Lunes primero (UX de semana laboral).
+const DIAS_ORDEN = [1, 2, 3, 4, 5, 6, 0]
 
 interface HorarioDia {
   dia_semana: number
@@ -197,7 +199,7 @@ export function ModuloPersonalModal({ visible, onCerrar, onEmpleadoCreado }: Mod
   // ---- Horarios ----
 
   const horarioVacio = (): HorarioDia[] =>
-    DIAS_SEMANA.map((_, i) => ({ dia_semana: i, activo: false, hora_inicio: '06:00', hora_fin: '14:00' }))
+    DIAS_ORDEN.map(d => ({ dia_semana: d, activo: false, hora_inicio: '06:00', hora_fin: '14:00' }))
 
   const abrirHorario = (empId: string) => {
     if (expandido?.empId === empId && expandido.tipo === 'horario') {
@@ -445,7 +447,7 @@ export function ModuloPersonalModal({ visible, onCerrar, onEmpleadoCreado }: Mod
                                 className="rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
                               />
                               <span className={`text-[12px] font-semibold w-[72px] flex-shrink-0 ${dia.activo ? 'text-slate-800' : 'text-slate-400'}`}>
-                                {DIAS_SEMANA[dia.dia_semana]}
+                                {DIAS_SEMANA_NOMBRES[dia.dia_semana]}
                               </span>
                               {dia.activo ? (
                                 <div className="flex items-center gap-1.5 flex-1">
