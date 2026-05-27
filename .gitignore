@@ -27,3 +27,6 @@ dist-ssr
 *.tmp.*
 .next
 .env*
+
+# Scripts con credenciales (no subir)
+sync-to-cloud.sh
