@@ -955,7 +955,7 @@ export function CronogramaTimeline({
           borderRadius: 0,
           borderTop: defaultBorder,
           borderBottom: defaultBorder,
-          borderLeft: tarea.grupo_id ? `4px solid ${getGrupoColor(tarea.grupo_id)}` : touchesLeft ? connectedBorder : defaultBorder,
+          borderLeft: touchesLeft ? connectedBorder : defaultBorder,
           borderRight: touchesRight ? connectedBorder : defaultBorder,
           zIndex: getTaskZIndex(tarea, isDragging, isPartOfMultiDrag, isSelected, duration)
         }}
@@ -1133,26 +1133,22 @@ export function CronogramaTimeline({
     const el = wrapRef.current
     if (!el) return
     const handleWheel = (e: WheelEvent) => {
-      if (e.deltaY !== 0) {
-        if (e.ctrlKey || e.metaKey) {
-          e.preventDefault()
-          const dir: 1 | -1 = e.deltaY > 0 ? -1 : 1
-          const newZoom = Math.max(0.2, Math.min(10, +(internalZoom + dir * 0.1).toFixed(1)))
-          if (newZoom === internalZoom) return
-          const newPxPerMin = pxPerMinBase * newZoom
-          const rect = el.getBoundingClientRect()
-          const offsetFromLeft = e.clientX - rect.left
-          const xInContent = el.scrollLeft + offsetFromLeft
-          const minAtCursor = xInContent / pxPerMin + startMin
-          const newXInContent = (minAtCursor - startMin) * newPxPerMin
-          pendingScrollRef.current = newXInContent - offsetFromLeft
-          isLocalZoomRef.current = true
-          setInternalZoom(newZoom)
-          onZoomChangeRef.current(newZoom)
-        } else {
-          e.preventDefault()
-          el.scrollLeft += e.deltaY
-        }
+      // Solo Ctrl/Cmd + rueda hace zoom; la rueda normal queda con el scroll predefinido del navegador.
+      if (e.deltaY !== 0 && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault()
+        const dir: 1 | -1 = e.deltaY > 0 ? -1 : 1
+        const newZoom = Math.max(0.2, Math.min(10, +(internalZoom + dir * 0.1).toFixed(1)))
+        if (newZoom === internalZoom) return
+        const newPxPerMin = pxPerMinBase * newZoom
+        const rect = el.getBoundingClientRect()
+        const offsetFromLeft = e.clientX - rect.left
+        const xInContent = el.scrollLeft + offsetFromLeft
+        const minAtCursor = xInContent / pxPerMin + startMin
+        const newXInContent = (minAtCursor - startMin) * newPxPerMin
+        pendingScrollRef.current = newXInContent - offsetFromLeft
+        isLocalZoomRef.current = true
+        setInternalZoom(newZoom)
+        onZoomChangeRef.current(newZoom)
       }
     }
     el.addEventListener('wheel', handleWheel, { passive: false })
