@@ -38,6 +38,10 @@ interface CronogramaTimelineProps {
 const SLOT_PAD = 6
 const MIN_TASK_MIN = 1
 const MAGNET_PX = 8
+// Bordes de selección de alto contraste (visibles sobre cualquier color de bloque): anillo azul fuerte
+// con halo blanco; el resaltado de grupo usa un contorno punteado bien marcado.
+const SEL_RING = 'ring-2 ring-blue-600 ring-offset-2 ring-offset-white z-[55]'
+const SEL_GRUPO = 'outline outline-2 outline-dashed outline-blue-500/90 outline-offset-1'
 
 export function CronogramaTimeline({
   empleados,
@@ -932,7 +936,7 @@ export function CronogramaTimeline({
         key={tarea.id}
         className={`absolute flex flex-col justify-center ${tarea.orientacion_texto === 'vertical' ? 'items-center' : ''} select-none transition-[opacity,shadow,ring,outline,filter] duration-150
           ${isDragging || isPartOfMultiDrag ? 'overflow-visible' : 'overflow-hidden'}
-          ${isSelected ? 'ring-2 ring-blue-500 ring-offset-1' : isGrupoHighlight ? 'outline outline-2 outline-dashed outline-blue-400/60 outline-offset-1' : ''}
+          ${isSelected ? SEL_RING : isGrupoHighlight ? SEL_GRUPO : ''}
           ${isDragging || isPartOfMultiDrag ? 'opacity-90 shadow-xl cursor-grabbing' : tamano < 5 ? 'cursor-grab shadow-md' : 'cursor-grab shadow-sm'}
           ${!isDragging && !isPartOfMultiDrag ? 'hover:shadow-xl hover:brightness-105' : ''}
           ${tarea.bloqueada ? 'cursor-default' : ''}
@@ -1677,10 +1681,15 @@ export function CronogramaTimeline({
                     return (
                       <div
                         key={tarea.id}
-                        className={`absolute rounded overflow-hidden flex items-center px-1 cursor-move select-none ${isSelected ? 'ring-2 ring-blue-500 ring-offset-1' : isGrupoHighlight ? 'outline outline-2 outline-dashed outline-blue-400/60 outline-offset-1' : ''}`}
+                        className={`absolute rounded overflow-hidden flex items-center px-1 cursor-move select-none ${isSelected ? SEL_RING : isGrupoHighlight ? SEL_GRUPO : ''}`}
                         style={{ left, width, top: 4, bottom: 4, backgroundColor: color + 'cc', border: `1.5px solid ${color}` }}
                         title={`${tarea.descripcion} · ${tarea.hora_inicio} – ${tarea.hora_fin}`}
                         onMouseDown={e => handleTaskMouseDown(e, tarea, 'move')}
+                        onContextMenu={e => {
+                          e.preventDefault(); e.stopPropagation()
+                          if (!tareasSeleccionadas.includes(tarea.id)) onSeleccionarTarea([tarea.id])
+                          setContextMenu({ x: e.clientX, y: e.clientY, tareaId: tarea.id })
+                        }}
                         onClick={e => {
                           e.stopPropagation()
                           if (didDragRef.current) { didDragRef.current = false; return }
@@ -1753,10 +1762,15 @@ export function CronogramaTimeline({
                     return (
                       <div
                         key={i}
-                        className={`absolute rounded overflow-hidden flex items-center px-1 cursor-move select-none ${isSelected ? 'ring-2 ring-blue-500 ring-offset-1' : isGrupoHighlight ? 'outline outline-2 outline-dashed outline-blue-400/60 outline-offset-1' : ''}`}
+                        className={`absolute rounded overflow-hidden flex items-center px-1 cursor-move select-none ${isSelected ? SEL_RING : isGrupoHighlight ? SEL_GRUPO : ''}`}
                         style={{ left, width, top: 5, bottom: 5, backgroundColor: color + 'cc', border: `1.5px solid ${color}` }}
                         title={`${tarea.descripcion} · ${r.hora_inicio} – ${r.hora_fin}`}
                         onMouseDown={e => handleTaskMouseDown(e, tarea, 'move')}
+                        onContextMenu={e => {
+                          e.preventDefault(); e.stopPropagation()
+                          if (!tareasSeleccionadas.includes(tarea.id)) onSeleccionarTarea([tarea.id])
+                          setContextMenu({ x: e.clientX, y: e.clientY, tareaId: tarea.id })
+                        }}
                         onClick={e => {
                           e.stopPropagation()
                           if (didDragRef.current) { didDragRef.current = false; return }
@@ -1865,31 +1879,50 @@ export function CronogramaTimeline({
         onClick={e => e.stopPropagation()}
         onContextMenu={e => e.preventDefault()}
       >
-        <button
-          className="w-full px-3 py-1.5 text-left flex items-center gap-2 hover:bg-slate-100 text-slate-700"
-          onClick={() => { onCambiarTamano?.(tareasSeleccionadas, 1); setContextMenu(null) }}
-        >
-          <ChevronUp size={14} /> Agrandar
-        </button>
-        <button
-          className="w-full px-3 py-1.5 text-left flex items-center gap-2 hover:bg-slate-100 text-slate-700"
-          onClick={() => { onCambiarTamano?.(tareasSeleccionadas, -1); setContextMenu(null) }}
-        >
-          <ChevronDown size={14} /> Achicar
-        </button>
-        <button
-          className="w-full px-3 py-1.5 text-left flex items-center gap-2 hover:bg-slate-100 text-slate-700"
-          onClick={() => { onCambiarFila?.(tareasSeleccionadas, -1); setContextMenu(null) }}
-        >
-          <ChevronUp size={14} /> Subir fila
-        </button>
-        <button
-          className="w-full px-3 py-1.5 text-left flex items-center gap-2 hover:bg-slate-100 text-slate-700"
-          onClick={() => { onCambiarFila?.(tareasSeleccionadas, 1); setContextMenu(null) }}
-        >
-          <ChevronDown size={14} /> Bajar fila
-        </button>
-        <div className="border-t border-slate-100 my-1" />
+        {contextTarea?.plantilla_id != null && (
+          <>
+            <button
+              className="w-full px-3 py-1.5 text-left flex items-center gap-2 hover:bg-slate-100 text-slate-700"
+              onClick={() => {
+                const ids = tareas.filter(t => t.plantilla_id === contextTarea.plantilla_id && t.lote === contextTarea.lote).map(t => t.id)
+                onSeleccionarTarea(ids)
+                setContextMenu(null)
+              }}
+            >
+              <Package size={14} /> Seleccionar todo el proceso
+            </button>
+            <div className="border-t border-slate-100 my-1" />
+          </>
+        )}
+        {contextTarea?.linea_id && (
+          <>
+            <button
+              className="w-full px-3 py-1.5 text-left flex items-center gap-2 hover:bg-slate-100 text-slate-700"
+              onClick={() => { onCambiarTamano?.(tareasSeleccionadas, 1); setContextMenu(null) }}
+            >
+              <ChevronUp size={14} /> Agrandar
+            </button>
+            <button
+              className="w-full px-3 py-1.5 text-left flex items-center gap-2 hover:bg-slate-100 text-slate-700"
+              onClick={() => { onCambiarTamano?.(tareasSeleccionadas, -1); setContextMenu(null) }}
+            >
+              <ChevronDown size={14} /> Achicar
+            </button>
+            <button
+              className="w-full px-3 py-1.5 text-left flex items-center gap-2 hover:bg-slate-100 text-slate-700"
+              onClick={() => { onCambiarFila?.(tareasSeleccionadas, -1); setContextMenu(null) }}
+            >
+              <ChevronUp size={14} /> Subir fila
+            </button>
+            <button
+              className="w-full px-3 py-1.5 text-left flex items-center gap-2 hover:bg-slate-100 text-slate-700"
+              onClick={() => { onCambiarFila?.(tareasSeleccionadas, 1); setContextMenu(null) }}
+            >
+              <ChevronDown size={14} /> Bajar fila
+            </button>
+            <div className="border-t border-slate-100 my-1" />
+          </>
+        )}
         <button
           className="w-full px-3 py-1.5 text-left flex items-center gap-2 hover:bg-slate-100 text-slate-700 disabled:opacity-40 disabled:cursor-not-allowed"
           disabled={!contextPuedeAgrupar}
