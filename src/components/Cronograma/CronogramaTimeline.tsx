@@ -1655,6 +1655,7 @@ export function CronogramaTimeline({
                   key={proc.nombre}
                   className="relative border-b border-slate-200 bg-slate-50"
                   style={{ width: chartWidth + 'px', height: MAQUINA_ROW_H + 'px' }}
+                  onClick={() => onSeleccionarTarea([])}
                 >
                   {axisTicks.map(tick => (
                     <div
@@ -1729,6 +1730,7 @@ export function CronogramaTimeline({
                   key={maq.maquinaId}
                   className="relative border-b border-slate-200 bg-slate-50"
                   style={{ width: chartWidth + 'px', height: MAQUINA_ROW_H + 'px' }}
+                  onClick={() => onSeleccionarTarea([])}
                 >
                   {axisTicks.map(tick => (
                     <div
