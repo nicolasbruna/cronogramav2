@@ -31,20 +31,40 @@ export function recursosDeEtapa(etapa: PlantillaEtapa): RecursoEtapa[] {
 // La UI guarda el PRINCIPAL en los campos legacy (ventanas_empleado + empleado_preferido_id)
 // y `empleados_etapa` contiene SOLO los ayudantes. Por eso el principal se arma siempre desde
 // los campos legacy y se le suman los ayudantes, salvo que empleados_etapa ya traiga un principal.
-export function slotsDeEtapa(etapa: PlantillaEtapa): EmpleadoEtapaSlot[] {
+// `preferenciaProceso` es el empleado preferido a nivel proceso (resuelto desde la plantilla y el
+// override del día). Jerarquía para el slot principal: una etapa con preferido propio NO reemplazable
+// manda; si no, gana el preferido del proceso (si hay); si no, el de la etapa.
+export function slotsDeEtapa(
+  etapa: PlantillaEtapa,
+  preferenciaProceso?: { empleadoId: string | null; puedeReemplazarse: boolean } | null
+): EmpleadoEtapaSlot[] {
   const extra = etapa.empleados_etapa ?? []
   if (extra.some(s => s.rol === 'principal')) return extra
 
   const slots: EmpleadoEtapaSlot[] = []
   const ventanasPrincipal = ventanasDeEtapa(etapa)
   if (ventanasPrincipal.length > 0) {
+    const etapaPref = etapa.empleado_preferido_id ?? null
+    const etapaNoReemplazable = etapaPref != null && etapa.puede_reemplazarse === false
+    let prefId: string | null
+    let puedeReemp: boolean
+    if (etapaNoReemplazable) {
+      prefId = etapaPref
+      puedeReemp = false
+    } else if (preferenciaProceso?.empleadoId) {
+      prefId = preferenciaProceso.empleadoId
+      puedeReemp = preferenciaProceso.puedeReemplazarse
+    } else {
+      prefId = etapaPref
+      puedeReemp = etapa.puede_reemplazarse ?? true
+    }
     slots.push({
       id: 'principal',
       rol: 'principal',
       ventanas: ventanasPrincipal,
       habilidad_id: etapa.habilidad_id ?? null,
-      empleado_preferido_id: etapa.empleado_preferido_id ?? null,
-      puede_reemplazarse: etapa.puede_reemplazarse ?? true
+      empleado_preferido_id: prefId,
+      puede_reemplazarse: puedeReemp
     })
   }
   return [...slots, ...extra]

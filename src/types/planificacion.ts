@@ -115,6 +115,8 @@ export interface PlantillaProceso {
   hora_fin_max?: string | null      // TIME "HH:MM" — restricción global: el proceso no puede terminar después
   permite_solape?: boolean          // default para todas las etapas: pueden ejecutarse en paralelo
   atencion_exclusiva?: boolean      // default para las etapas
+  empleado_preferido_id?: string | null  // preferido para todo el proceso (gana sobre el de la etapa)
+  puede_reemplazarse?: boolean      // si el preferido del proceso puede reemplazarse por otro
   activa: boolean
   fecha_creacion: string
   etapas?: PlantillaEtapa[]
@@ -143,6 +145,8 @@ export interface CrearPlantillaRequest {
   hora_fin_max?: string | null
   permite_solape?: boolean
   atencion_exclusiva?: boolean
+  empleado_preferido_id?: string | null
+  puede_reemplazarse?: boolean
 }
 
 export interface CrearEtapaRequest {
@@ -188,6 +192,9 @@ export interface PlanDiaItem {
   hora_inicio_min?: string | null
   hora_inicio_max?: string | null
   hora_fin_max?: string | null
+  // Override del empleado preferido del proceso para este día.
+  empleado_preferido_modo?: string | null   // 'heredar' | 'fijar' | 'ninguno' (null = heredar)
+  empleado_preferido_override_id?: string | null
   activo: boolean
   fecha_creacion: string
 }
@@ -200,6 +207,8 @@ export interface CrearPlanDiaRequest {
   hora_inicio_min?: string | null
   hora_inicio_max?: string | null
   hora_fin_max?: string | null
+  empleado_preferido_modo?: string | null
+  empleado_preferido_override_id?: string | null
 }
 
 export const COLORES_ETAPA: Record<TipoEtapa, string> = {

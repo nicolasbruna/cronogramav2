@@ -173,6 +173,23 @@ function esFloatable(etapa: PlantillaEtapa, plantilla: PlantillaProceso): boolea
 
 // ============ Generador ============
 
+// Empleado preferido a nivel proceso (resuelto). null = el proceso no impone preferido.
+type PreferenciaProceso = { empleadoId: string; puedeReemplazarse: boolean } | null
+
+// Resuelve el preferido del proceso para el día: override del plan_dia (heredar/fijar/ninguno) sobre el
+// preferido de la plantilla. El flag "puede reemplazarse" siempre viene de la plantilla.
+function resolverPreferenciaProceso(
+  item: { empleadoPreferidoModo?: string | null; empleadoPreferidoOverride?: string | null },
+  plantilla: PlantillaProceso
+): PreferenciaProceso {
+  const modo = item.empleadoPreferidoModo ?? 'heredar'
+  let empleadoId: string | null
+  if (modo === 'ninguno') empleadoId = null
+  else if (modo === 'fijar') empleadoId = item.empleadoPreferidoOverride ?? null
+  else empleadoId = plantilla.empleado_preferido_id ?? null
+  return empleadoId ? { empleadoId, puedeReemplazarse: plantilla.puede_reemplazarse ?? true } : null
+}
+
 export function generarCronograma(ctx: ContextoScheduler, overrides: SchedulerOverrides = {}): ResultadoScheduler {
   let cal = new CalendarioOcupacion(ctx.ocupacionMaquinasInicial, ctx.ocupacionEmpleadosInicial)
 
@@ -198,6 +215,7 @@ export function generarCronograma(ctx: ContextoScheduler, overrides: SchedulerOv
     inicioMinOverride: number | null
     inicioMaxOverride: number | null
     finMaxOverride: number | null
+    preferenciaProceso: PreferenciaProceso
   }
   const SENTINEL = 100000 // valor finito grande para evitar Infinity-Infinity=NaN al ordenar
   const procesos: Proceso[] = []
@@ -209,6 +227,7 @@ export function generarCronograma(ctx: ContextoScheduler, overrides: SchedulerOv
     const inicioMinOverride = item.inicioMinOverride ?? null
     const inicioMaxOverride = item.inicioMaxOverride ?? null
     const finMaxOverride = item.finMaxOverride ?? null
+    const preferenciaProceso = resolverPreferenciaProceso(item, plantilla)
     const finMaxEfectivo = finMaxOverride ?? timeOrNull(plantilla.hora_fin_max)
     const edf = Math.min(
       SENTINEL,
@@ -225,7 +244,7 @@ export function generarCronograma(ctx: ContextoScheduler, overrides: SchedulerOv
     // Piso de inicio efectivo: el "Desde…"; un proceso flexible (Desde tardío) se deja para después.
     const inicioMinEf = inicioMinOverride ?? timeOrNull(plantilla.hora_inicio_min) ?? 0
     for (let lote = 1; lote <= item.cantidadLotes; lote++) {
-      procesos.push({ plantilla, lote, prioridad, edf, topeInicioEf, inicioMinEf, inicioMinOverride, inicioMaxOverride, finMaxOverride })
+      procesos.push({ plantilla, lote, prioridad, edf, topeInicioEf, inicioMinEf, inicioMinOverride, inicioMaxOverride, finMaxOverride, preferenciaProceso })
     }
   }
 
@@ -247,7 +266,8 @@ export function generarCronograma(ctx: ContextoScheduler, overrides: SchedulerOv
   for (const proc of procesos) {
     const res = colocarProceso(
       proc.plantilla, proc.lote, empleados, empById, ctx.maquinas, cal, overrides, ctx.diaInicio,
-      { inicioMin: proc.inicioMinOverride, inicioMax: proc.inicioMaxOverride, finMax: proc.finMaxOverride }
+      { inicioMin: proc.inicioMinOverride, inicioMax: proc.inicioMaxOverride, finMax: proc.finMaxOverride },
+      proc.preferenciaProceso
     )
     instancias.push(...res.instancias)
     cal = res.cal
@@ -276,7 +296,8 @@ function colocarProceso(
   cal: CalendarioOcupacion,
   overrides: SchedulerOverrides,
   diaInicio: number,
-  overrideDia: OverrideDia
+  overrideDia: OverrideDia,
+  preferenciaProceso: PreferenciaProceso
 ): { instancias: InstanciaEtapa[]; cal: CalendarioOcupacion } {
   const etapas = [...plantilla.etapas!].sort((a, b) => a.orden - b.orden)
 
@@ -308,7 +329,7 @@ function colocarProceso(
       const inst = nuevaInst(etapa)
       // Las etapas preparables arrancan su búsqueda desde el inicio del día; el resto, desde el piso.
       const floor = floatableIds.has(etapa.id) ? diaInicio : piso
-      const c = colocarEtapa(inst, plantilla, etapa, colocadasPorId, empleados, empById, maquinas, calAttempt, overrides, lote, floor, overrideDia)
+      const c = colocarEtapa(inst, plantilla, etapa, colocadasPorId, empleados, empById, maquinas, calAttempt, overrides, lote, floor, overrideDia, preferenciaProceso)
       insts.push(inst)
       if (c) { colocadasPorId.set(etapa.id, inst); colocadas++ }
       else ok = false
@@ -390,7 +411,8 @@ function colocarEtapa(
   overrides: SchedulerOverrides,
   lote: number,
   piso: number,
-  overrideDia: { inicioMin: number | null; inicioMax: number | null; finMax: number | null }
+  overrideDia: { inicioMin: number | null; inicioMax: number | null; finMax: number | null },
+  preferenciaProceso: PreferenciaProceso
 ): boolean {
   const dur = etapa.duracion_proceso
 
@@ -479,7 +501,7 @@ function colocarEtapa(
   // cualquier otro disponible (NO se espera al titular). Si puede_reemplazarse es false, solo el titular.
   let hit: { t: number; intento: ResultadoIntento } | null = null
   for (let t = earliest; t <= latest; t++) {
-    const intento = intentarColocar(t, etapa, empleados, empById, maquinas, cal, pin?.empleadoId, permiteSolape, exclusiva, permitirSustitucion)
+    const intento = intentarColocar(t, etapa, empleados, empById, maquinas, cal, pin?.empleadoId, permiteSolape, exclusiva, permitirSustitucion, preferenciaProceso)
     if (intento.ok) { hit = { t, intento }; break }
   }
   if (hit) {
@@ -498,7 +520,7 @@ function colocarEtapa(
   // No se pudo ubicar: capturar el motivo del primer instante que falló.
   let primerFallo: ResultadoIntento | null = null
   for (let t = earliest; t <= latest; t++) {
-    const intento = intentarColocar(t, etapa, empleados, empById, maquinas, cal, pin?.empleadoId, permiteSolape, exclusiva, permitirSustitucion)
+    const intento = intentarColocar(t, etapa, empleados, empById, maquinas, cal, pin?.empleadoId, permiteSolape, exclusiva, permitirSustitucion, preferenciaProceso)
     if (!intento.ok) { primerFallo = intento; break }
   }
 
@@ -521,7 +543,7 @@ function colocarEtapa(
     }
   } else if (primerFallo?.motivo === 'empleado_no_disponible') {
     // Explicar qué ocupa a cada empleado preferido dentro de la ventana (nombrar al "culpable").
-    const slots = slotsDeEtapa(etapa)
+    const slots = slotsDeEtapa(etapa, preferenciaProceso)
     const habilTxt = slots.some(s => s.habilidad_id) ? ' con la habilidad requerida' : ''
     const detalles: string[] = []
     const culpables = new Set<string>()
@@ -588,7 +610,8 @@ function intentarColocar(
   pinEmpleadoId: string | undefined,
   permiteSolape: boolean,
   exclusiva: boolean,
-  permitirSustitucion = false
+  permitirSustitucion = false,
+  preferenciaProceso: PreferenciaProceso = null
 ): ResultadoIntento {
   // 1) Máquinas. `usoLocal` descuenta lo ya comprometido por ESTA misma etapa, para no
   // mandar dos recursos de la etapa a la misma máquina física (sobre todo con grupos).
@@ -610,7 +633,7 @@ function intentarColocar(
   // 2) Empleados (slots), con reemplazo por habilidad
   const asignaciones: AsignacionEtapa[] = []
   const usadosEnEtapa = new Set<string>()
-  for (const slot of slotsDeEtapa(etapa)) {
+  for (const slot of slotsDeEtapa(etapa, preferenciaProceso)) {
     if (slot.ventanas.length === 0) continue  // slot sin presencia de empleado
     const ivs: IntervaloAbs[] = slot.ventanas.map(v => ({ inicio: t + v.desde, fin: t + v.hasta }))
 
@@ -721,7 +744,9 @@ export async function generarParaDia(dia: number, overrides: SchedulerOverrides 
       prioridad: p.prioridad,
       inicioMinOverride: timeOrNull(p.hora_inicio_min),
       inicioMaxOverride: timeOrNull(p.hora_inicio_max),
-      finMaxOverride: timeOrNull(p.hora_fin_max)
+      finMaxOverride: timeOrNull(p.hora_fin_max),
+      empleadoPreferidoModo: p.empleado_preferido_modo ?? null,
+      empleadoPreferidoOverride: p.empleado_preferido_override_id ?? null
     })),
     maquinas,
     empleados,
@@ -1015,6 +1040,12 @@ export function generarSolucionesConflicto(
 ): SolucionConflicto[] {
   const soluciones: SolucionConflicto[] = []
   const etapa = conflicto.etapa
+  // Preferido del proceso (con el override del día) para reflejar la jerarquía también en las soluciones.
+  const plantillaDelConflicto = ctx.plantillasConEtapas.find(p => p.id === conflicto.plantillaId)
+  const itemDelConflicto = ctx.planDia.find(p => p.plantillaId === conflicto.plantillaId)
+  const preferenciaProceso = plantillaDelConflicto
+    ? resolverPreferenciaProceso(itemDelConflicto ?? {}, plantillaDelConflicto)
+    : null
 
   const simular = (delta: SchedulerOverrides, tipo: SolucionConflicto['tipo'], grupo: SolucionConflicto['grupo'], descripcion: string) => {
     const ov = fusionarOverrides(baseOverrides, delta)
@@ -1053,7 +1084,7 @@ export function generarSolucionesConflicto(
 
   // 2) Extender el turno de un empleado (para conflictos de empleado): franja extra + PIN.
   if (conflicto.conflicto?.motivo === 'empleado_no_disponible') {
-    const slots = slotsDeEtapa(etapa)
+    const slots = slotsDeEtapa(etapa, preferenciaProceso)
     const habilidadReq = slots.find(s => s.ventanas.length > 0)?.habilidad_id ?? null
     const preferidoEtapaId = slots.find(s => s.empleado_preferido_id)?.empleado_preferido_id ?? null
     const candidatos = ctx.empleados.filter(e => !habilidadReq || e.habilidades.has(habilidadReq))

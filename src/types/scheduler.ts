@@ -109,6 +109,9 @@ export interface ContextoScheduler {
     inicioMinOverride?: number | null
     inicioMaxOverride?: number | null
     finMaxOverride?: number | null
+    // Override del empleado preferido del proceso para este día.
+    empleadoPreferidoModo?: string | null   // 'heredar' | 'fijar' | 'ninguno'
+    empleadoPreferidoOverride?: string | null
   }[]
   maquinas: Maquina[]
   empleados: EmpleadoScheduler[]
