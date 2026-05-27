@@ -96,14 +96,16 @@ export const cronogramaHistorialService = {
 
     if (tareas.length === 0) return
 
-    const lineasIds = [...new Set(tareas.map(t => t.linea_id))]
+    const lineasIds = [...new Set(tareas.map(t => t.linea_id).filter((id): id is string => id != null))]
     const { data: lineasExistentes } = await supabase
       .from('cronograma_lineas')
       .select('id')
       .in('id', lineasIds)
 
     const lineasValidas = new Set((lineasExistentes || []).map(l => l.id))
-    const tareasValidas = tareas.filter(t => t.linea_id != null && lineasValidas.has(t.linea_id))
+    // Conservar tareas autónomas (linea_id null = procesos sin empleado) y las que apuntan a una línea
+    // que aún existe. NO descartar las autónomas: si no, un snapshot solo de procesos borraría todo.
+    const tareasValidas = tareas.filter(t => t.linea_id == null || lineasValidas.has(t.linea_id))
 
     if (tareasValidas.length === 0) return
 
