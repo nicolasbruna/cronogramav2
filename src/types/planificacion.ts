@@ -56,13 +56,6 @@ export interface RecursoEtapa {
   hasta: number        // minutos desde inicio del proceso
 }
 
-export interface RecursoProgramado {
-  maquinaId: string
-  maquinaNombre: string
-  inicio: number  // minutos absolutos
-  fin: number
-}
-
 export interface PlantillaEtapa {
   id: string
   plantilla_id: string
@@ -89,8 +82,8 @@ export interface PlantillaEtapa {
   empleado_preferido_id?: string | null
   empleado_preferido?: { id: string; nombre_completo: string } | null
   puede_reemplazarse?: boolean
-  dependencias: number[]
-  prerequisitos: number[]           // deps sueltas: deben terminar ANTES, sin encadenar
+  dependencias: string[]            // ids de etapa (estables ante reordenamientos)
+  prerequisitos: string[]           // ids de etapa: deben terminar ANTES, sin encadenar
   margen_espera_max?: number | null
   hora_inicio_min?: number | null   // minuto del día: no puede empezar antes
   hora_inicio_max?: number | null   // minuto del día: debe empezar antes (tope de comienzo)
@@ -125,59 +118,6 @@ export interface PlantillaProceso {
   activa: boolean
   fecha_creacion: string
   etapas?: PlantillaEtapa[]
-}
-
-export type LotesEncadenados = 'no' | 'secuencial' | 'pipeline'
-
-export interface PlanDia {
-  id: string
-  dia_semana: number
-  plantilla_id: string
-  plantilla?: PlantillaProceso
-  cantidad_lotes: number
-  prioridad: number
-  hora_inicio_deseada?: string | null
-  hora_inicio_min?: number | null   // override: ninguna etapa empieza antes de este minuto
-  hora_fin_max?: number | null      // override: ninguna etapa termina después de este minuto
-  lotes_encadenados?: LotesEncadenados | null  // cómo se encadenan los lotes de esta plantilla
-  activo: boolean
-  fecha_creacion: string
-}
-
-export interface EmpleadoAsignado {
-  empleadoId: string | null
-  empleadoNombre: string | null
-  inicio: number          // minutos absolutos
-  fin: number
-  rol: RolEmpleadoEtapa
-}
-
-export interface EtapaScheduled {
-  key: string
-  plantillaId: string
-  plantillaNombre: string
-  lote: number
-  etapa: PlantillaEtapa
-  inicio: number
-  fin: number
-  empleadoId: string | null
-  empleadoNombre: string | null
-  // Multi-empleado (principal + ayudantes). El primero es el principal (= empleadoId legacy).
-  empleadosAsignados: EmpleadoAsignado[]
-  lineaId: string | null
-  // Legacy (primer recurso) – mantenido por compatibilidad
-  maquinaId: string | null
-  maquinaNombre: string | null
-  // Multi-recurso
-  recursosProgramados: RecursoProgramado[]
-  conflicto: boolean
-  mensajeConflicto?: string
-}
-
-export interface ResultadoScheduler {
-  etapas: EtapaScheduled[]
-  conflictos: EtapaScheduled[]
-  duracionTotal: number
 }
 
 export interface CrearMaquinaRequest {
@@ -222,8 +162,8 @@ export interface CrearEtapaRequest {
   habilidad_id?: string | null
   empleado_preferido_id?: string | null
   puede_reemplazarse?: boolean
-  dependencias: number[]
-  prerequisitos: number[]
+  dependencias: string[]
+  prerequisitos: string[]
   margen_espera_max?: number | null
   hora_inicio_min?: number | null
   hora_inicio_max?: number | null
@@ -236,15 +176,30 @@ export interface CrearEtapaRequest {
   descripcion_extra?: string | null
 }
 
+// Cola de producción de un día: qué plantillas y cuántos lotes producir.
+export interface PlanDiaItem {
+  id: string
+  dia_semana: number
+  plantilla_id: string
+  plantilla?: PlantillaProceso | null
+  cantidad_lotes: number
+  prioridad: number
+  // Overrides de horario solo para este día (TIME "HH:MM"); null = usa el de la plantilla.
+  hora_inicio_min?: string | null
+  hora_inicio_max?: string | null
+  hora_fin_max?: string | null
+  activo: boolean
+  fecha_creacion: string
+}
+
 export interface CrearPlanDiaRequest {
   dia_semana: number
   plantilla_id: string
   cantidad_lotes: number
   prioridad: number
-  hora_inicio_deseada?: string | null
-  hora_inicio_min?: number | null
-  hora_fin_max?: number | null
-  lotes_encadenados?: LotesEncadenados | null
+  hora_inicio_min?: string | null
+  hora_inicio_max?: string | null
+  hora_fin_max?: string | null
 }
 
 export const COLORES_ETAPA: Record<TipoEtapa, string> = {

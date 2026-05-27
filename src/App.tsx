@@ -4,12 +4,14 @@ import { LoginPage } from './components/Auth/LoginPage'
 import { CronogramaPage } from './components/Cronograma/CronogramaPage'
 import { CronogramaEmpleadoPage } from './components/Cronograma/CronogramaEmpleadoPage'
 import { ConfiguracionPage } from './components/Configuracion/ConfiguracionPage'
+import { PlanificarPage } from './components/Planificacion/PlanificarPage'
 import { Loader2 } from 'lucide-react'
 
 type Vista =
   | { tipo: 'cronograma' }
   | { tipo: 'cronograma-empleado'; empleadoId: string; dia?: number }
   | { tipo: 'configuracion' }
+  | { tipo: 'planificar'; dia: number }
 
 function AppContent() {
   const { user, loading } = useAuth()
@@ -59,10 +61,19 @@ function AppContent() {
     )
   }
 
+  if (vista.tipo === 'planificar') {
+    return (
+      <div className="h-screen">
+        <PlanificarPage diaActual={vista.dia} onVolver={() => setVista({ tipo: 'cronograma' })} />
+      </div>
+    )
+  }
+
   return (
     <CronogramaPage
       onSectionChange={handleSectionChange}
       onIrAConfiguracion={() => setVista({ tipo: 'configuracion' })}
+      onIrAPlanificar={(dia) => setVista({ tipo: 'planificar', dia })}
     />
   )
 }

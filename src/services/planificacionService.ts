@@ -1,10 +1,12 @@
 import { supabase } from '../config/supabase'
 import {
-  Maquina, Habilidad, PlantillaProceso, PlantillaEtapa, PlanDia,
+  Maquina, Habilidad, PlantillaProceso, PlantillaEtapa,
   GrupoRecurso, CrearGrupoRecursoRequest,
   CrearMaquinaRequest, CrearHabilidadRequest, CrearPlantillaRequest,
-  CrearEtapaRequest, CrearPlanDiaRequest, EmpleadoHorario
+  CrearEtapaRequest, EmpleadoHorario, PlanDiaItem, CrearPlanDiaRequest
 } from '../types/planificacion'
+import { EmpleadoScheduler, FranjaDisponibilidad } from '../types/scheduler'
+import { timeToMin } from '../components/Cronograma/cronogramaHelpers'
 
 export const planificacionService = {
 
@@ -148,26 +150,6 @@ export const planificacionService = {
     return data || []
   },
 
-  async listarPlantillasConEtapas(): Promise<PlantillaProceso[]> {
-    const { data: plantillas, error: pe } = await supabase
-      .from('plantillas_proceso')
-      .select('*')
-      .eq('activa', true)
-      .order('nombre')
-    if (pe) throw pe
-
-    const { data: etapas, error: ee } = await supabase
-      .from('plantilla_etapas')
-      .select('*, maquina:maquinas(*), habilidad:habilidades(*)')
-      .order('orden')
-    if (ee) throw ee
-
-    return (plantillas || []).map(p => ({
-      ...p,
-      etapas: (etapas || []).filter(e => e.plantilla_id === p.id)
-    }))
-  },
-
   async crearPlantilla(req: CrearPlantillaRequest): Promise<PlantillaProceso> {
     const { data, error } = await supabase
       .from('plantillas_proceso')
@@ -240,45 +222,6 @@ export const planificacionService = {
     )
   },
 
-  // ==================== PLAN DEL DÍA ====================
-
-  async listarPlanDia(diaSemana: number): Promise<PlanDia[]> {
-    const { data, error } = await supabase
-      .from('plan_dia')
-      .select('*, plantilla:plantillas_proceso(*)')
-      .eq('dia_semana', diaSemana)
-      .eq('activo', true)
-      .order('prioridad', { ascending: false })
-    if (error) throw error
-    return data || []
-  },
-
-  async crearPlanDia(req: CrearPlanDiaRequest): Promise<PlanDia> {
-    const { data, error } = await supabase
-      .from('plan_dia')
-      .insert(req)
-      .select('*, plantilla:plantillas_proceso(*)')
-      .single()
-    if (error) throw error
-    return data
-  },
-
-  async actualizarPlanDia(id: string, req: Partial<Pick<PlanDia, 'cantidad_lotes' | 'prioridad' | 'hora_inicio_deseada' | 'hora_inicio_min' | 'hora_fin_max' | 'activo' | 'lotes_encadenados'>>): Promise<void> {
-    const { error } = await supabase
-      .from('plan_dia')
-      .update(req)
-      .eq('id', id)
-    if (error) throw error
-  },
-
-  async eliminarPlanDia(id: string): Promise<void> {
-    const { error } = await supabase
-      .from('plan_dia')
-      .delete()
-      .eq('id', id)
-    if (error) throw error
-  },
-
   // ==================== HORARIOS DE EMPLEADOS ====================
 
   async listarHorariosEmpleado(empleadoId: string): Promise<EmpleadoHorario[]> {
@@ -333,28 +276,77 @@ export const planificacionService = {
     }))
   },
 
-  // Obtiene empleados con sus habilidades, líneas y horario del día para el scheduler
-  async listarEmpleadosParaScheduler(diaSemana: number): Promise<{
-    id: string
-    nombre_completo: string
-    habilidades: string[]
-    lineas: { id: string; nombre: string }[]
-    horario: { hora_inicio: string; hora_fin: string } | null
-  }[]> {
+  // ==================== PLAN DEL DÍA (cola de producción) ====================
+
+  async listarPlanDia(diaSemana: number): Promise<PlanDiaItem[]> {
+    const { data, error } = await supabase
+      .from('plan_dia')
+      .select('*, plantilla:plantillas_proceso(*)')
+      .eq('dia_semana', diaSemana)
+      .eq('activo', true)
+      .order('prioridad', { ascending: false })
+    if (error) throw error
+    return data || []
+  },
+
+  async crearPlanDiaItem(req: CrearPlanDiaRequest): Promise<PlanDiaItem> {
+    const { data, error } = await supabase
+      .from('plan_dia')
+      .insert(req)
+      .select('*, plantilla:plantillas_proceso(*)')
+      .single()
+    if (error) throw error
+    return data
+  },
+
+  async actualizarPlanDiaItem(id: string, req: Partial<Pick<PlanDiaItem, 'cantidad_lotes' | 'prioridad' | 'activo' | 'hora_inicio_min' | 'hora_inicio_max' | 'hora_fin_max'>>): Promise<void> {
+    const { error } = await supabase
+      .from('plan_dia')
+      .update(req)
+      .eq('id', id)
+    if (error) throw error
+  },
+
+  async eliminarPlanDiaItem(id: string): Promise<void> {
+    const { error } = await supabase
+      .from('plan_dia')
+      .delete()
+      .eq('id', id)
+    if (error) throw error
+  },
+
+  // ==================== LOADERS PARA EL SCHEDULER ====================
+
+  // Plantillas activas con sus etapas pobladas (para el generador).
+  async listarPlantillasConEtapas(): Promise<PlantillaProceso[]> {
+    const { data: plantillas, error: pe } = await supabase
+      .from('plantillas_proceso')
+      .select('*')
+      .eq('activa', true)
+      .order('nombre')
+    if (pe) throw pe
+
+    const { data: etapas, error: ee } = await supabase
+      .from('plantilla_etapas')
+      .select('*, maquina:maquinas(*), habilidad:habilidades(*)')
+      .order('orden')
+    if (ee) throw ee
+
+    return (plantillas || []).map(p => ({
+      ...p,
+      etapas: (etapas || []).filter(e => e.plantilla_id === p.id)
+    }))
+  },
+
+  // Empleados activos como EmpleadoScheduler: habilidades + FRANJAS del día.
+  // Cada fila de empleado_horarios del día es una franja independiente (no se fusionan).
+  async listarEmpleadosParaScheduler(diaSemana: number): Promise<EmpleadoScheduler[]> {
     const { data: empleados, error: ee } = await supabase
       .from('empleados')
       .select('id, nombre_completo')
       .eq('activo', true)
       .order('nombre_completo')
     if (ee) throw ee
-
-    const { data: lineas, error: le } = await supabase
-      .from('cronograma_lineas')
-      .select('id, nombre, empleado_id')
-      .eq('dia_semana', diaSemana)
-      .eq('activa', true)
-      .order('orden')
-    if (le) throw le
 
     const { data: habs, error: he } = await supabase
       .from('empleado_habilidades')
@@ -367,19 +359,28 @@ export const planificacionService = {
       .eq('dia_semana', diaSemana)
     if (ho) throw ho
 
-    return (empleados || []).map(emp => ({
-      id: emp.id,
-      nombre_completo: emp.nombre_completo,
-      habilidades: (habs || [])
+    return (empleados || []).map(emp => {
+      const franjas: FranjaDisponibilidad[] = (horarios || [])
         .filter(h => h.empleado_id === emp.id)
-        .map(h => h.habilidad_id),
-      lineas: (lineas || [])
-        .filter(l => l.empleado_id === emp.id)
-        .map(l => ({ id: l.id, nombre: l.nombre })),
-      horario: (horarios || []).find(h => h.empleado_id === emp.id)
-        ? { hora_inicio: (horarios || []).find(h => h.empleado_id === emp.id)!.hora_inicio,
-            hora_fin: (horarios || []).find(h => h.empleado_id === emp.id)!.hora_fin }
-        : null
-    }))
+        .flatMap(h => {
+          const desde = timeToMin(h.hora_inicio)
+          const hasta = timeToMin(h.hora_fin)
+          // Turno que cruza medianoche (ej. 22:00→06:00): partir en [desde,1440] y [0,hasta].
+          if (hasta <= desde) {
+            return [
+              { desde, hasta: 1440, origen: 'turno' as const, etiqueta: 'Turno' },
+              { desde: 0, hasta, origen: 'turno' as const, etiqueta: 'Turno' }
+            ]
+          }
+          return [{ desde, hasta, origen: 'turno' as const, etiqueta: 'Turno' }]
+        })
+        .sort((a, b) => a.desde - b.desde)
+      return {
+        id: emp.id,
+        nombre_completo: emp.nombre_completo,
+        habilidades: new Set((habs || []).filter(h => h.empleado_id === emp.id).map(h => h.habilidad_id)),
+        franjas
+      }
+    })
   }
 }

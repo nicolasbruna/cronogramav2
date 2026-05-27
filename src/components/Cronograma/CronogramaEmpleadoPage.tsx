@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { ArrowLeft, ChevronLeft, ChevronRight } from 'lucide-react'
 import { cronogramaService } from '../../services/cronogramaService'
-import { CronogramaTarea, EmpleadoConLineas, DIAS_SEMANA_NOMBRES } from '../../types/cronograma'
+import { CronogramaTarea, EmpleadoConLineas, DIAS_SEMANA_NOMBRES, TamanoTexto, OrientacionTexto } from '../../types/cronograma'
 import { CronogramaTimeline } from './CronogramaTimeline'
 import { TareaModal } from './TareaModal'
 import { getDiaSemanaHoy } from './cronogramaHelpers'
@@ -38,7 +38,7 @@ export function CronogramaEmpleadoPage({ empleadoId, diaInicial, onVolver }: Pro
       if (empFiltrado.length > 0) {
         setNombreEmpleado(empFiltrado[0].nombre_completo)
         const lineaIds = new Set(empFiltrado[0].lineas.map(l => l.id))
-        setTareas(tars.filter(t => lineaIds.has(t.linea_id)))
+        setTareas(tars.filter(t => t.linea_id != null && lineaIds.has(t.linea_id)))
       } else {
         setTareas([])
       }
@@ -81,13 +81,13 @@ export function CronogramaEmpleadoPage({ empleadoId, diaInicial, onVolver }: Pro
   }, [diaActual])
 
   const handleGuardarTarea = useCallback(async (datos: {
-    linea_id: string; hora_inicio: string; hora_fin: string; descripcion: string; color: string | null; bloqueada: boolean; tamano_texto: string; orientacion_texto: string
+    linea_id: string; hora_inicio: string; hora_fin: string; descripcion: string; color: string | null; bloqueada: boolean; tamano_texto: TamanoTexto; orientacion_texto: OrientacionTexto
   }) => {
     try {
       if (modalTarea?.id) {
         await cronogramaService.actualizarTarea(modalTarea.id, datos)
       } else {
-        await cronogramaService.crearTarea({ ...datos, dia_semana: diaActual, tamano_texto: datos.tamano_texto as 'xs' | 'sm' | 'normal' | 'lg' | 'xl', orientacion_texto: datos.orientacion_texto as 'horizontal' | 'vertical' })
+        await cronogramaService.crearTarea({ ...datos, dia_semana: diaActual })
       }
       setModalVisible(false)
       setModalTarea(null)

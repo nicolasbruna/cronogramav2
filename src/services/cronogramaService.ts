@@ -11,6 +11,46 @@ import {
   COLORES_EMPLEADOS
 } from '../types/cronograma'
 
+// Mapea una tarea (de otro día, versión o snapshot) al objeto insertable COMPLETO, preservando
+// todos los campos relevantes (recursos, trazabilidad de scheduler, solape, visual). Centraliza la
+// copia para que copiarTareasDesde / cargarVersion / restaurarSnapshot no se desincronicen.
+export function mapTareaParaInsert(
+  t: CronogramaTarea,
+  diaDestino: number,
+  lineaId: string | null,
+  overrides: Record<string, unknown> = {}
+) {
+  return {
+    linea_id: lineaId,
+    dia_semana: diaDestino,
+    hora_inicio: t.hora_inicio,
+    hora_fin: t.hora_fin,
+    descripcion: t.descripcion,
+    color: t.color ?? null,
+    bloqueada: t.bloqueada ?? false,
+    tamano_texto: t.tamano_texto || 'normal',
+    orientacion_texto: t.orientacion_texto || 'horizontal',
+    orden: t.orden ?? 0,
+    tamano: t.tamano ?? 5,
+    fila: t.fila ?? 0,
+    grupo_id: t.grupo_id ?? null,
+    recursos_programados: t.recursos_programados ?? [],
+    plantilla_id: t.plantilla_id ?? null,
+    es_provisoria: t.es_provisoria ?? false,
+    notas_provisoria: t.notas_provisoria ?? null,
+    etapa_orden: t.etapa_orden ?? null,
+    lote: t.lote ?? null,
+    dependencias: t.dependencias ?? [],
+    prerequisitos: t.prerequisitos ?? [],
+    permite_solape: t.permite_solape ?? false,
+    duracion_base_min: t.duracion_base_min ?? null,
+    factor_solape_pct: t.factor_solape_pct ?? null,
+    solape_modo: t.solape_modo ?? null,
+    eliminada: false,
+    ...overrides
+  }
+}
+
 export const cronogramaService = {
   async listarEmpleadosConLineas(diaSemana?: number): Promise<EmpleadoConLineas[]> {
     const { data: empleados, error: empError } = await supabase
@@ -287,17 +327,8 @@ export const cronogramaService = {
     }
 
     const nuevasTareas = tareasOrigen
-      .filter(t => lineaMap[t.linea_id])
-      .map(t => ({
-        linea_id: lineaMap[t.linea_id],
-        dia_semana: diaDestino,
-        hora_inicio: t.hora_inicio,
-        hora_fin: t.hora_fin,
-        descripcion: t.descripcion,
-        color: t.color,
-        bloqueada: false,
-        orden: t.orden
-      }))
+      .filter(t => t.linea_id != null && lineaMap[t.linea_id])
+      .map(t => mapTareaParaInsert(t, diaDestino, lineaMap[t.linea_id!], { bloqueada: false }))
 
     if (nuevasTareas.length === 0) return 0
 
@@ -385,18 +416,8 @@ export const cronogramaService = {
 
     if (tareasSnapshot.length > 0) {
       const tareas = tareasSnapshot
-        .filter(t => lineaIdMap[t.linea_id])
-        .map(t => ({
-          linea_id: lineaIdMap[t.linea_id],
-          dia_semana: diaDestino,
-          hora_inicio: t.hora_inicio,
-          hora_fin: t.hora_fin,
-          descripcion: t.descripcion,
-          color: t.color,
-          bloqueada: t.bloqueada,
-          tamano_texto: t.tamano_texto || 'normal',
-          orden: t.orden || 0
-        }))
+        .filter(t => t.linea_id != null && lineaIdMap[t.linea_id])
+        .map(t => mapTareaParaInsert(t, diaDestino, lineaIdMap[t.linea_id!]))
       if (tareas.length > 0) {
         const { error: errTareas } = await supabase.from('cronograma_tareas').insert(tareas)
         if (errTareas) throw errTareas

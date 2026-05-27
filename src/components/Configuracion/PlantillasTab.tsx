@@ -20,7 +20,7 @@ const COLORES_PROCESO = [
 ]
 import { PlantillaProceso, PlantillaEtapa, Maquina, Habilidad, CrearEtapaRequest, TipoEtapa, COLORES_ETAPA, VentanaEmpleado, RecursoEtapa, EmpleadoEtapaSlot } from '../../types/planificacion'
 import { planificacionService } from '../../services/planificacionService'
-import { convertirLegacyAVentanas } from '../../services/schedulerService'
+import { convertirLegacyAVentanas } from '../../services/etapaHelpers'
 
 const TIPO_LABELS: Record<TipoEtapa, string> = {
   critica: 'Crítica',
@@ -359,26 +359,38 @@ export function PlantillasTab() {
                 <div onClick={e => e.stopPropagation()}>
                   <input autoFocus type="text" value={formPlantilla.nombre}
                     onChange={e => setFormPlantilla(prev => ({ ...prev, nombre: e.target.value }))}
-                    className="w-full h-7 px-2 text-[12px] border border-slate-300 rounded mb-1.5 focus:outline-none focus:ring-1 focus:ring-blue-400"
+                    className="w-full h-7 px-2 text-[12px] bg-white text-slate-900 border border-slate-300 rounded mb-1.5 focus:outline-none focus:ring-1 focus:ring-blue-400"
                     onKeyDown={e => { if (e.key === 'Enter') guardarPlantilla() }} />
+                  <div className="mb-1.5">
+                    <label className="text-[9px] text-slate-400 block mb-0.5">Color del proceso</label>
+                    <div className="flex flex-wrap gap-1.5">
+                      {COLORES_PROCESO.map(c => (
+                        <button key={c} onClick={() => setFormPlantilla(prev => ({ ...prev, color: c }))}
+                          className={`w-5 h-5 rounded-full border-2 transition-transform hover:scale-110 ${formPlantilla.color === c ? 'border-slate-700 scale-110' : 'border-transparent'}`}
+                          style={{ backgroundColor: c }} />
+                      ))}
+                      <button onClick={() => setFormPlantilla(prev => ({ ...prev, color: '' }))}
+                        className={`w-5 h-5 rounded-full border-2 bg-slate-200 text-slate-400 text-[8px] flex items-center justify-center ${!formPlantilla.color ? 'border-slate-700' : 'border-transparent'}`}>∅</button>
+                    </div>
+                  </div>
                   <div className="flex gap-1.5 mb-1.5">
                     <div className="flex-1">
                       <label className="text-[9px] text-slate-400 block mb-0.5">Desde</label>
                       <input type="time" value={formPlantilla.hora_inicio_min}
                         onChange={e => setFormPlantilla(prev => ({ ...prev, hora_inicio_min: e.target.value }))}
-                        className="w-full h-6 px-1 text-[10px] border border-slate-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-400 bg-white" />
+                        className="w-full h-6 px-1 text-[10px] bg-white text-slate-900 border border-slate-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-400" />
                     </div>
                     <div className="flex-1">
                       <label className="text-[9px] text-slate-400 block mb-0.5">Tope inicio</label>
                       <input type="time" value={formPlantilla.hora_inicio_max}
                         onChange={e => setFormPlantilla(prev => ({ ...prev, hora_inicio_max: e.target.value }))}
-                        className="w-full h-6 px-1 text-[10px] border border-slate-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-400 bg-white" />
+                        className="w-full h-6 px-1 text-[10px] bg-white text-slate-900 border border-slate-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-400" />
                     </div>
                     <div className="flex-1">
                       <label className="text-[9px] text-slate-400 block mb-0.5">Hasta</label>
                       <input type="time" value={formPlantilla.hora_fin_max}
                         onChange={e => setFormPlantilla(prev => ({ ...prev, hora_fin_max: e.target.value }))}
-                        className="w-full h-6 px-1 text-[10px] border border-slate-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-400 bg-white" />
+                        className="w-full h-6 px-1 text-[10px] bg-white text-slate-900 border border-slate-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-400" />
                     </div>
                   </div>
                   <label className="flex items-start gap-1.5 cursor-pointer select-none mb-1">
@@ -394,8 +406,8 @@ export function PlantillasTab() {
                     <span className="text-[10px] text-slate-600 leading-tight">Atención exclusiva (no solapar con paralelas)</span>
                   </label>
                   <div className="flex gap-1">
-                    <button onClick={() => setEditandoPlantillaId(null)} className="flex-1 h-6 text-[10px] border border-slate-300 rounded text-slate-600">Cancelar</button>
-                    <button onClick={guardarPlantilla} className="flex-1 h-6 text-[10px] bg-slate-900 text-white rounded">OK</button>
+                    <button onClick={() => setEditandoPlantillaId(null)} className="flex-1 h-6 text-[10px] bg-white text-slate-600 border border-slate-300 rounded">Cancelar</button>
+                    <button onClick={guardarPlantilla} className="flex-1 h-6 text-[10px] bg-slate-900 text-white border border-slate-900 rounded">OK</button>
                   </div>
                 </div>
               ) : (
@@ -487,7 +499,7 @@ export function PlantillasTab() {
                         empleados={empleados} etapasExistentes={etapas.filter(et => et.id !== e.id)}
                         titulo={`Editando: ${e.nombre}`} />
                     ) : (
-                      <EtapaCard etapa={e} idx={idx} total={etapas.length}
+                      <EtapaCard etapa={e} idx={idx} total={etapas.length} etapas={etapas}
                         onEditar={() => iniciarEditarEtapa(e)}
                         onEliminar={() => eliminarEtapa(e.id, e.nombre)}
                         onMover={(dir) => moverEtapa(e.id, dir)}
@@ -512,12 +524,13 @@ export function PlantillasTab() {
 
 // ---- EtapaCard ----
 
-function EtapaCard({ etapa, idx, total, onEditar, onEliminar, onMover, maquinas, empleados }: {
-  etapa: PlantillaEtapa; idx: number; total: number; maquinas: Maquina[]
+function EtapaCard({ etapa, idx, total, etapas, onEditar, onEliminar, onMover, maquinas, empleados }: {
+  etapa: PlantillaEtapa; idx: number; total: number; etapas: PlantillaEtapa[]; maquinas: Maquina[]
   empleados: EmpleadoConHabilidades[]
   onEditar: () => void; onEliminar: () => void; onMover: (dir: 'up' | 'down') => void
 }) {
   const color = etapa.color || COLORES_ETAPA[etapa.tipo]
+  const ordenesDe = (ids: string[]) => ids.map(id => etapas.find(e => e.id === id)?.orden).filter(o => o != null).sort((a, b) => a! - b!).join(', ')
   const ventanas = etapa.ventanas_empleado?.length > 0 ? etapa.ventanas_empleado : convertirLegacyAVentanas(etapa)
   const tiempoEmpleado = ventanas.reduce((s, v) => s + (v.hasta - v.desde), 0)
   const usoRecurso = etapa.uso_recurso ?? 1.0
@@ -610,12 +623,12 @@ function EtapaCard({ etapa, idx, total, onEditar, onEliminar, onMover, maquinas,
               )}
               {etapa.dependencias.length > 0 && (
                 <span className="text-[11px] text-slate-500 flex items-center gap-1">
-                  <GitBranch size={10} />depende de: {etapa.dependencias.join(', ')}
+                  <GitBranch size={10} />depende de: {ordenesDe(etapa.dependencias)}
                 </span>
               )}
               {(etapa.prerequisitos ?? []).length > 0 && (
                 <span className="text-[11px] text-amber-600 flex items-center gap-1">
-                  <Timer size={10} />prereq: {etapa.prerequisitos.join(', ')}
+                  <Timer size={10} />prereq: {ordenesDe(etapa.prerequisitos)}
                 </span>
               )}
               {etapa.hora_inicio_min != null && (
@@ -1165,10 +1178,10 @@ function FormEtapa({ form, onChange, onGuardar, onCancelar, maquinas, habilidade
           <div className="flex flex-wrap gap-2">
             {etapasExistentes.map(e => (
               <label key={e.id} className="flex items-center gap-1.5 cursor-pointer">
-                <input type="checkbox" checked={(form.dependencias ?? []).includes(e.orden)}
+                <input type="checkbox" checked={(form.dependencias ?? []).includes(e.id)}
                   onChange={ev => {
                     const deps = form.dependencias ?? []
-                    onChange({ ...form, dependencias: ev.target.checked ? [...deps, e.orden] : deps.filter(d => d !== e.orden) })
+                    onChange({ ...form, dependencias: ev.target.checked ? [...deps, e.id] : deps.filter(d => d !== e.id) })
                   }}
                   className="w-3.5 h-3.5" />
                 <span className="text-[11px] text-slate-700">{e.orden}. {e.nombre}</span>
@@ -1188,10 +1201,10 @@ function FormEtapa({ form, onChange, onGuardar, onCancelar, maquinas, habilidade
           <div className="flex flex-wrap gap-2">
             {etapasExistentes.map(e => (
               <label key={e.id} className="flex items-center gap-1.5 cursor-pointer">
-                <input type="checkbox" checked={(form.prerequisitos ?? []).includes(e.orden)}
+                <input type="checkbox" checked={(form.prerequisitos ?? []).includes(e.id)}
                   onChange={ev => {
                     const prereqs = form.prerequisitos ?? []
-                    onChange({ ...form, prerequisitos: ev.target.checked ? [...prereqs, e.orden] : prereqs.filter(d => d !== e.orden) })
+                    onChange({ ...form, prerequisitos: ev.target.checked ? [...prereqs, e.id] : prereqs.filter(d => d !== e.id) })
                   }}
                   className="w-3.5 h-3.5 accent-amber-500" />
                 <span className="text-[11px] text-slate-700">{e.orden}. {e.nombre}</span>

@@ -1,1285 +1,1084 @@
-import { PlantillaEtapa, PlanDia, Maquina, EtapaScheduled, ResultadoScheduler, VentanaEmpleado, RecursoProgramado, EmpleadoAsignado, EmpleadoEtapaSlot } from '../types/planificacion'
+import { PlantillaProceso, PlantillaEtapa, Maquina } from '../types/planificacion'
+import {
+  ContextoScheduler, ResultadoScheduler, InstanciaEtapa, FranjaDisponibilidad,
+  EmpleadoScheduler, IntervaloAbs, AsignacionEtapa, RecursoAbs, OcupacionMaquina,
+  OcupacionEmpleado, SchedulerOverrides, MotivoConflicto, MetricasJornada, SolucionConflicto
+} from '../types/scheduler'
+import { recursosDeEtapa, slotsDeEtapa } from './etapaHelpers'
+import { timeToMin, minToTime, formatDuration } from '../components/Cronograma/cronogramaHelpers'
+import { cronogramaService } from './cronogramaService'
+import { planificacionService } from './planificacionService'
+import { configuracionService } from './configuracionService'
+import { calcularCambiosSolape } from '../components/Cronograma/solapeHelpers'
+import { RecursoProgramadoCronograma } from '../types/cronograma'
 
-// Convierte "HH:MM" o "HH:MM:SS" a minutos desde medianoche. null si vacío.
-function timeStrToMin(t: string | null | undefined): number | null {
-  if (!t) return null
-  const [h, m] = t.split(':').map(Number)
-  return h * 60 + (m ?? 0)
-}
+const DIA_FIN = 1440  // minuto tope del día
 
-interface EmpleadoScheduler {
-  id: string
-  nombre_completo: string
-  habilidades: string[]
-  lineas: { id: string; nombre: string }[]
-  busyIntervals: [number, number][]
-  parallelIntervals: [number, number][]   // ocupaciones de tareas paralelas (no bloquean tareas normales)
-  exclusiveIntervals: [number, number][]  // ocupaciones de tareas con atención exclusiva (bloquean paralelas)
-  horarioInicio: number | null   // minutos del día — hora de entrada (null = sin turno ese día)
-  horarioFin: number | null      // minutos del día — hora de salida
-  trabajaHoy: boolean            // false = el empleado no tiene turno configurado ese día → no disponible
-}
+// ============ Estructuras de ocupación (mutables durante la colocación) ============
 
-interface UsageSlot {
-  start: number
-  end: number
-  usage: number
-}
+interface ReservaMaquina { intervalo: IntervaloAbs; uso: number; etiqueta?: string; plantillaId?: string }
+interface ReservaEmpleado { intervalo: IntervaloAbs; etiqueta?: string; plantillaId?: string; permiteSolape: boolean; exclusiva: boolean }
 
-interface MaquinaScheduler {
-  id: string
-  nombre: string
-  cantidad: number
-  grupo_id: string | null
-  prioridad_grupo: number
-  slots: UsageSlot[]
-}
+class CalendarioOcupacion {
+  private maquinas = new Map<string, ReservaMaquina[]>()
+  private empleados = new Map<string, ReservaEmpleado[]>()
 
-interface RecursoEfectivo {
-  maquinaId: string
-  usoRecurso: number
-  desde: number  // relativo al inicio de la tarea
-  hasta: number
-}
-
-interface EtapaExpandida {
-  key: string
-  plantillaId: string
-  plantillaNombre: string
-  lote: number
-  etapa: PlantillaEtapa
-  dependencyKeys: string[]
-  prerequisitoKeys: string[]  // deps sueltas: deben terminar antes, sin encadenar al bloque
-  horaInicioMin: number | null   // minuto del día: no puede empezar antes (etapa o plan override)
-  horaInicioMaxEtapa: number | null    // tope de comienzo a nivel ETAPA (se aplica a esta etapa, con su offset)
-  horaInicioMaxProceso: number | null  // tope de comienzo a nivel PLANTILLA (se aplica al inicio del proceso, sin offset)
-  horaFinMax: number | null      // minuto del día: debe terminar antes
-}
-
-interface ChainGroup {
-  headKey: string
-  tasks: EtapaExpandida[]
-  offsets: number[]      // offset desde el inicio del chain head para cada tarea
-  totalDuration: number
-}
-
-interface ChainPlacement {
-  inicio: number
-  fin: number
-  empleadoId: string | null
-  empleadoNombre: string | null
-  lineaId: string | null
-  recursosProgramados: RecursoProgramado[]
-}
-
-// Motivo por el cual un bloque no pudo ubicarse — usado para construir un mensaje
-// de conflicto específico en lugar del genérico.
-interface ChainFailReason {
-  tipo: 'ventana' | 'maquina' | 'empleado'
-  etapaNombre?: string
-  recursoNombre?: string
-  empMinStart?: number | null   // hora de entrada del primer empleado candidato
-  deadlineStart?: number        // tope de comienzo del bloque (effectiveMax), si es finito
-  earliest?: number             // primer comienzo posible del bloque (effectiveEarliest)
-  // Datos para identificar al "culpable" (qué bloque ya ubicado ocupa el recurso):
-  inicioIntentado?: number      // inicio de la etapa que falló, en el último t probado
-  finIntentado?: number         // fin de la etapa que falló
-  candidatoIds?: string[]       // ids de empleados candidatos de la etapa que falló
-  maquinaIdBloqueada?: string   // id de la máquina que faltó (caso 'maquina')
-}
-
-// ---- Helpers recursos ----
-
-function getRecursosEfectivos(etapa: PlantillaEtapa): RecursoEfectivo[] {
-  if (etapa.recursos && etapa.recursos.length > 0) {
-    return etapa.recursos.map(r => ({
-      maquinaId: r.maquina_id,
-      usoRecurso: r.uso_recurso,
-      desde: r.desde,
-      hasta: r.hasta
-    }))
+  constructor(maqInit: OcupacionMaquina[], empInit: OcupacionEmpleado[]) {
+    for (const o of maqInit) this.reservarMaquina(o.maquinaId, o.intervalo, o.uso, o.etiqueta, o.plantillaId)
+    for (const o of empInit) this.reservarEmpleado(o.empleadoId, o.intervalo, o.etiqueta, o.plantillaId, o.permiteSolape ?? false, o.exclusiva ?? false)
   }
-  if (etapa.maquina_id) {
-    return [{ maquinaId: etapa.maquina_id, usoRecurso: etapa.uso_recurso ?? 1.0, desde: 0, hasta: etapa.duracion_proceso }]
+
+  private solapan<T extends { intervalo: IntervaloAbs }>(arr: T[], ivs: IntervaloAbs[]): T[] {
+    return arr.filter(o => ivs.some(iv => o.intervalo.inicio < iv.fin && o.intervalo.fin > iv.inicio))
   }
-  return []
-}
 
-// ---- Helpers empleado ----
-
-function getVentanasEmpleado(etapa: PlantillaEtapa, inicio: number, fin: number): [number, number][] {
-  if (etapa.ventanas_empleado && etapa.ventanas_empleado.length > 0) {
-    return etapa.ventanas_empleado.map(v => [inicio + v.desde, inicio + v.hasta] as [number, number])
+  // Etiquetas de las tareas que ocupan a un empleado dentro de los intervalos dados.
+  competidoresEmpleado(empId: string, ivs: IntervaloAbs[]): string[] {
+    return [...new Set(this.solapan(this.empleados.get(empId) || [], ivs).map(o => o.etiqueta).filter((e): e is string => !!e))]
   }
-  if (etapa.bloquea_empleado_total) return [[inicio, fin]]
-  const w: [number, number][] = []
-  if (etapa.tiempo_empleado_inicio > 0) w.push([inicio, inicio + etapa.tiempo_empleado_inicio])
-  if (etapa.tiempo_empleado_fin > 0) w.push([fin - etapa.tiempo_empleado_fin, fin])
-  return w
-}
 
-function isSlotFree(intervals: [number, number][], start: number, end: number): boolean {
-  for (const [s, e] of intervals) {
-    if (s < end && e > start) return false
+  // Plantillas culpables que ocupan a un empleado / máquina (para soluciones sobre el culpable).
+  plantillasEmpleado(empId: string, ivs: IntervaloAbs[]): string[] {
+    return [...new Set(this.solapan(this.empleados.get(empId) || [], ivs).map(o => o.plantillaId).filter((p): p is string => !!p))]
   }
-  return true
-}
 
-function addInterval(intervals: [number, number][], start: number, end: number): void {
-  if (start < end) intervals.push([start, end])
-}
+  plantillasMaquina(maquinaId: string, ivs: IntervaloAbs[]): string[] {
+    return [...new Set(this.solapan(this.maquinas.get(maquinaId) || [], ivs).map(o => o.plantillaId).filter((p): p is string => !!p))]
+  }
 
-function empleadoDisponible(emp: EmpleadoScheduler, inicio: number, fin: number, etapa: PlantillaEtapa): boolean {
-  // Sin turno configurado ese día → el empleado no trabaja, no está disponible.
-  if (!emp.trabajaHoy) return false
-  // Verificar ventana horaria del empleado (hora de entrada / salida)
-  const ventanas = getVentanasEmpleado(etapa, inicio, fin)
-  const esParalela = etapa.permite_solape === true
-  const esExclusiva = etapa.atencion_exclusiva === true
-  if (ventanas.length > 0) {
-    for (const [vs, ve] of ventanas) {
-      if (emp.horarioInicio !== null && vs < emp.horarioInicio) return false
-      if (emp.horarioFin !== null && ve > emp.horarioFin) return false
-      if (esParalela) {
-        // Paralela: ignora ocupaciones normales y otras paralelas, pero no puede pisar una exclusiva
-        if (!isSlotFree(emp.exclusiveIntervals, vs, ve)) return false
-      } else {
-        // Normal o exclusiva: respeta la ocupación normal del empleado
-        if (!isSlotFree(emp.busyIntervals, vs, ve)) return false
-        // Exclusiva: además no puede coincidir con una tarea paralela del mismo empleado
-        if (esExclusiva && !isSlotFree(emp.parallelIntervals, vs, ve)) return false
-      }
+  // Cuántos minutos tienen ocupado a un empleado las plantillas dadas (p.ej. la crema que hace
+  // Sebastián). Sirve para traerlo SOLO ese tiempo antes del tope de la otra etapa.
+  spanOcupacionPlantillasEnEmpleado(plantillaIds: string[], empId: string): number {
+    const set = new Set(plantillaIds)
+    const arr = (this.empleados.get(empId) || []).filter(o => o.plantillaId && set.has(o.plantillaId))
+    if (arr.length === 0) return 0
+    const inicio = Math.min(...arr.map(o => o.intervalo.inicio))
+    const fin = Math.max(...arr.map(o => o.intervalo.fin))
+    return fin - inicio
+  }
+
+  // Etiquetas de las reservas que se solapan con un intervalo en una máquina (para explicar conflictos).
+  competidoresMaquina(maquinaId: string, iv: IntervaloAbs): string[] {
+    const reservas = this.maquinas.get(maquinaId) || []
+    const etiquetas = reservas
+      .filter(r => r.intervalo.inicio < iv.fin && r.intervalo.fin > iv.inicio && r.etiqueta)
+      .map(r => r.etiqueta!)
+    return [...new Set(etiquetas)]
+  }
+
+  // Máximo uso concurrente de una máquina dentro de un intervalo (para capacidad parcial).
+  maxUsoMaquina(maquinaId: string, iv: IntervaloAbs): number {
+    const reservas = this.maquinas.get(maquinaId) || []
+    const solapadas = reservas.filter(r => r.intervalo.inicio < iv.fin && r.intervalo.fin > iv.inicio)
+    if (solapadas.length === 0) return 0
+    // Barrido de puntos de inicio para hallar el pico de uso simultáneo.
+    const puntos = [iv.inicio, ...solapadas.map(r => Math.max(r.intervalo.inicio, iv.inicio))]
+    let pico = 0
+    for (const t of puntos) {
+      const suma = solapadas
+        .filter(r => r.intervalo.inicio <= t && r.intervalo.fin > t)
+        .reduce((acc, r) => acc + r.uso, 0)
+      if (suma > pico) pico = suma
     }
-  } else {
-    // Sin ventanas: verificar el bloque completo
-    if (emp.horarioInicio !== null && inicio < emp.horarioInicio) return false
-    if (emp.horarioFin !== null && fin > emp.horarioFin) return false
+    return pico
   }
-  return true
+
+  // ¿El empleado puede tomar una reserva nueva en estos intervalos? Dos reservas pueden
+  // COEXISTIR (solaparse) solo si ambas permiten solape y ninguna es de atención exclusiva.
+  empleadoLibre(empId: string, ivs: IntervaloAbs[], permiteSolapeNuevo: boolean, exclusivaNueva: boolean): boolean {
+    const ocup = this.empleados.get(empId) || []
+    return ivs.every(iv =>
+      !ocup.some(o => {
+        if (o.intervalo.inicio >= iv.fin || o.intervalo.fin <= iv.inicio) return false  // no se solapan
+        const puedenCoexistir = permiteSolapeNuevo && o.permiteSolape && !exclusivaNueva && !o.exclusiva
+        return !puedenCoexistir  // si no pueden coexistir, está ocupado
+      })
+    )
+  }
+
+  reservarMaquina(maquinaId: string, iv: IntervaloAbs, uso: number, etiqueta?: string, plantillaId?: string) {
+    const arr = this.maquinas.get(maquinaId) || []
+    arr.push({ intervalo: iv, uso, etiqueta, plantillaId })
+    this.maquinas.set(maquinaId, arr)
+  }
+
+  reservarEmpleado(empId: string, iv: IntervaloAbs, etiqueta: string | undefined, plantillaId: string | undefined, permiteSolape: boolean, exclusiva: boolean) {
+    const arr = this.empleados.get(empId) || []
+    arr.push({ intervalo: iv, etiqueta, plantillaId, permiteSolape, exclusiva })
+    this.empleados.set(empId, arr)
+  }
+
+  // Copia profunda, para probar la colocación de un proceso sin tocar el calendario real.
+  clonar(): CalendarioOcupacion {
+    const c = new CalendarioOcupacion([], [])
+    for (const [k, arr] of this.maquinas) c.maquinas.set(k, arr.map(r => ({ ...r, intervalo: { ...r.intervalo } })))
+    for (const [k, arr] of this.empleados) c.empleados.set(k, arr.map(r => ({ ...r, intervalo: { ...r.intervalo } })))
+    return c
+  }
+
+  // Momentos en que se libera algún recurso (para atrasar un proceso a horarios "candidatos").
+  tiemposLiberacion(): number[] {
+    const s = new Set<number>()
+    for (const arr of this.maquinas.values()) for (const r of arr) s.add(r.intervalo.fin)
+    for (const arr of this.empleados.values()) for (const r of arr) s.add(r.intervalo.fin)
+    return [...s].sort((a, b) => a - b)
+  }
 }
 
-function marcarEmpleadoOcupado(emp: EmpleadoScheduler, inicio: number, fin: number, etapa: PlantillaEtapa): void {
-  const ventanas = getVentanasEmpleado(etapa, inicio, fin)
-  if (etapa.permite_solape === true) {
-    // Paralela: no reserva al empleado, pero registra el intervalo para bloquear exclusivas
-    for (const [s, e] of ventanas) addInterval(emp.parallelIntervals, s, e)
-    return
-  }
-  for (const [s, e] of ventanas) addInterval(emp.busyIntervals, s, e)
-  if (etapa.atencion_exclusiva === true) {
-    for (const [s, e] of ventanas) addInterval(emp.exclusiveIntervals, s, e)
-  }
+// ============ Helpers ============
+
+function timeOrNull(t: string | null | undefined): number | null {
+  return t ? timeToMin(t) : null
 }
 
-// ---- Múltiples empleados por etapa (principal + ayudantes) ----
-
-function buildCandidatosSlot(slot: EmpleadoEtapaSlot, empleados: EmpleadoScheduler[]): EmpleadoScheduler[] {
-  const prefId = slot.empleado_preferido_id ?? null
-  const preferido = prefId ? (empleados.find(e => e.id === prefId) ?? null) : null
-  if (preferido) {
-    if (slot.puede_reemplazarse === false) return [preferido]
-    const otros = slot.habilidad_id
-      ? empleados.filter(e => e.id !== preferido.id && e.habilidades.includes(slot.habilidad_id!))
-      : empleados.filter(e => e.id !== preferido.id)
-    return [preferido, ...otros]
-  }
-  return slot.habilidad_id
-    ? empleados.filter(e => e.habilidades.includes(slot.habilidad_id!))
-    : [...empleados]
+function ventanaEnUnaFranja(emp: EmpleadoScheduler, iv: IntervaloAbs): boolean {
+  return emp.franjas.some(f => f.desde <= iv.inicio && f.hasta >= iv.fin)
 }
 
-function slotLibre(emp: EmpleadoScheduler, intervals: [number, number][], esParalela: boolean, esExclusiva: boolean): boolean {
-  if (!emp.trabajaHoy) return false
-  for (const [s, e] of intervals) {
-    if (emp.horarioInicio !== null && s < emp.horarioInicio) return false
-    if (emp.horarioFin !== null && e > emp.horarioFin) return false
-    if (esParalela) {
-      if (!isSlotFree(emp.exclusiveIntervals, s, e)) return false
-    } else {
-      if (!isSlotFree(emp.busyIntervals, s, e)) return false
-      if (esExclusiva && !isSlotFree(emp.parallelIntervals, s, e)) return false
-    }
-  }
-  return true
+function franjaExtraDe(emp: EmpleadoScheduler, iv: IntervaloAbs): boolean {
+  const f = emp.franjas.find(fr => fr.desde <= iv.inicio && fr.hasta >= iv.fin)
+  return f?.origen === 'extra'
 }
 
-// Construye la lista de empleados asignados a una etapa: el principal (del modelo legacy)
-// más un empleado por cada slot 'ayudante' definido en empleados_etapa. Reserva las ventanas
-// del ayudante en empState para evitar doble reserva.
-function construirAsignados(
-  etapa: PlantillaEtapa, inicio: number, fin: number,
-  principalId: string | null, principalNombre: string | null,
-  empState: EmpleadoScheduler[]
-): EmpleadoAsignado[] {
-  const asignados: EmpleadoAsignado[] = [
-    { empleadoId: principalId, empleadoNombre: principalNombre, inicio, fin, rol: 'principal' }
-  ]
-  const paralelo = etapa.permite_solape === true
-  const exclusiva = etapa.atencion_exclusiva === true
-  for (const slot of (etapa.empleados_etapa || [])) {
-    if (slot.rol !== 'ayudante') continue
-    const vent = (slot.ventanas && slot.ventanas.length > 0) ? slot.ventanas : [{ desde: 0, hasta: etapa.duracion_proceso }]
-    const intervals = vent.map(v => [inicio + v.desde, inicio + v.hasta] as [number, number])
-    const sIni = Math.min(...intervals.map(i => i[0]))
-    const sFin = Math.max(...intervals.map(i => i[1]))
-    const cand = buildCandidatosSlot(slot, empState)
-    const elegido = cand.find(e => e.id !== principalId && slotLibre(e, intervals, paralelo, exclusiva)) ?? null
-    if (elegido) {
-      if (paralelo) {
-        for (const [a, b] of intervals) addInterval(elegido.parallelIntervals, a, b)
-      } else {
-        for (const [a, b] of intervals) addInterval(elegido.busyIntervals, a, b)
-        if (exclusiva) for (const [a, b] of intervals) addInterval(elegido.exclusiveIntervals, a, b)
-      }
-      asignados.push({ empleadoId: elegido.id, empleadoNombre: elegido.nombre_completo, inicio: sIni, fin: sFin, rol: 'ayudante' })
-    } else {
-      asignados.push({ empleadoId: null, empleadoNombre: null, inicio: sIni, fin: sFin, rol: 'ayudante' })
+// Por defecto, modo estricto: cada recurso usa EXACTAMENTE la máquina asignada. Si la etapa habilita
+// sustitución (resolución asistida), puede usar cualquier máquina ACTIVA de su mismo grupo, ordenadas
+// por prioridad_grupo (se prueba la preferida del grupo primero).
+function maquinasCandidatas(maquinaId: string, maquinas: Maquina[], permitirSustitucion = false): Maquina[] {
+  const m = maquinas.find(x => x.id === maquinaId)
+  if (!m) return []
+  if (!permitirSustitucion || !m.grupo_id) return [m]
+  const grupo = maquinas.filter(x => x.id !== m.id && x.activa && x.grupo_id === m.grupo_id)
+  return [m, ...grupo].sort((a, b) => a.prioridad_grupo - b.prioridad_grupo)
+}
+
+// Una etapa es "preparable con antelación" (se puede adelantar a cualquier hueco libre del día):
+// no tiene dependencias ni prerequisitos propios, tiene al menos una etapa que la consume, y ninguna
+// de las que la usan como DEPENDENCIA exige arrancar enseguida (margen_espera_max acotado). Si solo
+// la usan como prerequisito, el acoplamiento es flojo y también se adelanta. Así se adelantan las
+// preparaciones (ingredientes, margarina, empaste) pero NO cosas como "calentar horno", cuya cocción
+// arranca inmediatamente después (margen acotado), ni "pasar masas", que va pegada a la cortada.
+function esFloatable(etapa: PlantillaEtapa, plantilla: PlantillaProceso): boolean {
+  if ((etapa.dependencias?.length ?? 0) > 0) return false
+  if ((etapa.prerequisitos?.length ?? 0) > 0) return false
+  let tieneConsumidor = false
+  for (const c of plantilla.etapas ?? []) {
+    const esDep = (c.dependencias ?? []).includes(etapa.id)
+    const esPre = (c.prerequisitos ?? []).includes(etapa.id)
+    if (esDep || esPre) tieneConsumidor = true
+    if (esDep && c.margen_espera_max != null) return false  // acoplamiento estricto → no se adelanta
+  }
+  return tieneConsumidor
+}
+
+// ============ Generador ============
+
+export function generarCronograma(ctx: ContextoScheduler, overrides: SchedulerOverrides = {}): ResultadoScheduler {
+  let cal = new CalendarioOcupacion(ctx.ocupacionMaquinasInicial, ctx.ocupacionEmpleadosInicial)
+
+  // Empleados con franjas extra inyectadas por overrides (resolución asistida)
+  const empleados: EmpleadoScheduler[] = ctx.empleados.map(e => {
+    const extra = overrides.franjasExtra?.[e.id] || []
+    return extra.length > 0
+      ? { ...e, franjas: [...e.franjas, ...extra].sort((a, b) => a.desde - b.desde) }
+      : e
+  })
+  const empById = new Map(empleados.map(e => [e.id, e]))
+
+  const plantById = new Map(ctx.plantillasConEtapas.map(p => [p.id, p]))
+
+  // 1) Construir "procesos" = (plantilla, lote) según plan_dia
+  interface Proceso {
+    plantilla: PlantillaProceso
+    lote: number
+    prioridad: number   // del item de plan
+    edf: number         // deadline efectivo (menor hora_fin_max entre etapas), SENTINEL si ninguna
+    topeInicioEf: number // tope de inicio efectivo (menor entre override/plantilla/etapas inicio), SENTINEL si ninguno
+    inicioMinEf: number  // piso de inicio efectivo (override ?? plantilla ?? 0)
+    inicioMinOverride: number | null
+    inicioMaxOverride: number | null
+    finMaxOverride: number | null
+  }
+  const SENTINEL = 100000 // valor finito grande para evitar Infinity-Infinity=NaN al ordenar
+  const procesos: Proceso[] = []
+  for (const item of ctx.planDia) {
+    if (overrides.excluirPlantillas?.includes(item.plantillaId)) continue
+    const plantilla = plantById.get(item.plantillaId)
+    if (!plantilla || !plantilla.etapas || plantilla.etapas.length === 0) continue
+    const prioridad = overrides.prioridadPlantilla?.[item.plantillaId] ?? item.prioridad
+    const inicioMinOverride = item.inicioMinOverride ?? null
+    const inicioMaxOverride = item.inicioMaxOverride ?? null
+    const finMaxOverride = item.finMaxOverride ?? null
+    const finMaxEfectivo = finMaxOverride ?? timeOrNull(plantilla.hora_fin_max)
+    const edf = Math.min(
+      SENTINEL,
+      ...plantilla.etapas.map(e => e.hora_fin_max ?? SENTINEL),
+      finMaxEfectivo ?? SENTINEL
+    )
+    // Tope de inicio efectivo: el menor entre el override, el de plantilla y los topes de etapa.
+    // Un proceso con tope temprano (ej. cocción 04:35) DEBE empezar antes → se coloca primero.
+    const topeInicioEf = Math.min(
+      SENTINEL,
+      inicioMaxOverride ?? timeOrNull(plantilla.hora_inicio_max) ?? SENTINEL,
+      ...plantilla.etapas.map(e => e.hora_inicio_max ?? SENTINEL)
+    )
+    // Piso de inicio efectivo: el "Desde…"; un proceso flexible (Desde tardío) se deja para después.
+    const inicioMinEf = inicioMinOverride ?? timeOrNull(plantilla.hora_inicio_min) ?? 0
+    for (let lote = 1; lote <= item.cantidadLotes; lote++) {
+      procesos.push({ plantilla, lote, prioridad, edf, topeInicioEf, inicioMinEf, inicioMinOverride, inicioMaxOverride, finMaxOverride })
     }
   }
-  return asignados
-}
 
-// ---- Selección de candidatos de empleado ----
-// Orden de prioridad: empleado_preferido → habilidad requerida → cualquiera.
-// Si puede_reemplazarse = false, SOLO se usa el empleado preferido.
-
-function buildCandidatos(etapa: PlantillaEtapa, empleados: EmpleadoScheduler[]): EmpleadoScheduler[] {
-  const prefId = etapa.empleado_preferido_id ?? null
-  const preferido = prefId ? (empleados.find(e => e.id === prefId) ?? null) : null
-
-  if (preferido) {
-    if (etapa.puede_reemplazarse === false) {
-      // No admite sustitución: solo este empleado
-      return [preferido]
-    }
-    // Preferido primero, luego los que tienen la habilidad requerida (si aplica), luego el resto
-    const otros = etapa.habilidad_id
-      ? empleados.filter(e => e.id !== preferido.id && e.habilidades.includes(etapa.habilidad_id!))
-      : empleados.filter(e => e.id !== preferido.id)
-    return [preferido, ...otros]
-  }
-
-  // Sin preferido: filtrar por habilidad o usar todos
-  return etapa.habilidad_id
-    ? empleados.filter(e => e.habilidades.includes(etapa.habilidad_id!))
-    : [...empleados]
-}
-
-function necesitaEmpleadoFn(etapa: PlantillaEtapa): boolean {
-  return !!(
-    (etapa.ventanas_empleado && etapa.ventanas_empleado.length > 0) ||
-    etapa.bloquea_empleado_total ||
-    etapa.tiempo_empleado_inicio > 0 ||
-    etapa.tiempo_empleado_fin > 0
+  // 2) Orden: prioridad desc; luego el MÁS RESTRINGIDO primero (tope de inicio temprano),
+  //    luego EDF asc, luego el que puede empezar antes (Desde temprano), estable por (nombre, lote).
+  procesos.sort((a, b) =>
+    b.prioridad - a.prioridad ||
+    a.topeInicioEf - b.topeInicioEf ||
+    a.edf - b.edf ||
+    a.inicioMinEf - b.inicioMinEf ||
+    a.plantilla.nombre.localeCompare(b.plantilla.nombre) ||
+    a.lote - b.lote
   )
-}
 
-// ---- Sustitución de máquinas por grupo ----
-// Intenta el recurso primario y, si no cabe, prueba en orden de prioridad los
-// miembros del mismo grupo. Devuelve { maq, nextFreeAt } donde nextFreeAt es
-// el mínimo instante libre de todos los miembros del grupo (para avanzar t).
+  const instancias: InstanciaEtapa[] = []
 
-function findMachineForSlot(
-  allMaquinas: MaquinaScheduler[],
-  primaryId: string,
-  rStart: number,
-  rEnd: number,
-  required: number
-): { maq: MaquinaScheduler; isSub: boolean } | null {
-  const primary = allMaquinas.find(m => m.id === primaryId)
-  if (primary && canFitMachine(primary, rStart, rEnd, required)) {
-    return { maq: primary, isSub: false }
+  // 3) Colocar cada proceso COMO UNIDAD: se busca un horario de inicio donde toda la cadena
+  //    entre; si entra, se commitea entero; si no, se reporta un conflicto raíz (no se rompe a la mitad).
+  for (const proc of procesos) {
+    const res = colocarProceso(
+      proc.plantilla, proc.lote, empleados, empById, ctx.maquinas, cal, overrides, ctx.diaInicio,
+      { inicioMin: proc.inicioMinOverride, inicioMax: proc.inicioMaxOverride, finMax: proc.finMaxOverride }
+    )
+    instancias.push(...res.instancias)
+    cal = res.cal
   }
 
-  // No cabe en la primaria → buscar sustituto en el mismo grupo (si existe)
-  const grupoId = primary?.grupo_id ?? null
-  if (!grupoId) return null  // Sin grupo = no hay sustitución
+  const conflictos = instancias.filter(i => i.estado === 'conflicto')
+  const cierreJornada = instancias.reduce<number | null>(
+    (max, i) => i.finAbs != null ? Math.max(max ?? 0, i.finAbs) : max, null
+  )
 
-  const groupMembers = allMaquinas
-    .filter(m => m.grupo_id === grupoId && m.id !== primaryId)
-    .sort((a, b) => a.prioridad_grupo - b.prioridad_grupo)
-
-  for (const sub of groupMembers) {
-    if (canFitMachine(sub, rStart, rEnd, required)) {
-      return { maq: sub, isSub: true }
-    }
-  }
-
-  return null  // Ningún miembro del grupo disponible
+  return { instancias, conflictos, cierreJornada }
 }
 
-// Devuelve el próximo instante en que algún miembro del grupo (incluyendo el primario)
-// pueda acomodar el recurso — usado para avanzar t cuando nadie del grupo cabe.
-function nextFreeInGroup(
-  allMaquinas: MaquinaScheduler[],
-  primaryId: string,
-  fromTime: number,
-  duration: number,
-  required: number
-): number {
-  const primary = allMaquinas.find(m => m.id === primaryId)
-  const grupoId = primary?.grupo_id ?? null
-  const members = grupoId
-    ? allMaquinas.filter(m => m.grupo_id === grupoId)
-    : primary ? [primary] : []
+interface OverrideDia { inicioMin: number | null; inicioMax: number | null; finMax: number | null }
 
-  if (members.length === 0) return fromTime + 1
+// Coloca un PROCESO completo (todas sus etapas) como unidad. Busca el menor "piso" de inicio
+// (desde diaInicio, probando los momentos en que se liberan recursos) donde la cadena entera entra,
+// y commitea ese intento al calendario. Si nunca entra completo, devuelve el mejor intento con un
+// conflicto raíz y las demás etapas marcadas como cascada (no se ubica nada del proceso).
+function colocarProceso(
+  plantilla: PlantillaProceso,
+  lote: number,
+  empleados: EmpleadoScheduler[],
+  empById: Map<string, EmpleadoScheduler>,
+  maquinas: Maquina[],
+  cal: CalendarioOcupacion,
+  overrides: SchedulerOverrides,
+  diaInicio: number,
+  overrideDia: OverrideDia
+): { instancias: InstanciaEtapa[]; cal: CalendarioOcupacion } {
+  const etapas = [...plantilla.etapas!].sort((a, b) => a.orden - b.orden)
 
-  return Math.min(...members.map(m => getNextFreeStartMachine(m, fromTime, duration, required)))
-}
+  // Etapas que pueden adelantarse: se ubican desde el inicio del día (no desde el piso del proceso),
+  // así caen en el primer hueco libre aunque el resto de la cadena arranque más tarde.
+  const floatableIds = new Set(etapas.filter(e => esFloatable(e, plantilla)).map(e => e.id))
 
-// ---- Helpers máquina con capacidad parcial ----
-
-function getMaxUsageInRange(slots: UsageSlot[], start: number, end: number): number {
-  const boundaries = new Set<number>([start])
-  for (const s of slots) {
-    if (s.start < end && s.end > start) {
-      if (s.start > start) boundaries.add(s.start)
-      if (s.end < end) boundaries.add(s.end)
-    }
-  }
-  let maxUsage = 0
-  for (const t of boundaries) {
-    let usage = 0
-    for (const s of slots) {
-      if (s.start <= t && s.end > t) usage += s.usage
-    }
-    maxUsage = Math.max(maxUsage, usage)
-  }
-  return maxUsage
-}
-
-function canFitMachine(maq: MaquinaScheduler, start: number, end: number, required: number): boolean {
-  return getMaxUsageInRange(maq.slots, start, end) + required <= maq.cantidad
-}
-
-function getNextFreeStartMachine(maq: MaquinaScheduler, fromTime: number, duration: number, required: number): number {
-  const candidates = [fromTime, ...maq.slots.filter(s => s.end > fromTime).map(s => s.end)]
-  candidates.sort((a, b) => a - b)
-  for (const t of candidates) {
-    if (t < fromTime) continue
-    if (canFitMachine(maq, t, t + duration, required)) return t
-  }
-  return fromTime + duration * 100
-}
-
-// ---- Empleado: próximo slot libre ----
-
-function getNextFreeStart(intervals: [number, number][], fromTime: number, duration: number): number {
-  let candidate = fromTime
-  let changed = true
-  while (changed) {
-    changed = false
-    for (const [s, e] of intervals) {
-      if (s < candidate + duration && e > candidate) {
-        candidate = e
-        changed = true
-      }
-    }
-  }
-  return candidate
-}
-
-// ---- Ordenamiento topológico ----
-
-// includePrereqs=true: también sigue prerequisitoKeys como aristas de orden (necesario para prework)
-function topologicalSort(etapas: EtapaExpandida[], includePrereqs = false): EtapaExpandida[] {
-  const byKey = new Map(etapas.map(e => [e.key, e]))
-  const visited = new Set<string>()
-  const result: EtapaExpandida[] = []
-
-  function visit(e: EtapaExpandida) {
-    if (visited.has(e.key)) return
-    visited.add(e.key)
-    for (const depKey of e.dependencyKeys) {
-      const dep = byKey.get(depKey)
-      if (dep) visit(dep)
-    }
-    if (includePrereqs) {
-      for (const preqKey of e.prerequisitoKeys) {
-        const dep = byKey.get(preqKey)
-        if (dep) visit(dep)
-      }
-    }
-    result.push(e)
-  }
-
-  const sorted = [...etapas].sort((a, b) => {
-    if (a.etapa.tipo !== b.etapa.tipo) {
-      const order: Record<string, number> = { critica: 0, descanso: 1, flexible: 2 }
-      return (order[a.etapa.tipo] ?? 1) - (order[b.etapa.tipo] ?? 1)
-    }
-    return b.etapa.prioridad - a.etapa.prioridad
+  const nuevaInst = (etapa: PlantillaEtapa): InstanciaEtapa => ({
+    key: `${plantilla.id}:${lote}:${etapa.orden}`,
+    plantillaId: plantilla.id,
+    plantillaNombre: plantilla.nombre,
+    lote,
+    etapa,
+    inicioAbs: null,
+    finAbs: null,
+    asignaciones: [],
+    recursosAbs: [],
+    estado: 'conflicto'
   })
 
-  for (const e of sorted) visit(e)
-  return result
+  // Prueba colocar toda la cadena con un piso dado, contra un clon del calendario.
+  const intentar = (piso: number) => {
+    const calAttempt = cal.clonar()
+    const colocadasPorId = new Map<string, InstanciaEtapa>()
+    const insts: InstanciaEtapa[] = []
+    let colocadas = 0
+    let ok = true
+    for (const etapa of etapas) {
+      const inst = nuevaInst(etapa)
+      // Las etapas preparables arrancan su búsqueda desde el inicio del día; el resto, desde el piso.
+      const floor = floatableIds.has(etapa.id) ? diaInicio : piso
+      const c = colocarEtapa(inst, plantilla, etapa, colocadasPorId, empleados, empById, maquinas, calAttempt, overrides, lote, floor, overrideDia)
+      insts.push(inst)
+      if (c) { colocadasPorId.set(etapa.id, inst); colocadas++ }
+      else ok = false
+    }
+    return { insts, cal: calAttempt, ok, colocadas }
+  }
+
+  // Offset (en min) de cada etapa respecto al arranque del proceso, siguiendo solo las dependencias
+  // encadenadas (cada una va inmediatamente después de la anterior). El offset de una etapa es el
+  // camino de duraciones más largo de dependencias que la preceden.
+  const etapaPorId = new Map(etapas.map(e => [e.id, e]))
+  const offsetCache = new Map<string, number>()
+  const offsetDe = (e: PlantillaEtapa): number => {
+    const cached = offsetCache.get(e.id)
+    if (cached != null) return cached
+    let off = 0
+    for (const depId of e.dependencias ?? []) {
+      const dep = etapaPorId.get(depId)
+      if (dep) off = Math.max(off, offsetDe(dep) + dep.duracion_proceso)
+    }
+    offsetCache.set(e.id, off)
+    return off
+  }
+
+  // Candidatos de piso: el arranque del día, los momentos en que se libera algún recurso, y —para
+  // cada liberación T— ese momento menos el offset de cada etapa. Esto último permite arrancar el
+  // proceso un poco antes para que la etapa interna que necesita ese recurso caiga JUSTO cuando se
+  // libera (si no, el proceso saltaría directo al instante de liberación y arrancaría más tarde de
+  // lo necesario, corriendo toda la cadena).
+  const liberaciones = cal.tiemposLiberacion().filter(t => t > diaInicio && t < DIA_FIN)
+  const candidatos = new Set<number>([diaInicio, ...liberaciones])
+  for (const t of liberaciones) {
+    for (const e of etapas) {
+      const p = t - offsetDe(e)
+      if (p > diaInicio && p < DIA_FIN) candidatos.add(p)
+    }
+  }
+  const pisos = [...candidatos].sort((a, b) => a - b)
+
+  let mejor: { insts: InstanciaEtapa[]; colocadas: number } | null = null
+  for (const piso of pisos) {
+    const r = intentar(piso)
+    if (r.ok) return { instancias: r.insts, cal: r.cal }   // entra completo → commit
+    if (!mejor || r.colocadas > mejor.colocadas) mejor = { insts: r.insts, colocadas: r.colocadas }
+  }
+
+  // No entró en ningún piso: el proceso NO se ubica. Marcar causa raíz + cascada, sin commitear.
+  const insts = mejor!.insts
+  const raiz = insts.find(i => i.estado === 'conflicto')
+  let nCascada = 0
+  for (const inst of insts) {
+    if (inst === raiz) continue
+    // todo lo demás del proceso queda sin ubicar (no se rompe a la mitad)
+    inst.estado = 'conflicto'
+    inst.cascada = true
+    inst.inicioAbs = null
+    inst.finAbs = null
+    inst.asignaciones = []
+    inst.recursosAbs = []
+    if (!inst.conflicto) inst.conflicto = { motivo: 'dependencia', mensaje: 'El proceso no se pudo ubicar completo.', culpables: [] }
+    nCascada++
+  }
+  if (raiz?.conflicto && nCascada > 0) {
+    raiz.conflicto.mensaje += ` Y ${nCascada} etapa(s) más de este proceso quedan sin ubicar.`
+  }
+  return { instancias: insts, cal }
 }
 
-// ---- Detección de cadenas ----
-// Una "cadena" es una secuencia lineal A→B→C donde cada paso tiene margen_espera_max=0.
-// Regla principal: solo se absorbe un sucesor S a la cadena si TODAS sus dependencias
-// externas (las que no forman parte de la cadena actual) aparecen ANTES de la cabeza
-// en el orden topológico — de lo contrario S todavía no puede planificarse correctamente
-// dentro de la cadena (su dep externa no fue procesada aún).
-// Si una tarea tiene MÚLTIPLES sucesores válidos con margen=0, se elige el primero.
+// Coloca una etapa; muta `inst` y reserva en el calendario. Devuelve true si colocó.
+function colocarEtapa(
+  inst: InstanciaEtapa,
+  plantilla: PlantillaProceso,
+  etapa: PlantillaEtapa,
+  colocadasPorId: Map<string, InstanciaEtapa>,
+  empleados: EmpleadoScheduler[],
+  empById: Map<string, EmpleadoScheduler>,
+  maquinas: Maquina[],
+  cal: CalendarioOcupacion,
+  overrides: SchedulerOverrides,
+  lote: number,
+  piso: number,
+  overrideDia: { inicioMin: number | null; inicioMax: number | null; finMax: number | null }
+): boolean {
+  const dur = etapa.duracion_proceso
 
-function detectChains(ordered: EtapaExpandida[]): {
-  chainGroups: Map<string, ChainGroup>
-  chainSuccessors: Set<string>
-} {
-  const chainSuccessors = new Set<string>()
-  const chainGroups = new Map<string, ChainGroup>()
+  // Restricciones (override de relajación si aplica)
+  const rel = overrides.relajarRestriccion?.[etapa.id] || overrides.relajarRestriccion?.[plantilla.id]
+  const etapaInicioMin = rel?.hora_inicio_min ?? etapa.hora_inicio_min ?? null
+  const etapaInicioMax = rel?.hora_inicio_max ?? etapa.hora_inicio_max ?? null
+  const etapaFinMax = rel?.hora_fin_max ?? etapa.hora_fin_max ?? null
+  // Override de horario del día (plan_dia) tiene prioridad sobre el de la plantilla.
+  // "Desde" (hora_inicio_min) es un PISO: la etapa se puede ubicar de ahí en adelante (se mantiene).
+  // "Tope de inicio" (hora_inicio_max) obliga a arrancar antes de X; la solución "empezar más tarde"
+  // relaja SOLO el tope, nunca el piso.
+  const sinTopeInicio = overrides.relajarTopeInicio?.includes(plantilla.id) ?? false
+  const sinInicioPlan = overrides.relajarInicioPlan?.includes(plantilla.id) ?? false
+  const plantInicioMin = sinInicioPlan ? null : (overrideDia.inicioMin ?? timeOrNull(plantilla.hora_inicio_min))
+  const plantInicioMax = sinTopeInicio ? null : (overrideDia.inicioMax ?? timeOrNull(plantilla.hora_inicio_max))
+  const plantFinMax = overrideDia.finMax ?? timeOrNull(plantilla.hora_fin_max)
 
-  // Índice de posición para consulta O(1)
-  const indexByKey = new Map<string, number>()
-  ordered.forEach((e, i) => indexByKey.set(e.key, i))
+  const nombreEtapaId = (id: string) => plantilla.etapas?.find(e => e.id === id)?.nombre ?? 'una etapa previa'
 
-  for (const head of ordered) {
-    if (chainSuccessors.has(head.key)) continue
+  // Dependencias (encadenadas) y prerequisitos (sueltos): deben estar colocadas y terminar antes.
+  // El piso `earliest` usa el máximo de AMBOS (todas deben terminar antes), pero el margen de
+  // espera (cap) se mide SOLO contra las dependencias encadenadas, no contra los prerequisitos.
+  let depFinMax = 0
+  let depFinNombre = ''
+  let depEncadenadasFinMax = 0
+  let depEncadenadasNombre = ''
+  const deps = etapa.dependencias || []
+  const requisitos = [...deps, ...(etapa.prerequisitos || [])]
+  for (const reqId of requisitos) {
+    const dep = colocadasPorId.get(reqId)
+    if (!dep || dep.finAbs == null) {
+      inst.conflicto = {
+        motivo: 'dependencia',
+        mensaje: `No se puede ubicar porque su etapa previa "${nombreEtapaId(reqId)}" quedó en conflicto. Resolvé esa etapa primero para que ésta pueda encadenarse.`,
+        culpables: []
+      }
+      return false
+    }
+    if (dep.finAbs > depFinMax) { depFinMax = dep.finAbs; depFinNombre = nombreEtapaId(reqId) }
+    if (deps.includes(reqId) && dep.finAbs > depEncadenadasFinMax) { depEncadenadasFinMax = dep.finAbs; depEncadenadasNombre = nombreEtapaId(reqId) }
+  }
 
-    const headIndex = indexByKey.get(head.key)!
-    const tasks: EtapaExpandida[] = [head]
-    const offsets: number[] = [0]
-    let offset = head.etapa.duracion_proceso
+  // El "tope de inicio" del proceso (plantilla/override) solo limita a la etapa que
+  // arranca el proceso (sin dependencias); las siguientes arrancan según sus dependencias.
+  const esInicioProceso = (etapa.dependencias?.length ?? 0) === 0
 
-    let current = head
-    while (true) {
-      const chainKeys = new Set(tasks.map(t => t.key))
+  // Ventana de inicio permitida, registrando el motivo de cada borde para explicar conflictos.
+  let earliest = piso
+  let earliestReason = `no puede arrancar antes de las ${minLabel(piso)}`
+  const subirEarliest = (v: number | null, reason: string) => { if (v != null && v > earliest) { earliest = v; earliestReason = reason } }
+  if (depFinMax > 0) subirEarliest(depFinMax, `debe esperar a que termine "${depFinNombre}" (${minLabel(depFinMax)})`)
+  subirEarliest(etapaInicioMin, `la etapa no puede empezar antes de las ${minLabel(etapaInicioMin ?? 0)}`)
+  subirEarliest(plantInicioMin, `el proceso no puede empezar antes de las ${minLabel(plantInicioMin ?? 0)}`)
 
-      const successor = ordered.find(other => {
-        if (chainSuccessors.has(other.key)) return false
-        if (other.etapa.margen_espera_max !== 0) return false
-        if (other.dependencyKeys.length < 1) return false
-        if (!other.dependencyKeys.includes(current.key)) return false
+  let latest = DIA_FIN - dur
+  let latestReason = 'el fin del día'
+  const bajarLatest = (v: number | null, reason: string) => { if (v != null && v < latest) { latest = v; latestReason = reason } }
+  if (etapaInicioMax != null) bajarLatest(etapaInicioMax, `la etapa debe empezar a más tardar a las ${minLabel(etapaInicioMax)}`)
+  if (esInicioProceso && plantInicioMax != null) bajarLatest(plantInicioMax, `el proceso debe empezar a más tardar a las ${minLabel(plantInicioMax)}`)
+  if (etapaFinMax != null) bajarLatest(etapaFinMax - dur, `la etapa debe terminar a más tardar a las ${minLabel(etapaFinMax)}`)
+  if (plantFinMax != null) bajarLatest(plantFinMax - dur, `el proceso debe terminar a más tardar a las ${minLabel(plantFinMax)}`)
+  if (etapa.margen_espera_max != null && depEncadenadasFinMax > 0) bajarLatest(depEncadenadasFinMax + etapa.margen_espera_max, `solo puede esperar ${etapa.margen_espera_max} min después de "${depEncadenadasNombre}"`)
 
-        // Solo absorber si todas las deps EXTERNAS a la cadena actual
-        // aparecen antes de la cabeza en el orden topológico.
-        // Si una dep externa viene después, el sucesor no puede planificarse
-        // correctamente dentro de esta cadena (la dep aún no fue resuelta).
-        const externalDeps = other.dependencyKeys.filter(dk => !chainKeys.has(dk))
-        return externalDeps.every(dk => {
-          const depIndex = indexByKey.get(dk)
-          return depIndex !== undefined && depIndex < headIndex
-        })
-      })
+  if (earliest > latest) {
+    inst.conflicto = {
+      motivo: 'ventana_horaria',
+      mensaje: `Dura ${formatDuration(dur)} y no hay lugar en su ventana: puede empezar recién a las ${minLabel(earliest)} porque ${earliestReason}, pero ${latestReason}, así que tendría que empezar a más tardar a las ${minLabel(latest)}.`,
+      culpables: []
+    }
+    return false
+  }
 
-      if (!successor) break
-      chainSuccessors.add(successor.key)
-      tasks.push(successor)
-      offsets.push(offset)
-      offset += successor.etapa.duracion_proceso
-      current = successor
+  // PIN: asignación fijada por resolución asistida
+  const pin = overrides.asignacionFijada?.find(p => p.plantillaId === plantilla.id && p.lote === lote && p.etapaOrden === etapa.orden)
+
+  // Solape de empleado: la etapa define si puede correr en paralelo / si es exclusiva (default de la plantilla).
+  const permiteSolape = etapa.permite_solape ?? plantilla.permite_solape ?? false
+  const exclusiva = etapa.atencion_exclusiva ?? plantilla.atencion_exclusiva ?? false
+
+  // Sustitución de máquina habilitada por resolución asistida (puede usar otra del grupo).
+  const permitirSustitucion = overrides.sustituirMaquina?.includes(etapa.id) ?? false
+
+  // Barrido temporal: ubicar en el horario MÁS TEMPRANO posible. En cada instante se prefiere
+  // al empleado preferido si está disponible; si no lo está y la etapa permite reemplazo, lo hace
+  // cualquier otro disponible (NO se espera al titular). Si puede_reemplazarse es false, solo el titular.
+  let hit: { t: number; intento: ResultadoIntento } | null = null
+  for (let t = earliest; t <= latest; t++) {
+    const intento = intentarColocar(t, etapa, empleados, empById, maquinas, cal, pin?.empleadoId, permiteSolape, exclusiva, permitirSustitucion)
+    if (intento.ok) { hit = { t, intento }; break }
+  }
+  if (hit) {
+    // Commit (la etiqueta permite nombrar al "culpable" si otra etapa choca con ésta)
+    const etiqueta = `${inst.plantillaNombre} · ${etapa.nombre} (lote ${lote})`
+    inst.inicioAbs = hit.t
+    inst.finAbs = hit.t + dur
+    inst.recursosAbs = hit.intento.recursosAbs!
+    inst.asignaciones = hit.intento.asignaciones!
+    inst.estado = 'colocada'
+    for (const r of inst.recursosAbs) cal.reservarMaquina(r.maquinaId, r.intervalo, r.uso, etiqueta, inst.plantillaId)
+    for (const a of inst.asignaciones) for (const iv of a.ventanasAbs) cal.reservarEmpleado(a.empleadoId, iv, etiqueta, inst.plantillaId, permiteSolape, exclusiva)
+    return true
+  }
+
+  // No se pudo ubicar: capturar el motivo del primer instante que falló.
+  let primerFallo: ResultadoIntento | null = null
+  for (let t = earliest; t <= latest; t++) {
+    const intento = intentarColocar(t, etapa, empleados, empById, maquinas, cal, pin?.empleadoId, permiteSolape, exclusiva, permitirSustitucion)
+    if (!intento.ok) { primerFallo = intento; break }
+  }
+
+  const ventanaTxt = `${minLabel(earliest)}–${minLabel(latest + dur)}`
+  const ventana: IntervaloAbs = { inicio: earliest, fin: latest + dur }
+  if (primerFallo?.motivo === 'maquina_ocupada') {
+    const culpables = primerFallo.culpables ?? []
+    const usan = culpables.length > 0 ? ` La está usando: ${culpables.join('; ')}.` : ''
+    // Plantillas culpables que ocupan las máquinas de esta etapa dentro de la ventana.
+    const culpablesPlantillaIds = [...new Set(
+      recursosDeEtapa(etapa).flatMap(r =>
+        maquinasCandidatas(r.maquina_id, maquinas, permitirSustitucion).flatMap(m => cal.plantillasMaquina(m.id, [ventana]))
+      )
+    )].filter(id => id !== plantilla.id)
+    inst.conflicto = {
+      motivo: 'maquina_ocupada',
+      mensaje: `La máquina "${primerFallo.detalle}" está ocupada durante toda la ventana posible de esta etapa (${ventanaTxt}), así que no hay momento libre para hacerla.${usan}`,
+      culpables,
+      culpablesPlantillaIds
+    }
+  } else if (primerFallo?.motivo === 'empleado_no_disponible') {
+    // Explicar qué ocupa a cada empleado preferido dentro de la ventana (nombrar al "culpable").
+    const slots = slotsDeEtapa(etapa)
+    const habilTxt = slots.some(s => s.habilidad_id) ? ' con la habilidad requerida' : ''
+    const detalles: string[] = []
+    const culpables = new Set<string>()
+    const culpablesPlantillaIds = new Set<string>()
+    for (const s of slots) {
+      if (!s.empleado_preferido_id) continue
+      const emp = empById.get(s.empleado_preferido_id)
+      if (!emp) continue
+      const nombre = emp.nombre_completo.split(' ')[0]
+      const ocupa = cal.competidoresEmpleado(emp.id, [ventana])
+      ocupa.forEach(c => culpables.add(c))
+      cal.plantillasEmpleado(emp.id, [ventana]).forEach(p => { if (p !== plantilla.id) culpablesPlantillaIds.add(p) })
+      detalles.push(ocupa.length > 0 ? `${nombre} está ocupado con ${ocupa.join(', ')}` : `${nombre} está fuera de su turno en ese horario`)
+    }
+    const detalleTxt = detalles.length > 0 ? ` ${detalles.join('; ')}.` : ''
+    // Para "traer empleado el tiempo justo": de los preferidos bloqueados, el que más tiempo
+    // ocupa el proceso culpable (p.ej. cuánto tarda la crema que hace Sebastián). Así se lo trae
+    // justo ese tiempo antes del tope, en vez de a las 03:00.
+    let preferidoBloqueadoId: string | undefined
+    let leadBloqueo = 0
+    for (const s of slots) {
+      if (!s.empleado_preferido_id) continue
+      const span = cal.spanOcupacionPlantillasEnEmpleado([...culpablesPlantillaIds], s.empleado_preferido_id)
+      if (span > leadBloqueo) { leadBloqueo = span; preferidoBloqueadoId = s.empleado_preferido_id }
+    }
+    inst.conflicto = {
+      motivo: 'empleado_no_disponible',
+      culpablesPlantillaIds: [...culpablesPlantillaIds],
+      mensaje: `No hay ningún empleado${habilTxt} libre en toda la ventana posible de esta etapa (${ventanaTxt}).${detalleTxt}`,
+      culpables: [...culpables],
+      desdeColocacion: earliest,
+      topeColocacion: latest,
+      leadBloqueo: leadBloqueo > 0 ? leadBloqueo : undefined,
+      preferidoBloqueadoId
+    }
+  } else {
+    inst.conflicto = {
+      motivo: 'ventana_horaria',
+      mensaje: `No se encontró ningún momento libre dentro de su ventana (${ventanaTxt}).`,
+      culpables: []
+    }
+  }
+  return false
+}
+
+interface ResultadoIntento {
+  ok: boolean
+  inicioAbs?: number
+  recursosAbs?: RecursoAbs[]
+  asignaciones?: AsignacionEtapa[]
+  motivo?: MotivoConflicto
+  detalle?: string       // máquina o descripción del empleado faltante
+  culpables?: string[]   // etiquetas de tareas que ocupan el recurso
+}
+
+// Intenta colocar la etapa en el instante t (sin mutar el calendario).
+function intentarColocar(
+  t: number,
+  etapa: PlantillaEtapa,
+  empleados: EmpleadoScheduler[],
+  empById: Map<string, EmpleadoScheduler>,
+  maquinas: Maquina[],
+  cal: CalendarioOcupacion,
+  pinEmpleadoId: string | undefined,
+  permiteSolape: boolean,
+  exclusiva: boolean,
+  permitirSustitucion = false
+): ResultadoIntento {
+  // 1) Máquinas. `usoLocal` descuenta lo ya comprometido por ESTA misma etapa, para no
+  // mandar dos recursos de la etapa a la misma máquina física (sobre todo con grupos).
+  const recursosAbs: RecursoAbs[] = []
+  const usoLocal = new Map<string, number>()
+  for (const r of recursosDeEtapa(etapa)) {
+    const iv: IntervaloAbs = { inicio: t + r.desde, fin: t + r.hasta }
+    const candidatas = maquinasCandidatas(r.maquina_id, maquinas, permitirSustitucion)
+    const elegida = candidatas.find(m => cal.maxUsoMaquina(m.id, iv) + (usoLocal.get(m.id) ?? 0) + r.uso_recurso <= m.cantidad + 1e-9)
+    if (!elegida) {
+      const maqNombre = maquinas.find(m => m.id === r.maquina_id)?.nombre ?? 'la máquina requerida'
+      const culpables = [...new Set(candidatas.flatMap(m => cal.competidoresMaquina(m.id, iv)))]
+      return { ok: false, motivo: 'maquina_ocupada', detalle: maqNombre, culpables }
+    }
+    usoLocal.set(elegida.id, (usoLocal.get(elegida.id) ?? 0) + r.uso_recurso)
+    recursosAbs.push({ maquinaId: elegida.id, maquinaNombre: elegida.nombre, uso: r.uso_recurso, intervalo: iv })
+  }
+
+  // 2) Empleados (slots), con reemplazo por habilidad
+  const asignaciones: AsignacionEtapa[] = []
+  const usadosEnEtapa = new Set<string>()
+  for (const slot of slotsDeEtapa(etapa)) {
+    if (slot.ventanas.length === 0) continue  // slot sin presencia de empleado
+    const ivs: IntervaloAbs[] = slot.ventanas.map(v => ({ inicio: t + v.desde, fin: t + v.hasta }))
+
+    const factible = (emp: EmpleadoScheduler): boolean => {
+      if (usadosEnEtapa.has(emp.id)) return false
+      if (slot.habilidad_id && !emp.habilidades.has(slot.habilidad_id)) return false
+      if (!ivs.every(iv => ventanaEnUnaFranja(emp, iv))) return false
+      return cal.empleadoLibre(emp.id, ivs, permiteSolape, exclusiva)
     }
 
-    chainGroups.set(head.key, {
-      headKey: head.key,
-      tasks,
-      offsets,
-      totalDuration: offset
+    let elegido: EmpleadoScheduler | undefined
+    const preferidoId = pinEmpleadoId || slot.empleado_preferido_id
+    if (preferidoId) {
+      const pref = empById.get(preferidoId)
+      if (pref && factible(pref)) {
+        elegido = pref
+      } else if (!pinEmpleadoId && (slot.puede_reemplazarse ?? true)) {
+        elegido = empleados.filter(factible).sort((a, b) => a.nombre_completo.localeCompare(b.nombre_completo))[0]
+      }
+    } else {
+      elegido = empleados.filter(factible).sort((a, b) => a.nombre_completo.localeCompare(b.nombre_completo))[0]
+    }
+
+    if (!elegido) {
+      const reqTxt = slot.habilidad_id ? 'con la habilidad requerida' : 'disponible en su turno'
+      const rolTxt = slot.rol === 'ayudante' ? 'ayudante ' : ''
+      const preferido = preferidoId ? empById.get(preferidoId) : undefined
+      const prefTxt = preferido ? ` (el preferido ${preferido.nombre_completo.split(' ')[0]} está ocupado o fuera de turno)` : ''
+      return { ok: false, motivo: 'empleado_no_disponible', detalle: `${rolTxt}${reqTxt}${prefTxt}` }
+    }
+    usadosEnEtapa.add(elegido.id)
+    asignaciones.push({
+      slotId: slot.id,
+      rol: slot.rol,
+      empleadoId: elegido.id,
+      empleadoNombre: elegido.nombre_completo,
+      ventanasAbs: ivs,
+      esReemplazo: !!preferidoId && elegido.id !== preferidoId,
+      enFranjaExtra: ivs.some(iv => franjaExtraDe(elegido!, iv))
     })
   }
 
-  return { chainGroups, chainSuccessors }
+  return { ok: true, inicioAbs: t, recursosAbs, asignaciones }
 }
 
-// ---- Buscar slot para una cadena completa ----
-// Verifica que todos los recursos de todas las tareas de la cadena estén disponibles
-// en sus ventanas relativas al inicio de la cadena.
-
-function findBestSlotForChain(
-  chain: ChainGroup,
-  earliest: number,
-  rangoFin: number,
-  empleados: EmpleadoScheduler[],
-  maquinas: MaquinaScheduler[],
-  maxInicio: number = Infinity,
-  diag?: { reason: ChainFailReason | null }
-): { placements: ChainPlacement[] } | null {
-  const { tasks, offsets, totalDuration } = chain
-
-  // Ajustar earliest y maxInicio según hora_inicio_min / hora_fin_max de cada tarea del bloque
-  let effectiveEarliest = earliest
-  let effectiveMax = maxInicio
-  for (let i = 0; i < tasks.length; i++) {
-    const { horaInicioMin, horaInicioMaxEtapa, horaInicioMaxProceso, horaFinMax, etapa } = tasks[i]
-    if (horaInicioMin != null) {
-      // taskStart = t + offsets[i] >= horaInicioMin  →  t >= horaInicioMin - offsets[i]
-      effectiveEarliest = Math.max(effectiveEarliest, horaInicioMin - offsets[i])
-    }
-    if (horaInicioMaxEtapa != null) {
-      // tope de la etapa: taskStart = t + offsets[i] <= max  →  t <= max - offsets[i]
-      effectiveMax = Math.min(effectiveMax, horaInicioMaxEtapa - offsets[i])
-    }
-    if (horaInicioMaxProceso != null) {
-      // tope del proceso: aplica al inicio del bloque  →  t <= max
-      effectiveMax = Math.min(effectiveMax, horaInicioMaxProceso)
-    }
-    if (horaFinMax != null) {
-      // taskEnd = t + offsets[i] + duracion <= horaFinMax  →  t <= horaFinMax - offsets[i] - duracion
-      effectiveMax = Math.min(effectiveMax, horaFinMax - offsets[i] - etapa.duracion_proceso)
-    }
-  }
-
-  let t = effectiveEarliest
-  let lastReason: ChainFailReason | null = null
-
-  while (t <= effectiveMax && t + totalDuration <= rangoFin) {
-
-    // Fase 1: verificar TODOS los recursos de TODAS las tareas de la cadena
-    let allMachinesOk = true
-    let tAdvance = t + 1
-    const allRecursos: RecursoProgramado[][] = tasks.map(() => [])
-
-    outer:
-    for (let i = 0; i < tasks.length; i++) {
-      const etapa = tasks[i].etapa
-      const taskStart = t + offsets[i]
-      const recursosEfectivos = getRecursosEfectivos(etapa)
-
-      for (const r of recursosEfectivos) {
-        const rStart = taskStart + r.desde
-        const rEnd = taskStart + r.hasta
-
-        const result = findMachineForSlot(maquinas, r.maquinaId, rStart, rEnd, r.usoRecurso)
-        if (!result) {
-          // No hay máquina disponible (ni en el grupo) → avanzar
-          const nextFree = nextFreeInGroup(maquinas, r.maquinaId, rStart, r.hasta - r.desde, r.usoRecurso)
-          tAdvance = Math.max(tAdvance, nextFree - offsets[i] - r.desde)
-          allMachinesOk = false
-          lastReason = {
-            tipo: 'maquina',
-            etapaNombre: etapa.nombre,
-            recursoNombre: maquinas.find(m => m.id === r.maquinaId)?.nombre,
-            maquinaIdBloqueada: r.maquinaId,
-            inicioIntentado: rStart,
-            finIntentado: rEnd,
-            deadlineStart: Number.isFinite(effectiveMax) ? effectiveMax : undefined
-          }
-          break outer
-        }
-
-        allRecursos[i].push({
-          maquinaId: result.maq.id,
-          maquinaNombre: result.maq.nombre,
-          inicio: rStart,
-          fin: rEnd
-        })
-      }
-    }
-
-    if (!allMachinesOk) {
-      t = tAdvance
-      continue
-    }
-
-    // Fase 2: asignar empleados para cada tarea de la cadena en orden
-    const placements: ChainPlacement[] = []
-    let allEmployeesOk = true
-    // Guardar longitudes para poder deshacer marcaciones si falla algún empleado
-    const savedLengths: [EmpleadoScheduler, number, number, number][] = []
-
-    for (let i = 0; i < tasks.length; i++) {
-      const { etapa } = tasks[i]
-      const inicio = t + offsets[i]
-      const fin = inicio + etapa.duracion_proceso
-
-      if (!necesitaEmpleadoFn(etapa)) {
-        placements.push({ inicio, fin, empleadoId: null, empleadoNombre: null, lineaId: null, recursosProgramados: allRecursos[i] })
-        continue
-      }
-
-      const candidatos = buildCandidatos(etapa, empleados)
-
-      let found = false
-      for (const emp of candidatos) {
-        if (empleadoDisponible(emp, inicio, fin, etapa)) {
-          savedLengths.push([emp, emp.busyIntervals.length, emp.parallelIntervals.length, emp.exclusiveIntervals.length])
-          marcarEmpleadoOcupado(emp, inicio, fin, etapa)
-          placements.push({
-            inicio, fin,
-            empleadoId: emp.id,
-            empleadoNombre: emp.nombre_completo,
-            lineaId: emp.lineas[0]?.id ?? null,
-            recursosProgramados: allRecursos[i]
-          })
-          found = true
-          break
-        }
-      }
-
-      if (!found) {
-        // Deshacer marcaciones de empleados tentativas
-        for (const [emp, bl, pl, el] of savedLengths) {
-          emp.busyIntervals.length = bl
-          emp.parallelIntervals.length = pl
-          emp.exclusiveIntervals.length = el
-        }
-        const startsCandidatos = candidatos
-          .map(e => e.horarioInicio)
-          .filter((x): x is number => x != null)
-        lastReason = {
-          tipo: 'empleado',
-          etapaNombre: etapa.nombre,
-          empMinStart: startsCandidatos.length ? Math.min(...startsCandidatos) : null,
-          inicioIntentado: inicio,
-          finIntentado: fin,
-          candidatoIds: candidatos.map(e => e.id),
-          deadlineStart: Number.isFinite(effectiveMax) ? effectiveMax : undefined
-        }
-        // Avanzar buscando cuándo libera el mejor empleado
-        let minNext = t + 1
-        for (const emp of candidatos) {
-          const ventanas = getVentanasEmpleado(etapa, t + offsets[i], t + offsets[i] + etapa.duracion_proceso)
-          for (const [vs, ve] of ventanas) {
-            const next = getNextFreeStart(emp.busyIntervals, vs, ve - vs)
-            minNext = Math.min(minNext, next - (vs - t - offsets[i]))
-          }
-        }
-        allEmployeesOk = false
-        t = Math.max(t + 1, minNext)
-        break
-      }
-    }
-
-    if (allEmployeesOk) {
-      return { placements }
-    }
-    // Si no: t ya fue avanzado en el bloque de employee-not-found
-  }
-
-  if (diag) {
-    diag.reason = lastReason ?? {
-      tipo: 'ventana',
-      deadlineStart: Number.isFinite(effectiveMax) ? effectiveMax : undefined,
-      earliest: effectiveEarliest
-    }
-  }
-  return null
+function minLabel(m: number): string {
+  const mm = ((Math.round(m) % 1440) + 1440) % 1440
+  return String(Math.floor(mm / 60)).padStart(2, '0') + ':' + String(mm % 60).padStart(2, '0')
 }
 
-// ---- Buscar slot para una tarea individual (no en cadena) ----
+// ============ Orquestación (carga datos, genera, materializa) ============
 
-function findBestSlot(
-  etapa: PlantillaEtapa,
-  earliest: number,
-  rangoFin: number,
-  empleados: EmpleadoScheduler[],
-  maquinas: MaquinaScheduler[],
-  maxInicio: number = Infinity
-): {
-  inicio: number; fin: number
-  empleadoId: string | null; empleadoNombre: string | null; lineaId: string | null
-  recursosProgramados: RecursoProgramado[]
-} | null {
-  const duracion = etapa.duracion_proceso
-  const recursosEfectivos = getRecursosEfectivos(etapa)
-  const candidatos = buildCandidatos(etapa, empleados)
-  const necesitaEmpleado = necesitaEmpleadoFn(etapa)
-
-  let t = earliest
-
-  while (t <= maxInicio && t + duracion <= rangoFin) {
-    const inicio = t
-    const fin = inicio + duracion
-
-    let allMachinesOk = true
-    const recursosProgramados: RecursoProgramado[] = []
-
-    for (const r of recursosEfectivos) {
-      const rStart = t + r.desde
-      const rEnd = t + r.hasta
-
-      const result = findMachineForSlot(maquinas, r.maquinaId, rStart, rEnd, r.usoRecurso)
-      if (!result) {
-        const nextFree = nextFreeInGroup(maquinas, r.maquinaId, rStart, r.hasta - r.desde, r.usoRecurso)
-        t = Math.max(t + 1, nextFree - r.desde)
-        allMachinesOk = false
-        break
-      }
-
-      recursosProgramados.push({ maquinaId: result.maq.id, maquinaNombre: result.maq.nombre, inicio: rStart, fin: rEnd })
-    }
-
-    if (!allMachinesOk) continue
-
-    if (!necesitaEmpleado) {
-      return { inicio, fin, empleadoId: null, empleadoNombre: null, lineaId: null, recursosProgramados }
-    }
-
-    if (candidatos.length === 0) return null
-
-    for (const emp of candidatos) {
-      if (empleadoDisponible(emp, inicio, fin, etapa)) {
-        const lineaId = emp.lineas[0]?.id ?? null
-        return { inicio, fin, empleadoId: emp.id, empleadoNombre: emp.nombre_completo, lineaId, recursosProgramados }
-      }
-    }
-
-    let minNext = t + 1
-    for (const emp of candidatos) {
-      // Saltar directamente a la hora de entrada si el t actual es demasiado temprano
-      if (emp.horarioInicio !== null && t < emp.horarioInicio) {
-        minNext = Math.min(minNext, emp.horarioInicio)
-      }
-      const ventanas = getVentanasEmpleado(etapa, t, t + duracion)
-      for (const [vs, ve] of ventanas) {
-        const next = getNextFreeStart(emp.busyIntervals, vs, ve - vs)
-        minNext = Math.min(minNext, next - (vs - t))
-      }
-    }
-    t = Math.max(t + 1, minNext)
-  }
-
-  return null
+export interface GeneracionPreparada {
+  ctx: ContextoScheduler       // contexto cargado, para re-simular soluciones en memoria
+  resultado: ResultadoScheduler
+  idsReemplazables: string[]   // tareas con plantilla_id no nulo y no bloqueadas (se reemplazan al aplicar)
 }
 
-// ---- Layout interno de un bloque (proceso) en aislamiento ----
-// Corre el scheduler greedy etapa-por-etapa con un estado de recursos fresco para
-// obtener el "inicio" relativo de cada etapa, respetando dependencias, cadenas
-// (margen=0) y conflictos internos de máquina/empleado. Muta empState y maqState.
+// Carga el contexto del día y corre el generador. NO toca la BD.
+export async function generarParaDia(dia: number, overrides: SchedulerOverrides = {}): Promise<GeneracionPreparada> {
+  const [planDiaItems, plantillas, maquinas, empleados, tareas, empsConLineas, rango] = await Promise.all([
+    planificacionService.listarPlanDia(dia),
+    planificacionService.listarPlantillasConEtapas(),
+    planificacionService.listarMaquinas(),
+    planificacionService.listarEmpleadosParaScheduler(dia),
+    cronogramaService.listarTareas(dia),
+    cronogramaService.listarEmpleadosConLineas(dia),
+    cronogramaService.obtenerRangoHorario(dia)
+  ])
 
-function scheduleStagesGreedy(
-  ordered: EtapaExpandida[],
-  empState: EmpleadoScheduler[],
-  maqState: MaquinaScheduler[],
-  rangoInicio: number,
-  rangoFin: number
-): { inicioPorKey: Map<string, number>; failed: Set<string> } {
-  const { chainGroups } = detectChains(ordered)
-  const completionTimes: Record<string, number> = {}
-  const inicioPorKey = new Map<string, number>()
-  const failed = new Set<string>()
-  const prePlaced = new Map<string, ChainPlacement | null>()
+  const diaInicio = rango ? timeToMin(rango.hora_inicio) : 240  // default 04:00
 
-  const marcarMaquinas = (etapa: PlantillaEtapa, recursosProgramados: RecursoProgramado[]) => {
-    for (const rp of recursosProgramados) {
-      const maq = maqState.find(m => m.id === rp.maquinaId)
-      const r = getRecursosEfectivos(etapa).find(r => r.maquinaId === rp.maquinaId)
-      if (maq && r) maq.slots.push({ start: rp.inicio, end: rp.fin, usage: r.usoRecurso })
-    }
+  const lineaToEmp = new Map<string, string>()
+  for (const e of empsConLineas) for (const l of e.lineas) lineaToEmp.set(l.id, e.id)
+
+  // Conservar: tareas manuales (sin plantilla), bloqueadas o provisorias (resolución manual de
+  // conflicto sin confirmar). Reemplazar: el resto de las generadas.
+  const conservadas = tareas.filter(t => t.plantilla_id === null || t.bloqueada || t.es_provisoria)
+  const reemplazables = tareas.filter(t => t.plantilla_id !== null && !t.bloqueada && !t.es_provisoria)
+
+  const ocupacionMaquinasInicial = conservadas.flatMap(t =>
+    (t.recursos_programados || []).map(r => ({
+      maquinaId: r.maquina_id,
+      intervalo: { inicio: timeToMin(r.hora_inicio), fin: timeToMin(r.hora_fin) },
+      uso: 1,
+      etiqueta: t.descripcion || 'tarea existente',
+      plantillaId: t.plantilla_id ?? undefined
+    }))
+  )
+  const ocupacionEmpleadosInicial = conservadas
+    .filter(t => t.linea_id && lineaToEmp.has(t.linea_id))
+    .map(t => ({
+      empleadoId: lineaToEmp.get(t.linea_id!)!,
+      intervalo: { inicio: timeToMin(t.hora_inicio), fin: timeToMin(t.hora_fin) },
+      etiqueta: t.descripcion || 'tarea existente',
+      plantillaId: t.plantilla_id ?? undefined,
+      permiteSolape: t.permite_solape ?? false,
+      exclusiva: false
+    }))
+
+  const ctx: ContextoScheduler = {
+    dia,
+    diaInicio,
+    plantillasConEtapas: plantillas,
+    planDia: planDiaItems.map(p => ({
+      plantillaId: p.plantilla_id,
+      cantidadLotes: p.cantidad_lotes,
+      prioridad: p.prioridad,
+      inicioMinOverride: timeOrNull(p.hora_inicio_min),
+      inicioMaxOverride: timeOrNull(p.hora_inicio_max),
+      finMaxOverride: timeOrNull(p.hora_fin_max)
+    })),
+    maquinas,
+    empleados,
+    ocupacionMaquinasInicial,
+    ocupacionEmpleadosInicial
   }
 
-  for (const expandida of ordered) {
-    const { key, etapa, dependencyKeys, horaInicioMin, horaInicioMaxEtapa, horaInicioMaxProceso, horaFinMax } = expandida
-
-    if (prePlaced.has(key)) {
-      if (!prePlaced.get(key)) failed.add(key)
-      continue
-    }
-
-    let earliest = rangoInicio
-    for (const depKey of dependencyKeys) {
-      if (completionTimes[depKey] !== undefined) earliest = Math.max(earliest, completionTimes[depKey])
-    }
-    // Respetar hora_inicio_min de la etapa/plan
-    if (horaInicioMin != null) earliest = Math.max(earliest, horaInicioMin)
-
-    const chain = chainGroups.get(key)
-    if (!chain) {
-      completionTimes[key] = earliest + etapa.duracion_proceso
-      continue
-    }
-
-    if (chain.tasks.length === 1) {
-      const margen = etapa.margen_espera_max
-      let maxInicio = Infinity
-      if (margen !== null && margen !== undefined && margen > 0 && dependencyKeys.length > 0) {
-        maxInicio = earliest + margen
-      }
-      // Respetar hora_fin_max y topes de comienzo. El tope de proceso solo aplica a etapas
-      // de arranque (sin dependencias); las etapas posteriores arrancan más tarde por diseño.
-      if (horaFinMax != null) maxInicio = Math.min(maxInicio, horaFinMax - etapa.duracion_proceso)
-      if (horaInicioMaxEtapa != null) maxInicio = Math.min(maxInicio, horaInicioMaxEtapa)
-      if (horaInicioMaxProceso != null && dependencyKeys.length === 0) maxInicio = Math.min(maxInicio, horaInicioMaxProceso)
-      const resultado = findBestSlot(etapa, earliest, rangoFin, empState, maqState, maxInicio)
-      if (!resultado) {
-        failed.add(key)
-        completionTimes[key] = rangoFin + 9999
-        continue
-      }
-      marcarMaquinas(etapa, resultado.recursosProgramados)
-      if (resultado.empleadoId) {
-        const emp = empState.find(e => e.id === resultado.empleadoId)!
-        marcarEmpleadoOcupado(emp, resultado.inicio, resultado.fin, etapa)
-      }
-      completionTimes[key] = resultado.fin
-      inicioPorKey.set(key, resultado.inicio)
-    } else {
-      const margenCabeza = etapa.margen_espera_max
-      let maxInicio = Infinity
-      if (margenCabeza !== null && margenCabeza !== undefined && margenCabeza > 0 && dependencyKeys.length > 0) {
-        maxInicio = earliest + margenCabeza
-      }
-      const resultado = findBestSlotForChain(chain, earliest, rangoFin, empState, maqState, maxInicio)
-      if (!resultado) {
-        for (let i = 0; i < chain.tasks.length; i++) {
-          failed.add(chain.tasks[i].key)
-          if (i > 0) {
-            prePlaced.set(chain.tasks[i].key, null)
-            completionTimes[chain.tasks[i].key] = rangoFin + 9999
-          }
-        }
-        completionTimes[key] = rangoFin + 9999
-      } else {
-        for (let i = 0; i < chain.tasks.length; i++) {
-          const task = chain.tasks[i]
-          const placement = resultado.placements[i]
-          marcarMaquinas(task.etapa, placement.recursosProgramados)
-          completionTimes[task.key] = placement.fin
-          inicioPorKey.set(task.key, placement.inicio)
-          if (i > 0) prePlaced.set(task.key, placement)
-        }
-      }
-    }
-  }
-
-  return { inicioPorKey, failed }
+  const resultado = generarCronograma(ctx, overrides)
+  return { ctx, resultado, idsReemplazables: reemplazables.map(t => t.id) }
 }
 
-// ---- Clasificación prework ----
-// Identifica etapas que son "prerequisito suelto": aparecen como prerequisito
-// de alguna etapa principal pero NO como dependencia-cadena de nadie.
-// Se incluyen también sus propias dependencias cadena (transitivamente).
+// Aplica el resultado: backup, borra reemplazables, crea las tareas colocadas, aplica solape.
+export async function aplicarResultado(dia: number, resultado: ResultadoScheduler, idsReemplazables: string[]): Promise<void> {
+  await cronogramaService.guardarVersion(
+    dia,
+    `Backup pre-generación ${new Date().toLocaleString('es-AR')}`,
+    'Backup automático antes de generar el cronograma',
+    ''
+  )
+  for (const id of idsReemplazables) await cronogramaService.eliminarTarea(id)
 
-function findPreworkSet(etapas: EtapaExpandida[]): Set<string> {
-  const allChainTargets = new Set(etapas.flatMap(e => e.dependencyKeys))
-  const allPrereqTargets = new Set(etapas.flatMap(e => e.prerequisitoKeys))
-  const byKey = new Map(etapas.map(e => [e.key, e]))
-
-  const prework = new Set<string>()
-  const queue: string[] = []
-
-  // Semilla: etapas que son prerequisito de alguien pero no son dep-cadena de nadie
-  for (const e of etapas) {
-    if (allPrereqTargets.has(e.key) && !allChainTargets.has(e.key)) {
-      prework.add(e.key)
-      queue.push(e.key)
-    }
+  for (const inst of resultado.instancias) {
+    if (inst.estado === 'colocada') await materializarInstancia(inst, dia)
   }
 
-  // Expansión transitiva: las dep-cadena de las etapas prework también son prework
-  while (queue.length > 0) {
-    const key = queue.pop()!
-    const e = byKey.get(key)
-    if (!e) continue
-    for (const depKey of e.dependencyKeys) {
-      if (!prework.has(depKey)) {
-        prework.add(depKey)
-        queue.push(depKey)
-      }
-    }
-  }
-
-  return prework
+  // Penalización por solapamiento sobre el resultado final
+  const [tareas, empleados, config] = await Promise.all([
+    cronogramaService.listarTareas(dia),
+    cronogramaService.listarEmpleadosConLineas(dia),
+    configuracionService.obtenerConfiguracionSolape()
+  ])
+  const cambios = calcularCambiosSolape(tareas, empleados, config)
+  await Promise.all(cambios.map(c =>
+    cronogramaService.actualizarTarea(c.id, { hora_fin: c.hora_fin, duracion_base_min: c.duracion_base_min })
+  ))
 }
 
-// ---- Función principal ----
-// Estrategia "bloque por bloque": cada plantilla+lote es un proceso indivisible.
-// 1) Se calcula su layout interno en aislamiento (offsets relativos entre etapas).
-// 2) Se ubica el proceso COMPLETO como un bloque (vía findBestSlotForChain) en el
-//    primer horario donde ninguna de sus etapas pise una máquina o empleado ya
-//    ocupado por otro proceso. El timing interno del proceso se preserva intacto.
-
-// Identifica qué bloques ya planificados ("culpables") están ocupando el recurso
-// que le faltó al bloque que falló, escaneando las etapas ya ubicadas (scheduled).
-function identificarCulpables(reason: ChainFailReason | null, scheduled: EtapaScheduled[]): string[] {
-  if (!reason || reason.inicioIntentado == null || reason.finIntentado == null) return []
-  const s = reason.inicioIntentado
-  const e = reason.finIntentado
-  const pisa = (a: EtapaScheduled) => a.inicio >= 0 && a.inicio < e && a.fin > s
-
-  let ocupantes: EtapaScheduled[] = []
-  if (reason.tipo === 'empleado' && reason.candidatoIds?.length) {
-    const ids = new Set(reason.candidatoIds)
-    ocupantes = scheduled.filter(a => a.empleadoId != null && ids.has(a.empleadoId) && pisa(a))
-  } else if (reason.tipo === 'maquina' && reason.maquinaIdBloqueada) {
-    ocupantes = scheduled.filter(a => pisa(a) && a.recursosProgramados.some(r => r.maquinaId === reason.maquinaIdBloqueada))
-  }
-
-  const vistos = new Set<string>()
-  const out: string[] = []
-  for (const o of ocupantes) {
-    const proc = `"${o.plantillaNombre}"${o.lote > 1 ? ` (lote ${o.lote})` : ''}`
-    const detalle = reason.tipo === 'empleado' && o.empleadoNombre
-      ? `${proc} (usa a ${o.empleadoNombre} de ${minToTimeStr(o.inicio)} a ${minToTimeStr(o.fin)})`
-      : proc
-    if (!vistos.has(detalle)) { vistos.add(detalle); out.push(detalle) }
-  }
-  return out
-}
-
-// Construye un mensaje de conflicto legible a partir del motivo de fallo del bloque.
-function mensajeConflictoBloque(reason: ChainFailReason | null, plantillaNombre: string, lote: number, culpables: string[] = []): string {
-  const proc = `"${plantillaNombre}"${lote > 1 ? ` (lote ${lote})` : ''}`
-  const tope = reason?.deadlineStart != null ? ` El proceso debe arrancar antes de las ${minToTimeStr(reason.deadlineStart)}.` : ''
-  const ocupado = culpables.length ? ` Ese horario está ocupado por: ${culpables.join(', ')}.` : ''
-  if (!reason) {
-    return `El proceso ${proc} no encontró un horario libre sin pisar otros procesos.`
-  }
-  switch (reason.tipo) {
-    case 'empleado': {
-      const etapa = reason.etapaNombre ? `la etapa "${reason.etapaNombre}"` : 'una de sus etapas'
-      const entrada = reason.empMinStart != null
-        ? ` El primer empleado habilitado entra a las ${minToTimeStr(reason.empMinStart)}.`
-        : ''
-      return `No hay ningún empleado disponible para ${etapa} dentro de la ventana del proceso ${proc}.${ocupado}${entrada}${tope}`
-    }
-    case 'maquina': {
-      const etapa = reason.etapaNombre ? `la etapa "${reason.etapaNombre}"` : 'una de sus etapas'
-      const maq = reason.recursoNombre ? ` "${reason.recursoNombre}" (y sus reemplazos)` : ''
-      return `La máquina${maq} está ocupada y no se libera a tiempo para ${etapa} del proceso ${proc}.${ocupado}${tope}`
-    }
-    case 'ventana':
-    default: {
-      if (reason.deadlineStart != null && reason.earliest != null && reason.earliest > reason.deadlineStart) {
-        return `El proceso ${proc} no entra en su ventana horaria: debe arrancar antes de las ${minToTimeStr(reason.deadlineStart)} pero sus dependencias/recursos no están listos hasta las ${minToTimeStr(reason.earliest)}.`
-      }
-      return `El proceso ${proc} no encontró un horario libre sin pisar otros procesos.${tope}`
-    }
-  }
-}
-
-export function generarCronograma(
-  planDia: PlanDia[],
-  empleados: { id: string; nombre_completo: string; habilidades: string[]; lineas: { id: string; nombre: string }[]; horario?: { hora_inicio: string; hora_fin: string } | null }[],
-  maquinas: Maquina[],
-  rangoInicio: number,
-  rangoFin: number
-): ResultadoScheduler {
-
-  console.log('[Scheduler] ▶ generarCronograma (modo bloque) iniciado')
-  console.log('[Scheduler] Máquinas:', maquinas.map(m => `${m.nombre}(cant=${m.cantidad})`))
-
-  const empleadosState: EmpleadoScheduler[] = empleados.map(e => ({
-    ...e,
-    busyIntervals: [],
-    parallelIntervals: [],
-    exclusiveIntervals: [],
-    horarioInicio: timeStrToMin(e.horario?.hora_inicio),
-    horarioFin: timeStrToMin(e.horario?.hora_fin),
-    trabajaHoy: e.horario != null   // sin turno configurado ese día → no disponible
-  }))
-  const maquinasState: MaquinaScheduler[] = maquinas.map(m => ({
-    id: m.id, nombre: m.nombre, cantidad: m.cantidad,
-    grupo_id: m.grupo_id ?? null, prioridad_grupo: m.prioridad_grupo ?? 1,
-    slots: []
+async function materializarInstancia(inst: InstanciaEtapa, dia: number): Promise<void> {
+  const dur = inst.finAbs! - inst.inicioAbs!
+  const recursos_programados: RecursoProgramadoCronograma[] = inst.recursosAbs.map(r => ({
+    maquina_id: r.maquinaId,
+    maquina_nombre: r.maquinaNombre,
+    hora_inicio: minToTime(r.intervalo.inicio),
+    hora_fin: minToTime(r.intervalo.fin)
   }))
 
-  // ---- Construir bloques (un bloque = plantilla + lote) ----
-  interface Bloque {
-    plantillaId: string
-    plantillaNombre: string
-    lote: number
-    prioridad: number
-    orden: number
-    lotesEncadenados: 'no' | 'secuencial' | 'pipeline'
-    etapas: EtapaExpandida[]
+  const principal = inst.asignaciones.find(a => a.rol === 'principal') ?? inst.asignaciones[0]
+  let lineaId: string | null = null
+  if (principal) {
+    lineaId = inst.etapa.permite_solape
+      ? await cronogramaService.asegurarLineaParalela(principal.empleadoId, dia)
+      : await cronogramaService.asegurarLineaExiste(principal.empleadoId, dia)
   }
-  const bloques: Bloque[] = []
-  let ordenPlan = 0
-  for (const plan of planDia) {
-    if (!plan.activo || !plan.plantilla?.etapas?.length) continue
-    const plantillaNombre = plan.plantilla.nombre
-    const etapasOrdenadas = [...plan.plantilla.etapas].sort((a, b) => a.orden - b.orden)
-    for (let lote = 1; lote <= plan.cantidad_lotes; lote++) {
-      const etapas: EtapaExpandida[] = etapasOrdenadas.map(etapa => {
-        const key = `${plan.plantilla_id}-l${lote}-o${etapa.orden}`
-        const dependencyKeys = (etapa.dependencias ?? []).map(depOrden =>
-          `${plan.plantilla_id}-l${lote}-o${depOrden}`
-        )
-        const prerequisitoKeys = (etapa.prerequisitos ?? []).map(preqOrden =>
-          `${plan.plantilla_id}-l${lote}-o${preqOrden}`
-        )
-        // Prioridad: plan-día > plantilla > etapa
-        const templateInicioMin = timeStrToMin(plan.plantilla?.hora_inicio_min)
-        const templateInicioMax = timeStrToMin(plan.plantilla?.hora_inicio_max)
-        const templateFinMax = timeStrToMin(plan.plantilla?.hora_fin_max)
-        const horaInicioMin = plan.hora_inicio_min ?? templateInicioMin ?? etapa.hora_inicio_min ?? null
-        // Tope de comienzo: el de la plantilla aplica al INICIO DEL PROCESO; el de la etapa aplica a esa etapa.
-        const horaInicioMaxProceso = templateInicioMax ?? null
-        const horaInicioMaxEtapa = etapa.hora_inicio_max ?? null
-        const horaFinMax = plan.hora_fin_max ?? templateFinMax ?? etapa.hora_fin_max ?? null
-        // Solape y atención exclusiva: la etapa hereda el default de la plantilla
-        const permiteSolape = etapa.permite_solape || (plan.plantilla?.permite_solape ?? false)
-        const atencionExclusiva = etapa.atencion_exclusiva || (plan.plantilla?.atencion_exclusiva ?? false)
-        const etapaEff = (permiteSolape !== (etapa.permite_solape ?? false) || atencionExclusiva !== (etapa.atencion_exclusiva ?? false))
-          ? { ...etapa, permite_solape: permiteSolape, atencion_exclusiva: atencionExclusiva }
-          : etapa
-        return { key, plantillaId: plan.plantilla_id, plantillaNombre, lote, etapa: etapaEff, dependencyKeys, prerequisitoKeys, horaInicioMin, horaInicioMaxEtapa, horaInicioMaxProceso, horaFinMax }
-      })
-      bloques.push({
-        plantillaId: plan.plantilla_id,
-        plantillaNombre,
-        lote,
-        prioridad: plan.prioridad ?? 0,
-        orden: ordenPlan,
-        lotesEncadenados: (plan.lotes_encadenados as 'no' | 'secuencial' | 'pipeline') ?? 'no',
-        etapas
-      })
+
+  await cronogramaService.crearTarea({
+    linea_id: lineaId,
+    dia_semana: dia,
+    hora_inicio: minToTime(inst.inicioAbs!),
+    hora_fin: minToTime(inst.finAbs!),
+    descripcion: `${inst.etapa.nombre} · ${inst.plantillaNombre}`,
+    color: inst.etapa.color ?? null,
+    plantilla_id: inst.plantillaId,
+    etapa_orden: inst.etapa.orden,
+    lote: inst.lote,
+    // cronograma_tareas.dependencias/prerequisitos son integer[] y ya no las lee nadie
+    // (se quitó el Modo Inteligente); la cadena vive en la plantilla por etapa.id.
+    dependencias: [],
+    prerequisitos: [],
+    permite_solape: inst.etapa.permite_solape ?? false,
+    duracion_base_min: dur,
+    recursos_programados,
+    tamano: 5,
+    fila: 0
+  })
+
+  // Ayudantes: un bloque por cada asignación adicional, en la línea del ayudante.
+  for (const a of inst.asignaciones) {
+    if (a === principal) continue
+    const li = inst.etapa.permite_solape
+      ? await cronogramaService.asegurarLineaParalela(a.empleadoId, dia)
+      : await cronogramaService.asegurarLineaExiste(a.empleadoId, dia)
+    const ini = Math.min(...a.ventanasAbs.map(v => v.inicio))
+    const fin = Math.max(...a.ventanasAbs.map(v => v.fin))
+    await cronogramaService.crearTarea({
+      linea_id: li,
+      dia_semana: dia,
+      hora_inicio: minToTime(ini),
+      hora_fin: minToTime(fin),
+      descripcion: `${inst.etapa.nombre} · ${inst.plantillaNombre} · ayuda`,
+      color: inst.etapa.color ?? null,
+      plantilla_id: inst.plantillaId,
+      etapa_orden: inst.etapa.orden,
+      lote: inst.lote,
+      permite_solape: inst.etapa.permite_solape ?? false,
+      duracion_base_min: fin - ini,
+      tamano: 5,
+      fila: 0
+    })
+  }
+}
+
+// ============ Fase 4: resolución asistida ============
+
+const DIA_EXTRA_INICIO = 180   // 03:00 — tope inferior para franjas extra
+
+// Fusiona dos overrides (delta sobre base) de forma inmutable.
+export function fusionarOverrides(base: SchedulerOverrides, delta: SchedulerOverrides): SchedulerOverrides {
+  const franjasExtra = { ...(base.franjasExtra || {}) }
+  for (const [emp, fr] of Object.entries(delta.franjasExtra || {})) {
+    franjasExtra[emp] = [...(franjasExtra[emp] || []), ...fr]
+  }
+  return {
+    franjasExtra,
+    prioridadPlantilla: { ...(base.prioridadPlantilla || {}), ...(delta.prioridadPlantilla || {}) },
+    relajarRestriccion: { ...(base.relajarRestriccion || {}), ...(delta.relajarRestriccion || {}) },
+    relajarTopeInicio: [...(base.relajarTopeInicio || []), ...(delta.relajarTopeInicio || [])],
+    relajarInicioPlan: [...(base.relajarInicioPlan || []), ...(delta.relajarInicioPlan || [])],
+    excluirPlantillas: [...(base.excluirPlantillas || []), ...(delta.excluirPlantillas || [])],
+    asignacionFijada: [...(base.asignacionFijada || []), ...(delta.asignacionFijada || [])]
+  }
+}
+
+// Métricas de una jornada simulada: cierre, conflictos y carga (incl. horas fuera de turno).
+export function calcularMetricasJornada(resultado: ResultadoScheduler, empleados: EmpleadoScheduler[]): MetricasJornada {
+  const carga = new Map<string, { minutos: number; fuera: number }>()
+  for (const inst of resultado.instancias) {
+    if (inst.estado !== 'colocada') continue
+    for (const a of inst.asignaciones) {
+      const dur = a.ventanasAbs.reduce((s, v) => s + (v.fin - v.inicio), 0)
+      const acc = carga.get(a.empleadoId) || { minutos: 0, fuera: 0 }
+      acc.minutos += dur
+      if (a.enFranjaExtra) acc.fuera += dur
+      carga.set(a.empleadoId, acc)
     }
-    ordenPlan++
+  }
+  const cargaPorEmpleado = empleados
+    .map(e => ({
+      empleadoId: e.id,
+      nombre: e.nombre_completo,
+      minutos: carga.get(e.id)?.minutos ?? 0,
+      minutosFueraTurno: carga.get(e.id)?.fuera ?? 0
+    }))
+    .filter(c => c.minutos > 0)
+  return {
+    cierreJornada: resultado.cierreJornada,
+    conflictos: resultado.conflictos.filter(c => !c.cascada).length,
+    cargaPorEmpleado
+  }
+}
+
+// Genera soluciones candidatas para un conflicto, cada una YA simulada sobre el contexto.
+// baseOverrides = overrides ya aplicados (para que la cascada acumule).
+export function generarSolucionesConflicto(
+  conflicto: InstanciaEtapa,
+  ctx: ContextoScheduler,
+  baseOverrides: SchedulerOverrides
+): SolucionConflicto[] {
+  const soluciones: SolucionConflicto[] = []
+  const etapa = conflicto.etapa
+
+  const simular = (delta: SchedulerOverrides, tipo: SolucionConflicto['tipo'], grupo: SolucionConflicto['grupo'], descripcion: string) => {
+    const ov = fusionarOverrides(baseOverrides, delta)
+    const resultado = generarCronograma(ctx, ov)
+    soluciones.push({
+      id: `${tipo}:${descripcion}`,
+      tipo,
+      grupo,
+      descripcion,
+      overrideDelta: delta,
+      resultado,
+      metricas: calcularMetricasJornada(resultado, ctx.empleados)
+    })
   }
 
-  if (bloques.length === 0) return { etapas: [], conflictos: [], duracionTotal: 0 }
+  // 1) Actuar sobre las plantillas CULPABLES (las que ocupan el recurso): bajar prioridad / sacar del plan.
+  const nombrePlantilla = (id: string) => ctx.plantillasConEtapas.find(p => p.id === id)?.nombre ?? 'proceso'
+  const culpablesIds = (conflicto.conflicto?.culpablesPlantillaIds ?? []).filter(id => id !== conflicto.plantillaId)
+  for (const culpableId of [...new Set(culpablesIds)]) {
+    const nombre = nombrePlantilla(culpableId)
+    simular({ prioridadPlantilla: { [culpableId]: 1 } }, 'bajar_prioridad', 'culpable', `Bajar prioridad de "${nombre}"`)
+    simular({ excluirPlantillas: [culpableId] }, 'excluir', 'culpable', `Sacar "${nombre}" del plan`)
+  }
 
-  // Deadline efectivo de un bloque: el instante más temprano en que ALGUNA de sus
-  // restricciones obliga a arrancar (hora_inicio_max de proceso/etapa, o hora_fin_max
-  // menos la duración). Infinity = sin restricción horaria.
-  const blockDeadline = (b: Bloque): number => {
-    let d = Infinity
-    for (const e of b.etapas) {
-      if (e.horaInicioMaxProceso != null) d = Math.min(d, e.horaInicioMaxProceso)
-      if (e.horaInicioMaxEtapa != null) d = Math.min(d, e.horaInicioMaxEtapa)
-      if (e.horaFinMax != null) d = Math.min(d, e.horaFinMax - e.etapa.duracion_proceso)
+  // 1b) Sustituir máquina (el fix más barato): si choca por máquina ocupada y esa máquina pertenece
+  //     a un grupo con otra máquina activa, ofrecer usar la equivalente.
+  if (conflicto.conflicto?.motivo === 'maquina_ocupada') {
+    const hayEquivalente = [...new Set(recursosDeEtapa(etapa).map(r => r.maquina_id))].some(id => {
+      const m = ctx.maquinas.find(x => x.id === id)
+      return !!m?.grupo_id && ctx.maquinas.some(o => o.id !== m.id && o.activa && o.grupo_id === m.grupo_id)
+    })
+    if (hayEquivalente) {
+      simular({ sustituirMaquina: [etapa.id] }, 'sustituir_maquina', 'maquina', 'Usar otra máquina equivalente del grupo')
     }
-    return d
   }
-  const deadlineByBloque = new Map<Bloque, number>(bloques.map(b => [b, blockDeadline(b)]))
 
-  // Mayor prioridad primero; a igual prioridad, el de deadline más ajustado (EDF) para
-  // que los procesos con ventana horaria reserven los recursos escasos antes que los
-  // que pueden ubicarse en cualquier momento; luego orden del plan y lote.
-  bloques.sort((a, b) =>
-    (b.prioridad - a.prioridad) ||
-    (deadlineByBloque.get(a)! - deadlineByBloque.get(b)!) ||
-    (a.orden - b.orden) ||
-    (a.lote - b.lote)
+  // 2) Extender el turno de un empleado (para conflictos de empleado): franja extra + PIN.
+  if (conflicto.conflicto?.motivo === 'empleado_no_disponible') {
+    const slots = slotsDeEtapa(etapa)
+    const habilidadReq = slots.find(s => s.ventanas.length > 0)?.habilidad_id ?? null
+    const preferidoEtapaId = slots.find(s => s.empleado_preferido_id)?.empleado_preferido_id ?? null
+    const candidatos = ctx.empleados.filter(e => !habilidadReq || e.habilidades.has(habilidadReq))
+    const desde0 = conflicto.conflicto.desdeColocacion  // primer minuto posible de la tarea
+    const tope = conflicto.conflicto.topeColocacion      // último minuto posible de inicio
+    const leadPreferido = conflicto.conflicto.leadBloqueo ?? 0
+    const preferidoBloqueadoId = conflicto.conflicto.preferidoBloqueadoId
+    const dur = etapa.duracion_proceso
+    const justo = desde0 != null && tope != null
+
+    // Minutos de [ini,fin] dentro del turno NORMAL del empleado (no cuentan como hora extra).
+    const minEnTurno = (emp: EmpleadoScheduler, ini: number, fin: number) =>
+      emp.franjas.filter(f => f.origen === 'turno')
+        .reduce((s, f) => s + Math.max(0, Math.min(fin, f.hasta) - Math.max(ini, f.desde)), 0)
+    // Fin del turno normal más cercano antes de que arranque la tarea (para medir el hueco muerto).
+    const finTurnoPrevio = (emp: EmpleadoScheduler, t0: number): number | null => {
+      const fines = emp.franjas.filter(f => f.origen === 'turno' && f.hasta <= t0).map(f => f.hasta)
+      return fines.length ? Math.max(...fines) : null
+    }
+
+    const opciones: { sol: SolucionConflicto; empId: string; costoExtra: number; hueco: number }[] = []
+    for (const emp of candidatos) {
+      const lead = emp.id === preferidoBloqueadoId ? leadPreferido : 0
+      const desde = justo ? Math.max(DIA_EXTRA_INICIO, desde0! - lead) : DIA_EXTRA_INICIO
+      // La franja cubre SOLO lo que necesita la tarea (desde0 → desde0+dur): nunca hasta medianoche.
+      const fin = justo ? Math.min(DIA_FIN, desde0! + dur) : DIA_FIN
+      const franja: FranjaDisponibilidad = { desde, hasta: fin, origen: 'extra', etiqueta: 'Turno extendido' }
+
+      const ini = justo ? desde0! : desde
+      const costoExtra = Math.max(0, dur - minEnTurno(emp, ini, fin))
+      const diaLibre = emp.franjas.every(f => f.origen !== 'turno')
+      const fp = finTurnoPrevio(emp, ini)
+      const hueco = fp != null ? Math.max(0, ini - fp) : 0
+
+      const nombre = emp.nombre_completo.split(' ')[0]
+      const descripcion = diaLibre
+        ? `Hacer venir a ${nombre} en su día libre hasta las ${minLabel(fin)}`
+        : lead > 0
+          ? `Extender turno de ${nombre} (entra ${minLabel(desde)} por la otra tarea, cubre hasta ${minLabel(fin)})`
+          : `Extender turno de ${nombre} hasta las ${minLabel(fin)}`
+
+      simular(
+        { franjasExtra: { [emp.id]: [franja] }, asignacionFijada: [{ plantillaId: conflicto.plantillaId, lote: conflicto.lote, etapaOrden: etapa.orden, empleadoId: emp.id }] },
+        'traer_empleado',
+        'traer',
+        descripcion
+      )
+      const sol = soluciones[soluciones.length - 1]
+      sol.costoExtraMin = costoExtra
+      sol.huecoMuertoMin = hueco
+      opciones.push({ sol, empId: emp.id, costoExtra, hueco })
+    }
+
+    // Recomendado: el de menos hueco muerto, luego menos hora extra; desempate por preferido.
+    if (opciones.length > 0) {
+      const ranqueado = [...opciones].sort((a, b) =>
+        a.hueco - b.hueco ||
+        a.costoExtra - b.costoExtra ||
+        Number(b.empId === preferidoEtapaId) - Number(a.empId === preferidoEtapaId)
+      )
+      ranqueado[0].sol.recomendada = true
+    }
+  }
+
+  // 3) Relajar restricciones horarias de la etapa (separadas para que se vea QUÉ se toca).
+  if (etapa.hora_inicio_max != null) {
+    simular(
+      { relajarRestriccion: { [etapa.id]: { hora_inicio_max: null } } },
+      'relajar',
+      'relajar',
+      'Permitir que la etapa empiece más tarde (sacar su tope de inicio)'
+    )
+  }
+  if (etapa.hora_fin_max != null) {
+    simular(
+      { relajarRestriccion: { [etapa.id]: { hora_fin_max: null } } },
+      'relajar',
+      'relajar',
+      'Permitir que la etapa termine más tarde (mueve la entrega)'
+    )
+    // Mover la entrega es más caro comercialmente que solo arrancar más tarde.
+    soluciones[soluciones.length - 1].costoNegocio = 3
+  }
+
+  // 4) Actuar sobre la propia etapa/proceso en conflicto.
+  // 4a) Si el proceso tiene tope de inicio (lo obliga a arrancar temprano), permitir que empiece
+  //     más tarde → así puede correrse a después de la culpable cuando se liberen los recursos.
+  const plantillaConflicto = ctx.plantillasConEtapas.find(p => p.id === conflicto.plantillaId)
+  // Si el plan del día (o la plantilla) obliga a "no empezar antes de X", ofrecer quitar esa
+  // restricción para poder ubicar la etapa más temprano, dentro del turno normal de los empleados.
+  const planItem = ctx.planDia.find(p => p.plantillaId === conflicto.plantillaId)
+  const tieneInicioPlan = (planItem?.inicioMinOverride ?? null) != null || !!plantillaConflicto?.hora_inicio_min
+  if (tieneInicioPlan) {
+    simular(
+      { relajarInicioPlan: [conflicto.plantillaId] },
+      'relajar',
+      'relajar',
+      `Quitar la restricción "no empezar antes" de "${conflicto.plantillaNombre}"`
+    )
+  }
+  if (plantillaConflicto?.hora_inicio_max) {
+    simular(
+      { relajarTopeInicio: [conflicto.plantillaId] },
+      'relajar',
+      'proceso',
+      `Permitir que "${conflicto.plantillaNombre}" empiece más tarde (sacar el tope de inicio)`
+    )
+  }
+  // 4b) Postergar/sacar el propio proceso.
+  simular(
+    { prioridadPlantilla: { [conflicto.plantillaId]: 1 } },
+    'bajar_prioridad',
+    'proceso',
+    `Bajar prioridad de "${conflicto.plantillaNombre}"`
+  )
+  simular(
+    { excluirPlantillas: [conflicto.plantillaId] },
+    'excluir',
+    'proceso',
+    `Sacar "${conflicto.plantillaNombre}" del plan`
   )
 
-  const scheduled: EtapaScheduled[] = []
-  const conflictos: EtapaScheduled[] = []
+  // Costo de negocio por tipo (menor = más barato/preferible). La hora extra (2) va SIEMPRE por
+  // encima de postergar (4) o sacar un producto (5): producir es prioridad.
+  const RANGO_TIPO: Record<SolucionConflicto['tipo'], number> = {
+    sustituir_maquina: 0, relajar: 1, traer_empleado: 2, bajar_prioridad: 4, excluir: 5
+  }
+  const costoNegocioDe = (s: SolucionConflicto) => s.costoNegocio ?? RANGO_TIPO[s.tipo]
 
-  // Encadenado de lotes: por cada plan (orden), guardamos el ancla del lote anterior.
-  //  - secuencial: el lote N+1 no arranca hasta que el lote N termina del todo (loteEnd)
-  //  - pipeline: el lote N+1 arranca cuando el lote N libera su primera etapa (firstFin)
-  const chainAnchor = new Map<number, { loteEnd: number; firstFin: number }>()
-
-  const marcarMaquinasGlobal = (etapa: PlantillaEtapa, recursosProgramados: RecursoProgramado[]) => {
-    for (const rp of recursosProgramados) {
-      const maq = maquinasState.find(m => m.id === rp.maquinaId)
-      const r = getRecursosEfectivos(etapa).find(r => r.maquinaId === rp.maquinaId)
-      if (maq && r) maq.slots.push({ start: rp.inicio, end: rp.fin, usage: r.usoRecurso })
-    }
+  // Marcar las opciones que dejan un producto fuera (pérdida comercial), para mostrarlo y rankearlo.
+  for (const s of soluciones) {
+    if (s.tipo === 'excluir' || s.tipo === 'bajar_prioridad') s.dejaProductoFuera = true
   }
 
-  const pushConflictoBloque = (bloque: Bloque, mensaje: (task: EtapaExpandida) => string) => {
-    for (const task of bloque.etapas) {
-      conflictos.push({
-        key: task.key, plantillaId: task.plantillaId, plantillaNombre: task.plantillaNombre,
-        lote: task.lote, etapa: task.etapa,
-        inicio: -1, fin: -1,
-        empleadoId: null, empleadoNombre: null, empleadosAsignados: [], lineaId: null,
-        maquinaId: null, maquinaNombre: null,
-        recursosProgramados: [],
-        conflicto: true,
-        mensajeConflicto: mensaje(task)
-      })
-    }
-  }
+  // Ranqueo de negocio: 1) menos conflictos; 2) más barato (sustituir<relajar<extra<entrega<postergar<sacar);
+  //                     3) menos hora extra; 4) cierre más temprano.
+  const fuera = (s: SolucionConflicto) => s.metricas.cargaPorEmpleado.reduce((acc, c) => acc + c.minutosFueraTurno, 0)
+  soluciones.sort((a, b) =>
+    a.metricas.conflictos - b.metricas.conflictos ||
+    costoNegocioDe(a) - costoNegocioDe(b) ||
+    (a.costoExtraMin ?? fuera(a)) - (b.costoExtraMin ?? fuera(b)) ||
+    (a.metricas.cierreJornada ?? 0) - (b.metricas.cierreJornada ?? 0)
+  )
 
-  for (const bloque of bloques) {
-    // 0) Separar etapas en prework (deps sueltas) y cadena principal
-    const preworkSet = findPreworkSet(bloque.etapas)
-    const preworkEtapas = bloque.etapas.filter(e => preworkSet.has(e.key))
-    const mainEtapas = bloque.etapas.filter(e => !preworkSet.has(e.key))
+  // Dedup por firma. Para máquina/extender/relajar cada descripción es una acción distinta (se
+  // conserva); para culpable/proceso se colapsan las que dan exactamente el mismo resultado.
+  const vistos = new Set<string>()
+  const filtradas = soluciones.filter(s => {
+    const firma = (s.grupo === 'culpable' || s.grupo === 'proceso')
+      ? `${s.grupo}|${s.metricas.conflictos}|${s.metricas.cierreJornada}|${fuera(s)}`
+      : `${s.grupo}|${s.descripcion}`
+    if (vistos.has(firma)) return false
+    vistos.add(firma)
+    return true
+  })
 
-    // Encadenado: piso de inicio según el lote anterior del mismo plan
-    let chainMin = rangoInicio
-    if (bloque.lotesEncadenados !== 'no' && bloque.lote > 1) {
-      const prev = chainAnchor.get(bloque.orden)
-      if (prev) chainMin = bloque.lotesEncadenados === 'secuencial' ? prev.loteEnd : prev.firstFin
-    }
-    // Tareas de ESTE lote (prework + main) para calcular el ancla del siguiente lote
-    const loteTasks: { inicio: number; fin: number }[] = []
+  // Recomendación: si el preferido de la etapa no quedó marcado (no era candidato), recomendar
+  // la primera opción de "extender turno" en el ranqueo (la de menor impacto).
+  const extender = filtradas.filter(s => s.grupo === 'traer')
+  if (extender.length > 0 && !extender.some(s => s.recomendada)) extender[0].recomendada = true
 
-    // 0b) Planificar prework greedy contra el estado GLOBAL (lo antes posible en el día)
-    const preworkFinish = new Map<string, number>()
-    if (preworkEtapas.length > 0) {
-      // Ordenar prework respetando tanto dependencyKeys como prerequisitoKeys (dentro del conjunto prework)
-      const orderedPrework = topologicalSort(preworkEtapas, true)
-      const completionTimesPrework: Record<string, number> = {}
-
-      for (const expandida of orderedPrework) {
-        const { key, etapa, dependencyKeys, prerequisitoKeys, horaInicioMin, horaInicioMaxEtapa, horaInicioMaxProceso, horaFinMax } = expandida
-        let earliest = Math.max(rangoInicio, chainMin)
-        for (const depKey of dependencyKeys) {
-          if (completionTimesPrework[depKey] !== undefined)
-            earliest = Math.max(earliest, completionTimesPrework[depKey])
-        }
-        // Respetar también prerequisitoKeys dentro del prework (e.g. "Preparar ingredientes" antes de "Amasar")
-        for (const preqKey of prerequisitoKeys) {
-          if (completionTimesPrework[preqKey] !== undefined)
-            earliest = Math.max(earliest, completionTimesPrework[preqKey])
-        }
-        if (horaInicioMin != null) earliest = Math.max(earliest, horaInicioMin)
-        let maxInicio = horaFinMax != null ? horaFinMax - etapa.duracion_proceso : Infinity
-        if (horaInicioMaxEtapa != null) maxInicio = Math.min(maxInicio, horaInicioMaxEtapa)
-        if (horaInicioMaxProceso != null && dependencyKeys.length === 0) maxInicio = Math.min(maxInicio, horaInicioMaxProceso)
-
-        const res = findBestSlot(etapa, earliest, rangoFin, empleadosState, maquinasState, maxInicio)
-        if (res) {
-          marcarMaquinasGlobal(etapa, res.recursosProgramados)
-          if (res.empleadoId) {
-            const emp = empleadosState.find(e => e.id === res.empleadoId)!
-            marcarEmpleadoOcupado(emp, res.inicio, res.fin, etapa)
-          }
-          completionTimesPrework[key] = res.fin
-          preworkFinish.set(key, res.fin)
-          loteTasks.push({ inicio: res.inicio, fin: res.fin })
-          const primerRecurso = res.recursosProgramados[0] ?? null
-          scheduled.push({
-            key, plantillaId: bloque.plantillaId, plantillaNombre: bloque.plantillaNombre,
-            lote: bloque.lote, etapa,
-            inicio: res.inicio, fin: res.fin,
-            empleadoId: res.empleadoId, empleadoNombre: res.empleadoNombre,
-            empleadosAsignados: construirAsignados(etapa, res.inicio, res.fin, res.empleadoId, res.empleadoNombre, empleadosState),
-            lineaId: res.lineaId,
-            maquinaId: primerRecurso?.maquinaId ?? null,
-            maquinaNombre: primerRecurso?.maquinaNombre ?? null,
-            recursosProgramados: res.recursosProgramados,
-            conflicto: false
-          })
-        } else {
-          completionTimesPrework[key] = rangoFin + 9999
-          preworkFinish.set(key, rangoFin + 9999)
-          conflictos.push({
-            key, plantillaId: bloque.plantillaId, plantillaNombre: bloque.plantillaNombre,
-            lote: bloque.lote, etapa,
-            inicio: -1, fin: -1,
-            empleadoId: null, empleadoNombre: null, empleadosAsignados: [], lineaId: null,
-            maquinaId: null, maquinaNombre: null, recursosProgramados: [],
-            conflicto: true,
-            mensajeConflicto: `Prework "${etapa.nombre}" no encontró horario libre`
-          })
-        }
-      }
-    }
-
-    // Si no hay etapas principales, el bloque era solo prework → listo
-    if (mainEtapas.length === 0) continue
-
-    // 0c) Calcular blockEarliest: máximo de los fines de prework que bloquean a etapas principales
-    // Se consideran tanto prerequisitoKeys como dependencyKeys de main etapas que apunten a prework
-    let blockEarliest = Math.max(rangoInicio, chainMin)
-    for (const etapa of mainEtapas) {
-      for (const prereqKey of etapa.prerequisitoKeys) {
-        const finish = preworkFinish.get(prereqKey)
-        if (finish !== undefined && finish < rangoFin + 9999) {
-          blockEarliest = Math.max(blockEarliest, finish)
-        }
-      }
-      // Si una etapa principal depende directamente de una prework (ej. "Sacar Salado" depende de "Amasar" que es prework)
-      for (const depKey of etapa.dependencyKeys) {
-        const finish = preworkFinish.get(depKey)
-        if (finish !== undefined && finish < rangoFin + 9999) {
-          blockEarliest = Math.max(blockEarliest, finish)
-        }
-      }
-    }
-
-    // 1) Layout interno de la cadena principal en aislamiento (estado fresco, desde blockEarliest)
-    const isoEmp: EmpleadoScheduler[] = empleadosState.map(e => ({ ...e, busyIntervals: [], parallelIntervals: [], exclusiveIntervals: [] }))
-    const isoMaq: MaquinaScheduler[] = maquinas.map(m => ({
-      id: m.id, nombre: m.nombre, cantidad: m.cantidad,
-      grupo_id: m.grupo_id ?? null, prioridad_grupo: m.prioridad_grupo ?? 1,
-      slots: []
-    }))
-    const orderedIso = topologicalSort(mainEtapas)
-    const { inicioPorKey, failed } = scheduleStagesGreedy(orderedIso, isoEmp, isoMaq, blockEarliest, rangoFin)
-
-    if (failed.size > 0 || inicioPorKey.size === 0) {
-      console.warn(`[Scheduler] Bloque "${bloque.plantillaNombre}" (lote ${bloque.lote}) no entra ni en aislamiento`)
-      const mainFailed = mainEtapas.map(e => e)
-      for (const task of mainFailed) {
-        conflictos.push({
-          key: task.key, plantillaId: task.plantillaId, plantillaNombre: task.plantillaNombre,
-          lote: task.lote, etapa: task.etapa,
-          inicio: -1, fin: -1,
-          empleadoId: null, empleadoNombre: null, empleadosAsignados: [], lineaId: null,
-          maquinaId: null, maquinaNombre: null, recursosProgramados: [],
-          conflicto: true,
-          mensajeConflicto: `"${task.etapa.nombre}" no entra en el rango horario`
-        })
-      }
-      continue
-    }
-
-    // 2) Construir el bloque-cadena con offsets relativos al inicio del bloque
-    const blockMin = Math.min(...inicioPorKey.values())
-    const tasksOrdenadas = [...mainEtapas]
-      .filter(t => inicioPorKey.has(t.key))
-      .sort((a, b) => inicioPorKey.get(a.key)! - inicioPorKey.get(b.key)!)
-    const offsets = tasksOrdenadas.map(t => inicioPorKey.get(t.key)! - blockMin)
-    const totalDuration = Math.max(...tasksOrdenadas.map((t, i) => offsets[i] + t.etapa.duracion_proceso))
-    const blockChain: ChainGroup = {
-      headKey: tasksOrdenadas[0].key,
-      tasks: tasksOrdenadas,
-      offsets,
-      totalDuration
-    }
-
-    // 3) Ubicar el bloque principal contra el estado global (desde blockEarliest)
-    const diag: { reason: ChainFailReason | null } = { reason: null }
-    const resultado = findBestSlotForChain(blockChain, blockEarliest, rangoFin, empleadosState, maquinasState, Infinity, diag)
-
-    if (!resultado) {
-      console.warn(`[Scheduler] Bloque "${bloque.plantillaNombre}" (lote ${bloque.lote}) no encontró horario libre`, diag.reason)
-      const culpables = identificarCulpables(diag.reason, scheduled)
-      const mensaje = mensajeConflictoBloque(diag.reason, bloque.plantillaNombre, bloque.lote, culpables)
-      pushConflictoBloque({ ...bloque, etapas: mainEtapas }, () => mensaje)
-      continue
-    }
-
-    const inicioBloque = Math.min(...resultado.placements.map(p => p.inicio))
-    console.log(`[Scheduler] ✔ "${bloque.plantillaNombre}" (lote ${bloque.lote}) ubicado en ${minToTimeStr(inicioBloque)}`)
-
-    // 4) Commit: marcar máquinas global (empleados ya marcados en findBestSlotForChain)
-    for (let i = 0; i < tasksOrdenadas.length; i++) {
-      const task = tasksOrdenadas[i]
-      const placement = resultado.placements[i]
-      marcarMaquinasGlobal(task.etapa, placement.recursosProgramados)
-      loteTasks.push({ inicio: placement.inicio, fin: placement.fin })
-      const primerRecurso = placement.recursosProgramados[0] ?? null
-      scheduled.push({
-        key: task.key, plantillaId: task.plantillaId, plantillaNombre: task.plantillaNombre,
-        lote: task.lote, etapa: task.etapa,
-        inicio: placement.inicio, fin: placement.fin,
-        empleadoId: placement.empleadoId, empleadoNombre: placement.empleadoNombre,
-        empleadosAsignados: construirAsignados(task.etapa, placement.inicio, placement.fin, placement.empleadoId, placement.empleadoNombre, empleadosState),
-        lineaId: placement.lineaId,
-        maquinaId: primerRecurso?.maquinaId ?? null,
-        maquinaNombre: primerRecurso?.maquinaNombre ?? null,
-        recursosProgramados: placement.recursosProgramados,
-        conflicto: false
-      })
-    }
-
-    // Guardar el ancla de encadenado para el siguiente lote de este plan
-    if (loteTasks.length > 0) {
-      const loteEnd = Math.max(...loteTasks.map(t => t.fin))
-      const firstFin = loteTasks.reduce((a, b) => (b.inicio < a.inicio ? b : a)).fin
-      chainAnchor.set(bloque.orden, { loteEnd, firstFin })
-    }
-  }
-
-  const allStarts = scheduled.map(s => s.inicio).filter(t => t >= 0)
-  const allFins = scheduled.map(s => s.fin).filter(t => t >= 0)
-  const duracionTotal = allStarts.length > 0 ? Math.max(...allFins) - Math.min(...allStarts) : 0
-
-  return { etapas: scheduled, conflictos, duracionTotal }
-}
-
-export function minToTimeStr(min: number): string {
-  const h = Math.floor(min / 60)
-  const m = min % 60
-  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`
-}
-
-export function convertirLegacyAVentanas(etapa: Pick<PlantillaEtapa, 'bloquea_empleado_total' | 'tiempo_empleado_inicio' | 'tiempo_empleado_fin' | 'duracion_proceso'>): VentanaEmpleado[] {
-  if (etapa.bloquea_empleado_total) return [{ desde: 0, hasta: etapa.duracion_proceso }]
-  const w: VentanaEmpleado[] = []
-  if (etapa.tiempo_empleado_inicio > 0) w.push({ desde: 0, hasta: etapa.tiempo_empleado_inicio })
-  if (etapa.tiempo_empleado_fin > 0) w.push({ desde: etapa.duracion_proceso - etapa.tiempo_empleado_fin, hasta: etapa.duracion_proceso })
-  return w
+  return filtradas
 }

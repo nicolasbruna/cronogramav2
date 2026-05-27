@@ -1,11 +1,13 @@
 import { useState, useRef, useCallback, useEffect, useLayoutEffect, useMemo, KeyboardEvent as ReactKeyboardEvent } from 'react'
 import { Lock, Unlock, Plus, Trash2, ChevronUp, ChevronDown, Link, Unlink, Package, Users, Tag } from 'lucide-react'
 import { CronogramaTarea, EmpleadoConLineas, TamanoTexto, RecursoProgramadoCronograma } from '../../types/cronograma'
+import { PlantillaProceso } from '../../types/planificacion'
 import { timeToMin, minToTime, formatDuration, isLightColor } from './cronogramaHelpers'
 
 interface CronogramaTimelineProps {
   empleados: EmpleadoConLineas[]
   tareas: CronogramaTarea[]
+  plantillas?: PlantillaProceso[]
   rangoInicio: string
   rangoFin: string
   zoom: number
@@ -31,10 +33,6 @@ interface CronogramaTimelineProps {
   onDesagrupar?: (tareaIds: string[]) => void
   onBloquear?: (tareaIds: string[]) => void
   vistaAgrupacion?: 'secciones' | 'todos'
-  modoInteligente?: boolean
-  onMoverConConflicto?: (tareaId: string, nuevaHoraInicio: string, nuevaHoraFin: string, nuevaLineaId: string, tareasConflicto: CronogramaTarea[], motivos: string[]) => void
-  maquinasCapacidad?: Map<string, number>
-  horariosEmpleados?: Map<string, { inicio: number; fin: number }>
 }
 
 const SLOT_PAD = 6
@@ -44,6 +42,7 @@ const MAGNET_PX = 8
 export function CronogramaTimeline({
   empleados,
   tareas,
+  plantillas = [],
   rangoInicio,
   rangoFin,
   zoom,
@@ -68,11 +67,7 @@ export function CronogramaTimeline({
   onAgrupar,
   onDesagrupar,
   onBloquear,
-  vistaAgrupacion = 'secciones',
-  modoInteligente = false,
-  onMoverConConflicto,
-  maquinasCapacidad,
-  horariosEmpleados
+  vistaAgrupacion = 'secciones'
 }: CronogramaTimelineProps) {
   const wrapRef = useRef<HTMLDivElement>(null)
   const sidebarRef = useRef<HTMLDivElement>(null)
@@ -94,111 +89,6 @@ export function CronogramaTimeline({
   const [scrollLeft, setScrollLeft] = useState(0)
   const scrollRafRef = useRef<number | null>(null)
   const [colorMode, setColorMode] = useState<'empleado' | 'proceso'>('empleado')
-  const modoInteligenteRef = useRef(modoInteligente)
-  modoInteligenteRef.current = modoInteligente
-  const onMoverConConflictoRef = useRef(onMoverConConflicto)
-  onMoverConConflictoRef.current = onMoverConConflicto
-  // Refs con datos frescos para la validación de factibilidad dentro de los handlers de drag
-  const tareasRef = useRef(tareas)
-  tareasRef.current = tareas
-  const empleadosRef = useRef(empleados)
-  empleadosRef.current = empleados
-  const maquinasCapRef = useRef(maquinasCapacidad)
-  maquinasCapRef.current = maquinasCapacidad
-  const horariosEmpRef = useRef(horariosEmpleados)
-  horariosEmpRef.current = horariosEmpleados
-
-  // Evalúa si mover una tarea a [newStart,newEnd] en newLineaId es factible.
-  // Devuelve los IDs de tareas en conflicto (solapamiento de línea o competencia por máquina)
-  // y motivos legibles (máquina sin capacidad, fuera del horario del empleado).
-  const evaluarMovimiento = useCallback((
-    tareaId: string, newStart: number, newEnd: number, newLineaId: string
-  ): { conflictIds: string[]; motivos: string[] } => {
-    const tareasAll = tareasRef.current
-    const empleadosAll = empleadosRef.current
-    const capMap = maquinasCapRef.current
-    const horMap = horariosEmpRef.current
-    const conflictSet = new Set<string>()
-    const motivos: string[] = []
-    const fmt = (m: number) => `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`
-
-    const movida = tareasAll.find(t => t.id === tareaId)
-    if (!movida) return { conflictIds: [], motivos: [] }
-
-    // 1) Solapamiento del MISMO EMPLEADO (en cualquiera de sus líneas, no solo la destino),
-    //    salvo que alguna de las dos permita solape / paralelo.
-    const empDestino = empleadosAll.find(e => e.lineas.some(l => l.id === newLineaId))
-    const lineasEmpleado = empDestino ? new Set(empDestino.lineas.map(l => l.id)) : new Set([newLineaId])
-    for (const t of tareasAll) {
-      if (t.id === tareaId || !t.linea_id || !lineasEmpleado.has(t.linea_id)) continue
-      if (movida.permite_solape || t.permite_solape) continue
-      if (timeToMin(t.hora_inicio) < newEnd && timeToMin(t.hora_fin) > newStart) {
-        conflictSet.add(t.id)
-      }
-    }
-
-    // 2) Capacidad de máquinas (los recursos se desplazan junto con la tarea)
-    const delta = newStart - timeToMin(movida.hora_inicio)
-    for (const r of (movida.recursos_programados || [])) {
-      const rs = timeToMin(r.hora_inicio) + delta
-      const re = timeToMin(r.hora_fin) + delta
-      const cap = capMap?.get(r.maquina_id) ?? 1
-      const competidores: string[] = []
-      for (const t of tareasAll) {
-        if (t.id === tareaId) continue
-        for (const r2 of (t.recursos_programados || [])) {
-          if (r2.maquina_id !== r.maquina_id) continue
-          if (timeToMin(r2.hora_inicio) < re && timeToMin(r2.hora_fin) > rs) {
-            competidores.push(t.id)
-            break
-          }
-        }
-      }
-      if (competidores.length + 1 > cap) {
-        motivos.push(`${r.maquina_nombre}: ${competidores.length + 1} en uso a la vez (capacidad ${cap})`)
-        competidores.forEach(id => conflictSet.add(id))
-      }
-    }
-
-    // 3) Horario del empleado de la línea destino
-    const emp = empleadosAll.find(e => e.lineas.some(l => l.id === newLineaId))
-    if (emp && horMap?.has(emp.id)) {
-      const h = horMap.get(emp.id)!
-      if (newStart < h.inicio || newEnd > h.fin) {
-        motivos.push(`Fuera del horario de ${emp.nombre_completo.split(' ')[0]} (${fmt(h.inicio)}–${fmt(h.fin)})`)
-      }
-    }
-
-    // 4) Dependencias entre etapas del mismo proceso (misma plantilla + mismo lote)
-    if (movida.plantilla_id != null && movida.lote != null && movida.etapa_orden != null) {
-      const nombreEtapa = (t: CronogramaTarea) => t.descripcion.split(' · ')[0]
-      const hermanas = tareasAll.filter(t =>
-        t.id !== tareaId &&
-        t.plantilla_id === movida.plantilla_id &&
-        t.lote === movida.lote &&
-        t.etapa_orden != null
-      )
-      const requisitosM = [...(movida.dependencias || []), ...(movida.prerequisitos || [])]
-      // 4a) Los requisitos de la tarea movida deben terminar antes de que ésta empiece
-      for (const orden of requisitosM) {
-        const req = hermanas.find(h => h.etapa_orden === orden)
-        if (req && timeToMin(req.hora_fin) > newStart) {
-          motivos.push(`Debe empezar después de "${nombreEtapa(req)}" (termina ${req.hora_fin.slice(0, 5)})`)
-          conflictSet.add(req.id)
-        }
-      }
-      // 4b) Las etapas que dependen de la tarea movida deben empezar después de que ésta termine
-      for (const h of hermanas) {
-        const reqsH = [...(h.dependencias || []), ...(h.prerequisitos || [])]
-        if (reqsH.includes(movida.etapa_orden) && timeToMin(h.hora_inicio) < newEnd) {
-          motivos.push(`"${nombreEtapa(h)}" depende de ésta y empieza ${h.hora_inicio.slice(0, 5)}`)
-          conflictSet.add(h.id)
-        }
-      }
-    }
-
-    return { conflictIds: [...conflictSet], motivos }
-  }, [])
 
   if (zoom !== internalZoom && pendingScrollRef.current === null && !isLocalZoomRef.current) {
     setInternalZoom(zoom)
@@ -287,14 +177,22 @@ export function CronogramaTimeline({
     return map
   }, [tareas, dragState, tareasSeleccionadas])
 
+  const colorPorPlantilla = useMemo(() => {
+    const m = new Map<string, string>()
+    for (const p of plantillas) if (p.color) m.set(p.id, p.color)
+    return m
+  }, [plantillas])
+
   const getTaskColor = useCallback((tarea: CronogramaTarea): string => {
     if (colorMode === 'proceso') {
-      // En modo proceso: usar el color de la tarea (almacenado desde el scheduler / plantilla)
-      if (tarea.color) return tarea.color
-      // Fallback: asignar color consistente por descripción (hash)
+      // En modo proceso: colorear por la plantilla/receta (no por la etapa).
+      const colorPlantilla = tarea.plantilla_id ? colorPorPlantilla.get(tarea.plantilla_id) : undefined
+      if (colorPlantilla) return colorPlantilla
+      // Fallback: color consistente por plantilla (o, si es manual, por descripción).
       const PROC_COLORS = ['#3b82f6','#10b981','#f59e0b','#8b5cf6','#ef4444','#06b6d4','#f97316','#84cc16','#ec4899','#14b8a6']
+      const semilla = tarea.plantilla_id ?? tarea.descripcion
       let hash = 0
-      for (let i = 0; i < tarea.descripcion.length; i++) { hash = ((hash << 5) - hash) + tarea.descripcion.charCodeAt(i); hash |= 0 }
+      for (let i = 0; i < semilla.length; i++) { hash = ((hash << 5) - hash) + semilla.charCodeAt(i); hash |= 0 }
       return PROC_COLORS[Math.abs(hash) % PROC_COLORS.length]
     }
     // Modo empleado: color del empleado por linea_id, ignora tarea.color
@@ -303,7 +201,7 @@ export function CronogramaTimeline({
     }
     if (tarea.color) return tarea.color
     return '#6b7280'
-  }, [empleados, colorMode])
+  }, [empleados, colorMode, colorPorPlantilla])
 
   const todasLasLineas = useMemo(() =>
     empleados.flatMap(emp => emp.lineas.map(linea => ({ linea, emp }))),
@@ -332,12 +230,13 @@ export function CronogramaTimeline({
     for (const tarea of autonomous) {
       const key = tarea.descripcion
       if (!map.has(key)) {
-        map.set(key, { nombre: tarea.descripcion, color: tarea.color || '#6b7280', blocks: [] })
+        const colorPlantilla = tarea.plantilla_id ? colorPorPlantilla.get(tarea.plantilla_id) : undefined
+        map.set(key, { nombre: tarea.descripcion, color: colorPlantilla || tarea.color || '#6b7280', blocks: [] })
       }
       map.get(key)!.blocks.push(tarea)
     }
     return [...map.values()].sort((a, b) => a.nombre.localeCompare(b.nombre))
-  }, [tareas])
+  }, [tareas, colorPorPlantilla])
 
   const GRUPO_COLORES = ['#0ea5e9', '#f59e0b', '#10b981', '#ef4444', '#8b5cf6', '#ec4899', '#14b8a6', '#f97316']
   const getGrupoColor = useCallback((grupoId: string): string => {
@@ -446,8 +345,6 @@ export function CronogramaTimeline({
     origFila: number
     currentTamano: number
     currentFila: number
-    conflictIds: string[]
-    motivos: string[]
   }
 
   interface CreateState {
@@ -489,9 +386,7 @@ export function CronogramaTimeline({
       origTamano: tarea.tamano ?? 5,
       origFila: tarea.fila ?? 0,
       currentTamano: tarea.tamano ?? 5,
-      currentFila: tarea.fila ?? 0,
-      conflictIds: [],
-      motivos: []
+      currentFila: tarea.fila ?? 0
     }
     dragRef.current = state
     setDragState(state)
@@ -624,21 +519,6 @@ export function CronogramaTimeline({
         dragRef.current.currentStart = Math.round(ns)
         dragRef.current.currentEnd = Math.round(ne)
 
-        // Validación de factibilidad en modo Inteligente (solo movimientos de una tarea)
-        if (modoInteligenteRef.current && dragRef.current.mode === 'move' && tareasSeleccionadas.length <= 1) {
-          const { conflictIds, motivos } = evaluarMovimiento(
-            dragRef.current.tareaId,
-            dragRef.current.currentStart,
-            dragRef.current.currentEnd,
-            dragRef.current.currentLineaId
-          )
-          dragRef.current.conflictIds = conflictIds
-          dragRef.current.motivos = motivos
-        } else if (!modoInteligenteRef.current) {
-          dragRef.current.conflictIds = []
-          dragRef.current.motivos = []
-        }
-
         setDragState({ ...dragRef.current })
       }
 
@@ -658,7 +538,7 @@ export function CronogramaTimeline({
     const handleMouseUp = () => {
       didDragRef.current = !!(dragRef.current && dragRef.current.moved)
       if (dragRef.current && dragRef.current.moved) {
-        const { tareaId, currentStart, currentEnd, mode, currentLineaId, origLineaId, origStart, currentTamano, currentFila, origTamano, origFila, conflictIds, motivos } = dragRef.current
+        const { tareaId, currentStart, currentEnd, mode, currentLineaId, origLineaId, origStart, currentTamano, currentFila, origTamano, origFila } = dragRef.current
         const isVerticalMode = mode === 'resize-top' || mode === 'resize-bottom' || mode === 'move-vertical'
 
         if (isVerticalMode) {
@@ -690,20 +570,7 @@ export function CronogramaTimeline({
               })
             onMoverMultiTareas(movimientos)
           } else {
-            if (modoInteligenteRef.current && (conflictIds.length > 0 || motivos.length > 0)) {
-              // Inteligente mode: show conflict resolution modal instead of moving
-              const conflictingTasks = tareas.filter(t => conflictIds.includes(t.id))
-              onMoverConConflictoRef.current?.(
-                tareaId,
-                minToTime(currentStart),
-                minToTime(currentEnd),
-                currentLineaId,
-                conflictingTasks,
-                motivos
-              )
-            } else {
-              onMoverTarea(tareaId, minToTime(currentStart), minToTime(currentEnd), nuevaLinea)
-            }
+            onMoverTarea(tareaId, minToTime(currentStart), minToTime(currentEnd), nuevaLinea)
           }
           // Aplicar cambio de fila si hubo movimiento vertical
           if (currentFila !== origFila) {
@@ -740,7 +607,7 @@ export function CronogramaTimeline({
       document.removeEventListener('mousemove', handleMouseMove)
       document.removeEventListener('mouseup', handleMouseUp)
     }
-  }, [pxPerMin, startMin, endMin, magnetSnap, magnetSnapFila, pxToMinFn, onMoverTarea, onMoverMultiTareas, onResizeTarea, onCrearTarea, detectLineaUnderCursor, onSeleccionarTarea, tareasSeleccionadas, tareas, effRowH, onCambiarTamano, onCambiarFila, snapHorarioOriginal, evaluarMovimiento])
+  }, [pxPerMin, startMin, endMin, magnetSnap, magnetSnapFila, pxToMinFn, onMoverTarea, onMoverMultiTareas, onResizeTarea, onCrearTarea, detectLineaUnderCursor, onSeleccionarTarea, tareasSeleccionadas, tareas, effRowH, onCambiarTamano, onCambiarFila, snapHorarioOriginal])
 
   // Get task position (considering drag state)
   const getTaskPos = (tarea: CronogramaTarea) => {
@@ -1002,8 +869,6 @@ export function CronogramaTimeline({
     })
     const isDragging = !!(dragState?.tareaId === tarea.id && dragState?.moved)
     const isPartOfMultiDrag = !!(dragState?.moved && dragState.mode === 'move' && tareasSeleccionadas.length > 1 && tareasSeleccionadas.includes(tarea.id) && dragState.tareaId !== tarea.id)
-    const hasDragConflict = isDragging && modoInteligente && (((dragState?.conflictIds?.length ?? 0) > 0) || ((dragState?.motivos?.length ?? 0) > 0))
-    const isConflictTarget = modoInteligente && !isDragging && !!(dragState?.moved && dragState?.conflictIds?.includes(tarea.id))
     const isTiny = width < 30
     const { touchesLeft, touchesRight } = getAdjacentBorders(tarea)
 
@@ -1019,7 +884,7 @@ export function CronogramaTimeline({
         key={tarea.id}
         className={`absolute flex flex-col justify-center ${tarea.orientacion_texto === 'vertical' ? 'items-center' : ''} select-none transition-[opacity,shadow,ring,outline,filter] duration-150
           ${isDragging || isPartOfMultiDrag ? 'overflow-visible' : 'overflow-hidden'}
-          ${hasDragConflict || isConflictTarget ? 'ring-2 ring-red-500 ring-offset-1' : isSelected ? 'ring-2 ring-blue-500 ring-offset-1' : isGrupoHighlight ? 'outline outline-2 outline-dashed outline-blue-400/60 outline-offset-1' : ''}
+          ${isSelected ? 'ring-2 ring-blue-500 ring-offset-1' : isGrupoHighlight ? 'outline outline-2 outline-dashed outline-blue-400/60 outline-offset-1' : ''}
           ${isDragging || isPartOfMultiDrag ? 'opacity-90 shadow-xl cursor-grabbing' : tamano < 5 ? 'cursor-grab shadow-md' : 'cursor-grab shadow-sm'}
           ${!isDragging && !isPartOfMultiDrag ? 'hover:shadow-xl hover:brightness-105' : ''}
           ${tarea.bloqueada ? 'cursor-default' : ''}

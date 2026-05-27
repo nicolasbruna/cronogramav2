@@ -1,5 +1,6 @@
 import { supabase } from '../config/supabase'
 import { CronogramaLinea, CronogramaTarea } from '../types/cronograma'
+import { mapTareaParaInsert } from './cronogramaService'
 
 export interface SnapshotCompleto {
   tareas: CronogramaTarea[]
@@ -102,27 +103,14 @@ export const cronogramaHistorialService = {
       .in('id', lineasIds)
 
     const lineasValidas = new Set((lineasExistentes || []).map(l => l.id))
-    const tareasValidas = tareas.filter(t => lineasValidas.has(t.linea_id))
+    const tareasValidas = tareas.filter(t => t.linea_id != null && lineasValidas.has(t.linea_id))
 
     if (tareasValidas.length === 0) return
 
-    const tareasParaUpsert = tareasValidas.map(t => ({
-      id: t.id,
-      linea_id: t.linea_id,
-      dia_semana: t.dia_semana,
-      hora_inicio: t.hora_inicio,
-      hora_fin: t.hora_fin,
-      descripcion: t.descripcion,
-      color: t.color,
-      bloqueada: t.bloqueada,
-      tamano_texto: t.tamano_texto || 'normal',
-      orientacion_texto: t.orientacion_texto || 'horizontal',
-      orden: t.orden || 0,
-      tamano: t.tamano || 5,
-      fila: t.fila || 0,
-      grupo_id: t.grupo_id || null,
-      eliminada: false
-    }))
+    // Preserva id (upsert) y todos los campos (recursos, trazabilidad, solape) vía el helper común.
+    const tareasParaUpsert = tareasValidas.map(t =>
+      mapTareaParaInsert(t, t.dia_semana, t.linea_id, { id: t.id })
+    )
 
     const { error } = await supabase
       .from('cronograma_tareas')

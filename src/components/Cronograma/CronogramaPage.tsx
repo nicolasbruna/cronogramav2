@@ -1,9 +1,9 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
-import { Plus, Minus, Maximize2, Copy, Trash2, ChevronLeft, ChevronRight, Lock, Unlock, UserPlus, Undo2, Redo2, List, Save, FolderOpen, Menu, Link, Unlink, ArchiveRestore, Magnet, Users, LogOut, Settings, CalendarClock, LayoutList, Layers, Zap, AlertTriangle } from 'lucide-react'
-import { PlanificarModal } from '../Planificacion/PlanificarModal'
+import { Plus, Minus, Maximize2, Copy, Trash2, ChevronLeft, ChevronRight, Lock, Unlock, UserPlus, Undo2, Redo2, List, Save, FolderOpen, Menu, Link, Unlink, ArchiveRestore, Magnet, Users, LogOut, Settings, LayoutList, Layers, CalendarClock } from 'lucide-react'
 import { cronogramaService } from '../../services/cronogramaService'
-import { planificacionService } from '../../services/planificacionService'
 import { cronogramaHistorialService } from '../../services/cronogramaHistorialService'
+import { planificacionService } from '../../services/planificacionService'
+import { PlantillaProceso } from '../../types/planificacion'
 import { CronogramaLinea, CronogramaTarea, CronogramaVersion, EmpleadoConLineas, DIAS_SEMANA_NOMBRES, ActualizarCronogramaTareaRequest, TamanoTexto, OrientacionTexto } from '../../types/cronograma'
 import { CronogramaTimeline } from './CronogramaTimeline'
 import { TareaModal } from './TareaModal'
@@ -18,13 +18,14 @@ interface CronogramaPageProps {
   onSectionChange?: (section: string) => void
   onToggleMenu?: () => void
   onIrAConfiguracion?: () => void
+  onIrAPlanificar?: (dia: number) => void
 }
 
-export function CronogramaPage({ onSectionChange, onToggleMenu, onIrAConfiguracion }: CronogramaPageProps) {
+export function CronogramaPage({ onSectionChange, onToggleMenu, onIrAConfiguracion, onIrAPlanificar }: CronogramaPageProps) {
   const { signOut } = useAuth()
-  const [planificarVisible, setPlanificarVisible] = useState(false)
   const [empleados, setEmpleados] = useState<EmpleadoConLineas[]>([])
   const [tareas, setTareas] = useState<CronogramaTarea[]>([])
+  const [plantillas, setPlantillas] = useState<PlantillaProceso[]>([])
   const [diaActual, setDiaActual] = useState(() => {
     const saved = localStorage.getItem('cronograma_dia_actual')
     return saved !== null ? parseInt(saved, 10) : getDiaSemanaHoy()
@@ -75,28 +76,11 @@ export function CronogramaPage({ onSectionChange, onToggleMenu, onIrAConfiguraci
   const [filtroVersionDia, setFiltroVersionDia] = useState<number | 'todos'>('todos')
   const [moduloPersonalVisible, setModuloPersonalVisible] = useState(false)
   const [vistaAgrupacion, setVistaAgrupacion] = useState<'secciones' | 'todos'>('secciones')
-  const [modoInteligente, setModoInteligente] = useState(true)
-  const [maquinasCapacidad, setMaquinasCapacidad] = useState<Map<string, number>>(new Map())
-  const [horariosDia, setHorariosDia] = useState<Map<string, { inicio: number; fin: number }>>(new Map())
   const [configSolape, setConfigSolape] = useState<ConfiguracionSolape>({ penalizacionPct: 30, modoDefault: 'solapada' })
   const configSolapeRef = useRef(configSolape)
   configSolapeRef.current = configSolape
   const empleadosRef = useRef(empleados)
   empleadosRef.current = empleados
-  interface ConflictoModal {
-    tareaId: string
-    nuevaHoraInicio: string
-    nuevaHoraFin: string
-    nuevaLineaId: string
-    tareasConflicto: CronogramaTarea[]
-    motivos: string[]
-  }
-  const [conflictoModal, setConflictoModal] = useState<ConflictoModal | null>(null)
-  // Confirmación cuando un desplazamiento deja tareas fuera del horario del empleado
-  const [confirmarFueraHorario, setConfirmarFueraHorario] = useState<{
-    movimientos: { tareaId: string; nuevaHoraInicio: string; nuevaHoraFin: string; nuevaLineaId?: string }[]
-    mensaje: string
-  } | null>(null)
 
   const cargarDatos = useCallback(async () => {
     try {
@@ -199,16 +183,12 @@ export function CronogramaPage({ onSectionChange, onToggleMenu, onIrAConfiguraci
   }, [puedeRehacer, undoRedoLoading, diaActual, actualizarEstadoHistorial, aplicarSnapshot, cargarDatos])
 
   useEffect(() => { cargarDatos() }, [cargarDatos])
-  useEffect(() => { actualizarEstadoHistorial() }, [actualizarEstadoHistorial])
-
-  // Capacidad de máquinas (para validación de conflictos en modo Inteligente)
   useEffect(() => {
-    let cancelled = false
-    planificacionService.listarMaquinas()
-      .then(ms => { if (!cancelled) setMaquinasCapacidad(new Map(ms.map(m => [m.id, m.cantidad]))) })
-      .catch(err => console.error('Error cargando capacidad de máquinas:', err))
-    return () => { cancelled = true }
+    planificacionService.listarPlantillas()
+      .then(setPlantillas)
+      .catch(err => console.error('Error cargando plantillas:', err))
   }, [])
+  useEffect(() => { actualizarEstadoHistorial() }, [actualizarEstadoHistorial])
 
   // Configuración global de penalización por solapamiento
   useEffect(() => {
@@ -218,23 +198,6 @@ export function CronogramaPage({ onSectionChange, onToggleMenu, onIrAConfiguraci
       .catch(err => console.error('Error cargando configuración de solape:', err))
     return () => { cancelled = true }
   }, [])
-
-  // Horarios de empleados del día actual (para validación de conflictos)
-  useEffect(() => {
-    let cancelled = false
-    planificacionService.listarTodosHorariosEmpleados()
-      .then(hs => {
-        if (cancelled) return
-        const map = new Map<string, { inicio: number; fin: number }>()
-        for (const h of hs) {
-          if (h.dia_semana !== diaActual) continue
-          map.set(h.empleado_id, { inicio: timeToMin(h.hora_inicio), fin: timeToMin(h.hora_fin) })
-        }
-        setHorariosDia(map)
-      })
-      .catch(err => console.error('Error cargando horarios de empleados:', err))
-    return () => { cancelled = true }
-  }, [diaActual])
 
   useEffect(() => {
     let cancelled = false
@@ -568,94 +531,6 @@ export function CronogramaPage({ onSectionChange, onToggleMenu, onIrAConfiguraci
       await cargarDatos()
     }
   }, [tareas, registrarEnHistorial, cargarDatos])
-
-  const handleMoverConConflicto = useCallback((tareaId: string, nuevaHoraInicio: string, nuevaHoraFin: string, nuevaLineaId: string, tareasConflicto: CronogramaTarea[], motivos: string[]) => {
-    setConflictoModal({ tareaId, nuevaHoraInicio, nuevaHoraFin, nuevaLineaId, tareasConflicto, motivos })
-  }, [])
-
-  // Ejecuta una lista de movimientos (optimista + persistencia + recálculo de solape + historial).
-  const ejecutarMovimientos = useCallback(async (
-    movimientos: { tareaId: string; nuevaHoraInicio: string; nuevaHoraFin: string; nuevaLineaId?: string }[],
-    label: string
-  ) => {
-    try {
-      let tareasOptimistas = [...tareas]
-      for (const mov of movimientos) {
-        tareasOptimistas = tareasOptimistas.map(t =>
-          t.id === mov.tareaId
-            ? { ...t, hora_inicio: mov.nuevaHoraInicio, hora_fin: mov.nuevaHoraFin, ...(mov.nuevaLineaId ? { linea_id: mov.nuevaLineaId } : {}) }
-            : t
-        )
-      }
-      setTareas(tareasOptimistas)
-      await Promise.all(movimientos.map(mov => {
-        const update: Record<string, string> = { hora_inicio: mov.nuevaHoraInicio, hora_fin: mov.nuevaHoraFin }
-        if (mov.nuevaLineaId) update.linea_id = mov.nuevaLineaId
-        return cronogramaService.actualizarTarea(mov.tareaId, update)
-      }))
-      const corregidas = await aplicarCambiosSolape(tareasOptimistas)
-      registrarEnHistorial(corregidas, label)
-    } catch (err) {
-      console.error('Error aplicando movimientos:', err)
-      await cargarDatos()
-    }
-  }, [tareas, registrarEnHistorial, cargarDatos, aplicarCambiosSolape])
-
-  // Detecta si un movimiento deja la tarea fuera del horario configurado del empleado destino.
-  // Devuelve el nombre del empleado si queda fuera, o null si está dentro / sin horario configurado.
-  const movimientoFueraHorario = useCallback((
-    mov: { tareaId: string; nuevaHoraInicio: string; nuevaHoraFin: string; nuevaLineaId?: string }
-  ): string | null => {
-    const tarea = tareas.find(t => t.id === mov.tareaId)
-    const lineaId = mov.nuevaLineaId ?? tarea?.linea_id ?? undefined
-    if (!lineaId) return null
-    const emp = empleados.find(e => e.lineas.some(l => l.id === lineaId))
-    if (!emp) return null
-    const h = horariosDia.get(emp.id)
-    if (!h) return null
-    const s = timeToMin(mov.nuevaHoraInicio)
-    const e = timeToMin(mov.nuevaHoraFin)
-    if (s < h.inicio || e > h.fin) return emp.nombre_completo.split(' ')[0]
-    return null
-  }, [tareas, empleados, horariosDia])
-
-  const handleDesplazarConflicto = useCallback(async () => {
-    if (!conflictoModal) return
-    const { tareaId, nuevaHoraInicio, nuevaHoraFin, nuevaLineaId, tareasConflicto } = conflictoModal
-    setConflictoModal(null)
-    const tarea = tareas.find(t => t.id === tareaId)
-    const nuevaLineaFinal = nuevaLineaId !== tarea?.linea_id ? nuevaLineaId : undefined
-    const newEndMin = timeToMin(nuevaHoraFin)
-    const movimientos: { tareaId: string; nuevaHoraInicio: string; nuevaHoraFin: string; nuevaLineaId?: string }[] = [
-      { tareaId, nuevaHoraInicio, nuevaHoraFin, nuevaLineaId: nuevaLineaFinal },
-      ...tareasConflicto
-        .filter(t => !t.bloqueada)
-        .map(t => {
-          const dur = timeToMin(t.hora_fin) - timeToMin(t.hora_inicio)
-          return { tareaId: t.id, nuevaHoraInicio: minToTime(newEndMin), nuevaHoraFin: minToTime(newEndMin + dur) }
-        })
-    ]
-    // Verificar si algún movimiento queda fuera del horario del empleado
-    const fuera = movimientos.map(m => movimientoFueraHorario(m)).filter((n): n is string => n !== null)
-    if (fuera.length > 0) {
-      const nombres = [...new Set(fuera)].join(', ')
-      setConfirmarFueraHorario({
-        movimientos,
-        mensaje: `El desplazamiento deja ${fuera.length === 1 ? 'una tarea' : `${fuera.length} tareas`} fuera del horario de ${nombres}. ¿Ubicarla igual? (solo esta vez, no se modifica el horario del empleado)`
-      })
-      return
-    }
-    await ejecutarMovimientos(movimientos, `Mover tarea y desplazar conflictos`)
-  }, [conflictoModal, tareas, movimientoFueraHorario, ejecutarMovimientos])
-
-  const handleForzarConflicto = useCallback(async () => {
-    if (!conflictoModal) return
-    const { tareaId, nuevaHoraInicio, nuevaHoraFin, nuevaLineaId } = conflictoModal
-    setConflictoModal(null)
-    const tarea = tareas.find(t => t.id === tareaId)
-    const nuevaLineaFinal = nuevaLineaId !== tarea?.linea_id ? nuevaLineaId : undefined
-    await handleMoverTarea(tareaId, nuevaHoraInicio, nuevaHoraFin, nuevaLineaFinal)
-  }, [conflictoModal, tareas, handleMoverTarea])
 
   const handleLiberarTodas = useCallback(async () => {
     const bloqueadas = tareas.filter(t => t.bloqueada)
@@ -1178,7 +1053,7 @@ export function CronogramaPage({ onSectionChange, onToggleMenu, onIrAConfiguraci
             </button>
           </div>
 
-          {/* Snap toggle + Modo Inteligente + logout - al final derecha */}
+          {/* Snap toggle + logout - al final derecha */}
           <div className="ml-auto flex items-center gap-1.5">
             <button
               onClick={() => setSnapHorarioOriginal(v => !v)}
@@ -1191,33 +1066,7 @@ export function CronogramaPage({ onSectionChange, onToggleMenu, onIrAConfiguraci
             >
               <Magnet size={11} /> Imán
             </button>
-            <div className="w-px h-4 bg-slate-200/70" />
-            {/* Modo Inteligente toggle */}
-            <div className="flex items-center gap-0.5 bg-slate-100 rounded-md p-0.5 h-[26px]">
-              <button
-                onClick={() => setModoInteligente(false)}
-                className={`flex items-center gap-1 px-2 h-full rounded text-[10px] font-bold transition-colors ${
-                  !modoInteligente
-                    ? 'bg-white text-slate-800 shadow-sm'
-                    : 'text-slate-400 hover:text-slate-600'
-                }`}
-                title="Arrastrar libremente sin detección de conflictos"
-              >
-                Libre
-              </button>
-              <button
-                onClick={() => setModoInteligente(true)}
-                className={`flex items-center gap-1 px-2 h-full rounded text-[10px] font-bold transition-colors ${
-                  modoInteligente
-                    ? 'bg-violet-600 text-white shadow-sm'
-                    : 'text-slate-400 hover:text-slate-600'
-                }`}
-                title="Detecta conflictos al arrastrar y ofrece opciones de resolución"
-              >
-                <Zap size={10} /> Inteligente
-              </button>
-            </div>
-            {modoInteligente && tareas.some(t => t.bloqueada) && (
+            {tareas.some(t => t.bloqueada) && (
               <button
                 onClick={handleLiberarTodas}
                 className="h-[26px] px-2 text-[10px] font-bold rounded-md border border-amber-300 bg-amber-50 text-amber-700 hover:bg-amber-100 flex items-center gap-1 transition-colors"
@@ -1295,9 +1144,9 @@ export function CronogramaPage({ onSectionChange, onToggleMenu, onIrAConfiguraci
           <div className="w-px h-4 bg-slate-200/70" />
 
           <button
-            onClick={() => setPlanificarVisible(true)}
+            onClick={() => onIrAPlanificar?.(diaActual)}
             className="h-[26px] px-2.5 text-[10px] font-semibold rounded-md border border-blue-300 bg-blue-600 text-white hover:bg-blue-700 flex items-center gap-1.5 transition-colors shadow-sm"
-            title="Generar cronograma automáticamente"
+            title="Generar el cronograma automáticamente"
           >
             <CalendarClock size={11} /> Planificar
           </button>
@@ -1392,6 +1241,7 @@ export function CronogramaPage({ onSectionChange, onToggleMenu, onIrAConfiguraci
           <CronogramaTimeline
             empleados={empleados.filter(e => e.lineas.length > 0)}
             tareas={tareas}
+            plantillas={plantillas}
             rangoInicio={rangoInicio}
             rangoFin={rangoFin}
             zoom={zoom}
@@ -1417,10 +1267,6 @@ export function CronogramaPage({ onSectionChange, onToggleMenu, onIrAConfiguraci
             onDesagrupar={handleDesagruparDesdeMenu}
             onBloquear={handleBloquearDesdeMenu}
             vistaAgrupacion={vistaAgrupacion}
-            modoInteligente={modoInteligente}
-            onMoverConConflicto={handleMoverConConflicto}
-            maquinasCapacidad={maquinasCapacidad}
-            horariosEmpleados={horariosDia}
           />
         )}
       </div>
@@ -1796,22 +1642,6 @@ export function CronogramaPage({ onSectionChange, onToggleMenu, onIrAConfiguraci
         textoCancelar="Cancelar"
       />
 
-      {/* Confirmación: desplazamiento fuera del horario del empleado */}
-      <ModalConfirmacionRapida
-        isOpen={!!confirmarFueraHorario}
-        onClose={() => setConfirmarFueraHorario(null)}
-        onConfirm={async () => {
-          const pendiente = confirmarFueraHorario
-          setConfirmarFueraHorario(null)
-          if (pendiente) await ejecutarMovimientos(pendiente.movimientos, `Mover tarea y desplazar conflictos`)
-        }}
-        titulo="Fuera del horario del empleado"
-        mensaje={confirmarFueraHorario?.mensaje || ''}
-        tipo="warning"
-        textoConfirmar="Ubicar igual"
-        textoCancelar="Cancelar"
-      />
-
       {/* Agregar empleado modal */}
       <ModuloPersonalModal
         visible={moduloPersonalVisible}
@@ -1819,115 +1649,6 @@ export function CronogramaPage({ onSectionChange, onToggleMenu, onIrAConfiguraci
         onEmpleadoCreado={cargarDatos}
       />
 
-      {/* Modal conflicto inteligente */}
-      {conflictoModal && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[300] backdrop-blur-sm" onClick={() => setConflictoModal(null)}>
-          <div className="bg-white w-[460px] max-w-[95vw] rounded-xl shadow-2xl overflow-hidden" onClick={e => e.stopPropagation()}>
-            <div className="px-5 py-4 border-b border-red-100 bg-red-50 flex items-start gap-3">
-              <div className="w-9 h-9 rounded-full bg-red-100 flex items-center justify-center flex-shrink-0 mt-0.5">
-                <AlertTriangle size={18} className="text-red-600" />
-              </div>
-              <div>
-                <h2 className="text-base font-bold text-slate-900">Conflicto detectado</h2>
-                <p className="text-[12px] text-slate-600 mt-0.5">
-                  {conflictoModal.tareasConflicto.length > 0
-                    ? `La tarea se superpone con ${conflictoModal.tareasConflicto.length === 1 ? 'otra tarea' : `${conflictoModal.tareasConflicto.length} tareas`}${conflictoModal.motivos.length > 0 ? ' y rompe otras restricciones' : ' en esa línea'}.`
-                    : 'El movimiento rompe restricciones del proceso.'}
-                </p>
-              </div>
-            </div>
-            <div className="px-5 py-4 space-y-3">
-              {/* Mover a */}
-              <div className="bg-slate-50 rounded-lg p-3 text-[12px]">
-                <div className="text-[10px] uppercase tracking-wider text-slate-400 font-bold mb-2">Tarea a mover</div>
-                <div className="flex items-center gap-2">
-                  <span className="font-semibold text-slate-800 truncate flex-1">
-                    {tareas.find(t => t.id === conflictoModal.tareaId)?.descripcion || 'Tarea'}
-                  </span>
-                  <span className="font-mono text-slate-500 flex-shrink-0">
-                    {conflictoModal.nuevaHoraInicio.slice(0,5)} → {conflictoModal.nuevaHoraFin.slice(0,5)}
-                  </span>
-                </div>
-              </div>
-              {/* Motivos (máquina / horario) */}
-              {conflictoModal.motivos.length > 0 && (
-                <div>
-                  <div className="text-[10px] uppercase tracking-wider text-slate-400 font-bold mb-1.5">
-                    Restricciones que se rompen
-                  </div>
-                  <div className="space-y-1">
-                    {conflictoModal.motivos.map((m, i) => (
-                      <div key={i} className="flex items-center gap-2 px-3 py-1.5 bg-amber-50 rounded border border-amber-200 text-[12px]">
-                        <AlertTriangle size={11} className="text-amber-600 flex-shrink-0" />
-                        <span className="font-medium text-slate-700 flex-1">{m}</span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-              {/* Conflictos */}
-              {conflictoModal.tareasConflicto.length > 0 && (
-                <div>
-                  <div className="text-[10px] uppercase tracking-wider text-slate-400 font-bold mb-1.5">
-                    {conflictoModal.tareasConflicto.length === 1 ? 'Tarea en conflicto' : 'Tareas en conflicto'}
-                  </div>
-                  <div className="space-y-1">
-                    {conflictoModal.tareasConflicto.map(t => (
-                      <div key={t.id} className="flex items-center gap-2 px-3 py-1.5 bg-red-50 rounded border border-red-100 text-[12px]">
-                        {t.bloqueada && <Lock size={11} className="text-red-500 flex-shrink-0" />}
-                        <span className="font-semibold text-slate-800 truncate flex-1">{t.descripcion}</span>
-                        <span className="font-mono text-slate-500 flex-shrink-0">
-                          {t.hora_inicio.slice(0,5)} → {t.hora_fin.slice(0,5)}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                  {conflictoModal.tareasConflicto.every(t => t.bloqueada) && (
-                    <p className="text-[11px] text-amber-600 mt-1.5 flex items-center gap-1">
-                      <Lock size={10} /> Todas las tareas en conflicto están bloqueadas y no pueden desplazarse.
-                    </p>
-                  )}
-                </div>
-              )}
-            </div>
-            <div className="px-5 py-3 border-t border-slate-200 bg-slate-50 flex items-center justify-between gap-2">
-              <button
-                onClick={() => setConflictoModal(null)}
-                className="h-8 px-3 text-sm font-semibold text-slate-600 border border-slate-300 rounded-lg hover:bg-slate-100"
-              >
-                Cancelar
-              </button>
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={handleDesplazarConflicto}
-                  disabled={conflictoModal.tareasConflicto.every(t => t.bloqueada)}
-                  className="h-8 px-3 text-[12px] font-semibold text-white bg-violet-600 rounded-lg hover:bg-violet-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-                  title="Mover la tarea y desplazar las tareas no bloqueadas que interfieren"
-                >
-                  Desplazar conflictos
-                </button>
-                <button
-                  onClick={handleForzarConflicto}
-                  className="h-8 px-3 text-[12px] font-semibold border border-slate-300 bg-white text-slate-700 rounded-lg hover:bg-slate-50 transition-colors"
-                  title="Mover la tarea ignorando los conflictos"
-                >
-                  Forzar igual
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Modal planificar */}
-      <PlanificarModal
-        visible={planificarVisible}
-        diaActual={diaActual}
-        rangoInicio={rangoInicio}
-        rangoFin={rangoFin}
-        onCerrar={() => setPlanificarVisible(false)}
-        onAplicado={cargarDatos}
-      />
 
       {agregarEmpleadoModalVisible && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[200] backdrop-blur-sm" onClick={() => setAgregarEmpleadoModalVisible(false)}>
