@@ -7,6 +7,7 @@ import {
 import { recursosDeEtapa, slotsDeEtapa } from './etapaHelpers'
 import { timeToMin, minToTime, formatDuration, generarId } from '../components/Cronograma/cronogramaHelpers'
 import { cronogramaService } from './cronogramaService'
+import { cronogramaHistorialService } from './cronogramaHistorialService'
 import { planificacionService } from './planificacionService'
 import { configuracionService } from './configuracionService'
 import { calcularCambiosSolape } from '../components/Cronograma/solapeHelpers'
@@ -756,6 +757,13 @@ export async function aplicarResultado(dia: number, resultado: ResultadoSchedule
   await Promise.all(cambios.map(c =>
     cronogramaService.actualizarTarea(c.id, { hora_fin: c.hora_fin, duracion_base_min: c.duracion_base_min })
   ))
+
+  // Sembrar el estado generado como base del historial, para que "deshacer" tras mover vuelva a este
+  // cronograma (y no a un estado viejo, que vaciaba el día). Se re-leen las tareas porque el ajuste de
+  // solape las modificó.
+  const tareasFinales = await cronogramaService.listarTareas(dia)
+  const lineasFinales = empleados.flatMap(e => e.lineas)
+  await cronogramaHistorialService.registrarAccion(dia, tareasFinales, 'Cronograma generado', lineasFinales)
 }
 
 // ¿Las ventanas cubren CONTINUAMENTE el intervalo [inicio, fin] (sin huecos)? Si no, la etapa es de
