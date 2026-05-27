@@ -383,13 +383,39 @@ export function CronogramaPage({ onSectionChange, onToggleMenu, onIrAConfiguraci
   const handleResizeTarea = useCallback(async (tareaId: string, nuevaHoraInicio: string, nuevaHoraFin: string) => {
     try {
       const tarea = tareas.find(t => t.id === tareaId)
+
+      // Si es el cuerpo de un proceso (tarea autónoma con grupo), el toque del extremo redimensionado
+      // sigue al nuevo borde (conservando su duración).
+      const toquesUpdates: { id: string; hora_inicio: string; hora_fin: string }[] = []
+      if (tarea && tarea.linea_id == null && tarea.grupo_id) {
+        const toques = tareas.filter(t => t.grupo_id === tarea.grupo_id && t.linea_id != null)
+        if (toques.length > 0) {
+          if (timeToMin(nuevaHoraInicio) !== timeToMin(tarea.hora_inicio)) {
+            const inicial = toques.reduce((a, b) => timeToMin(a.hora_inicio) <= timeToMin(b.hora_inicio) ? a : b)
+            const dur = timeToMin(inicial.hora_fin) - timeToMin(inicial.hora_inicio)
+            toquesUpdates.push({ id: inicial.id, hora_inicio: nuevaHoraInicio, hora_fin: minToTime(timeToMin(nuevaHoraInicio) + dur) })
+          }
+          if (timeToMin(nuevaHoraFin) !== timeToMin(tarea.hora_fin)) {
+            const final = toques.reduce((a, b) => timeToMin(a.hora_fin) >= timeToMin(b.hora_fin) ? a : b)
+            const dur = timeToMin(final.hora_fin) - timeToMin(final.hora_inicio)
+            toquesUpdates.push({ id: final.id, hora_inicio: minToTime(timeToMin(nuevaHoraFin) - dur), hora_fin: nuevaHoraFin })
+          }
+        }
+      }
+
       // Al redimensionar, la nueva longitud pasa a ser la duración base (se limpia el override previo).
-      const tareasOptimistas = tareas.map(t =>
-        t.id === tareaId ? { ...t, hora_inicio: nuevaHoraInicio, hora_fin: nuevaHoraFin, duracion_base_min: null } : t
-      )
+      const updMap = new Map(toquesUpdates.map(u => [u.id, u]))
+      const tareasOptimistas = tareas.map(t => {
+        if (t.id === tareaId) return { ...t, hora_inicio: nuevaHoraInicio, hora_fin: nuevaHoraFin, duracion_base_min: null }
+        const u = updMap.get(t.id)
+        return u ? { ...t, hora_inicio: u.hora_inicio, hora_fin: u.hora_fin } : t
+      })
       setTareas(tareasOptimistas)
 
       await cronogramaService.actualizarTarea(tareaId, { hora_inicio: nuevaHoraInicio, hora_fin: nuevaHoraFin, duracion_base_min: null })
+      await Promise.all(toquesUpdates.map(u =>
+        cronogramaService.actualizarTarea(u.id, { hora_inicio: u.hora_inicio, hora_fin: u.hora_fin })
+      ))
       const corregidas = await aplicarCambiosSolape(tareasOptimistas)
       registrarEnHistorial(corregidas, `Redimensionar tarea "${tarea?.descripcion || ''}"`)
     } catch (err) {

@@ -166,9 +166,9 @@ export function CronogramaTimeline({
       let lineaId = t.linea_id
       if (dragState && dragState.moved && dragState.mode === 'move') {
         if (dragState.tareaId === t.id) {
-          lineaId = dragState.currentLineaId
+          lineaId = dragState.currentLineaId ?? lineaId
         } else if (tareasSeleccionadas.length > 1 && tareasSeleccionadas.includes(t.id) && dragState.currentLineaId !== dragState.origLineaId) {
-          lineaId = dragState.currentLineaId
+          lineaId = dragState.currentLineaId ?? lineaId
         }
       }
       if (!map[lineaId]) map[lineaId] = []
@@ -286,11 +286,11 @@ export function CronogramaTimeline({
   }, [])
 
   // Magnet snap
-  const magnetSnap = useCallback((value: number, tareaId: string, lineaId: string) => {
+  const magnetSnap = useCallback((value: number, tareaId: string, lineaId: string | null) => {
     const thresholdMin = MAGNET_PX / pxPerMin
     let best = value
     let bestDist = thresholdMin + 1
-    const lineTasks = tareasporLinea[lineaId] || []
+    const lineTasks = lineaId ? (tareasporLinea[lineaId] || []) : []
     for (const t of lineTasks) {
       if (t.id === tareaId) continue
       for (const ed of [timeToMin(t.hora_inicio), timeToMin(t.hora_fin)]) {
@@ -301,9 +301,9 @@ export function CronogramaTimeline({
     return bestDist <= thresholdMin ? best : value
   }, [pxPerMin, tareasporLinea])
 
-  const magnetSnapFila = useCallback((fila: number, tamano: number, tareaId: string, lineaId: string): number => {
+  const magnetSnapFila = useCallback((fila: number, tamano: number, tareaId: string, lineaId: string | null): number => {
     if (!snapHorarioOriginal) return fila
-    const lineTasks = tareasporLinea[lineaId] || []
+    const lineTasks = lineaId ? (tareasporLinea[lineaId] || []) : []
     let best = fila
     let bestDist = 0.6
     for (const t of lineTasks) {
@@ -336,11 +336,11 @@ export function CronogramaTimeline({
     startClientY: number
     origStart: number
     origEnd: number
-    origLineaId: string
+    origLineaId: string | null
     moved: boolean
     currentStart: number
     currentEnd: number
-    currentLineaId: string
+    currentLineaId: string | null
     origTamano: number
     origFila: number
     currentTamano: number
@@ -357,7 +357,9 @@ export function CronogramaTimeline({
 
   const handleTaskMouseDown = useCallback((e: React.MouseEvent, tarea: CronogramaTarea, mode: DragState['mode']) => {
     if (e.button !== 0) return
-    if (!tarea.linea_id) return  // autonomous tasks are read-only
+    // Tareas autónomas (procesos): se permiten mover/redimensionar SOLO en horizontal (no tienen
+    // línea ni apilado vertical).
+    if (!tarea.linea_id && mode !== 'move' && mode !== 'resize-left' && mode !== 'resize-right') return
     if (tarea.bloqueada && mode !== 'move') return
     if (tarea.bloqueada) return
     e.preventDefault()
@@ -470,26 +472,29 @@ export function CronogramaTimeline({
           if (ns < startMin) { ns = startMin; ne = ns + dur }
           if (ne > endMin) { ne = endMin; ns = ne - dur }
 
-          // Detect target line: solo cambiar si el cursor salió del track original
-          const origTrackEl = wrapRef.current?.querySelector(`[data-linea-track="${dragRef.current.origLineaId}"]`) as HTMLElement | null
-          const origTrackRect = origTrackEl?.getBoundingClientRect()
-          const cursorInOrigTrack = origTrackRect && e.clientY >= origTrackRect.top && e.clientY <= origTrackRect.bottom
-          if (!cursorInOrigTrack) {
-            const targetLineaId = detectLineaUnderCursor(e.clientY)
-            if (targetLineaId) {
-              dragRef.current.currentLineaId = targetLineaId
+          // Autónomas (procesos): solo movimiento horizontal, sin línea ni apilado vertical.
+          if (dragRef.current.origLineaId != null) {
+            // Detect target line: solo cambiar si el cursor salió del track original
+            const origTrackEl = wrapRef.current?.querySelector(`[data-linea-track="${dragRef.current.origLineaId}"]`) as HTMLElement | null
+            const origTrackRect = origTrackEl?.getBoundingClientRect()
+            const cursorInOrigTrack = origTrackRect && e.clientY >= origTrackRect.top && e.clientY <= origTrackRect.bottom
+            if (!cursorInOrigTrack) {
+              const targetLineaId = detectLineaUnderCursor(e.clientY)
+              if (targetLineaId) {
+                dragRef.current.currentLineaId = targetLineaId
+              }
+            } else {
+              dragRef.current.currentLineaId = dragRef.current.origLineaId
             }
-          } else {
-            dragRef.current.currentLineaId = dragRef.current.origLineaId
-          }
 
-          // Mover fila verticalmente (basado en dy)
-          const filaHeight = effRowH / 5
-          const dyFilas = Math.round(dy / filaHeight)
-          const maxFila = 5 - dragRef.current.origTamano
-          let newFila = Math.max(0, Math.min(maxFila, dragRef.current.origFila + dyFilas))
-          newFila = magnetSnapFila(newFila, dragRef.current.origTamano, dragRef.current.tareaId, dragRef.current.currentLineaId)
-          dragRef.current.currentFila = newFila
+            // Mover fila verticalmente (basado en dy)
+            const filaHeight = effRowH / 5
+            const dyFilas = Math.round(dy / filaHeight)
+            const maxFila = 5 - dragRef.current.origTamano
+            let newFila = Math.max(0, Math.min(maxFila, dragRef.current.origFila + dyFilas))
+            newFila = magnetSnapFila(newFila, dragRef.current.origTamano, dragRef.current.tareaId, dragRef.current.currentLineaId)
+            dragRef.current.currentFila = newFila
+          }
 
           const snapLineaId = dragRef.current.currentLineaId
           const sSnap = magnetSnap(ns, dragRef.current.tareaId, snapLineaId)
@@ -553,7 +558,7 @@ export function CronogramaTimeline({
           }
         } else if (mode === 'move') {
           const deltaMin = currentStart - origStart
-          const nuevaLinea = currentLineaId !== origLineaId ? currentLineaId : undefined
+          const nuevaLinea = currentLineaId && currentLineaId !== origLineaId ? currentLineaId : undefined
           if (tareasSeleccionadas.length > 1 && tareasSeleccionadas.includes(tareaId)) {
             const movimientos = tareasSeleccionadas
               .map(id => tareas.find(t => t.id === id))
@@ -565,7 +570,8 @@ export function CronogramaTimeline({
                   tareaId: t.id,
                   nuevaHoraInicio: minToTime(Math.max(startMin, tStart)),
                   nuevaHoraFin: minToTime(Math.min(endMin, tEnd)),
-                  nuevaLineaId: nuevaLinea
+                  // Las autónomas (procesos) nunca cambian de línea.
+                  nuevaLineaId: t.linea_id == null ? undefined : nuevaLinea
                 }
               })
             onMoverMultiTareas(movimientos)
@@ -651,7 +657,7 @@ export function CronogramaTimeline({
   const getAdjacentBorders = (tarea: CronogramaTarea) => {
     const { start, end } = getTaskPos(tarea)
     const effectiveLineaId = (dragState && dragState.tareaId === tarea.id && dragState.moved && dragState.mode === 'move')
-      ? dragState.currentLineaId
+      ? (dragState.currentLineaId ?? '')
       : (tarea.linea_id || '')
     const lineTasks = tareasporLinea[effectiveLineaId] || []
     let touchesLeft = false
@@ -698,7 +704,7 @@ export function CronogramaTimeline({
 
   const getTextPosition = (tarea: CronogramaTarea, taskStart: number, taskEnd: number, taskWidth: number, taskLeft: number, taskHeight: number): { x: number; y: number; gapWidth: number } => {
     const effectiveLineaId = (dragState && dragState.tareaId === tarea.id && dragState.moved && dragState.mode === 'move')
-      ? dragState.currentLineaId : (tarea.linea_id || '')
+      ? (dragState.currentLineaId ?? '') : (tarea.linea_id || '')
     const lineTasks = tareasporLinea[effectiveLineaId] || []
     const taskDuration = taskEnd - taskStart
     const taskTamano = getTaskTamano(tarea)
@@ -1615,22 +1621,50 @@ export function CronogramaTimeline({
                       style={{ left: minToPx(tick.min) + 'px' }}
                     />
                   ))}
-                  {proc.blocks.map((tarea, i) => {
-                    const left = minToPx(timeToMin(tarea.hora_inicio))
-                    const width = Math.max(4, (timeToMin(tarea.hora_fin) - timeToMin(tarea.hora_inicio)) * pxPerMin)
+                  {proc.blocks.map((tarea) => {
+                    const { start, end } = getTaskPos(tarea)
+                    const left = minToPx(start)
+                    const width = Math.max(4, (end - start) * pxPerMin)
                     const color = proc.color
+                    const isSelected = tareasSeleccionadas.includes(tarea.id)
+                    const isGrupoHighlight = !isSelected && tarea.grupo_id && tareasSeleccionadas.some(id => {
+                      const t = tareas.find(ta => ta.id === id)
+                      return t?.grupo_id === tarea.grupo_id
+                    })
                     return (
                       <div
-                        key={i}
-                        className="absolute rounded overflow-hidden flex items-center px-1 cursor-default"
+                        key={tarea.id}
+                        className={`absolute rounded overflow-hidden flex items-center px-1 cursor-move select-none ${isSelected ? 'ring-2 ring-blue-500 ring-offset-1' : isGrupoHighlight ? 'outline outline-2 outline-dashed outline-blue-400/60 outline-offset-1' : ''}`}
                         style={{ left, width, top: 4, bottom: 4, backgroundColor: color + 'cc', border: `1.5px solid ${color}` }}
                         title={`${tarea.descripcion} · ${tarea.hora_inicio} – ${tarea.hora_fin}`}
+                        onMouseDown={e => handleTaskMouseDown(e, tarea, 'move')}
+                        onClick={e => {
+                          e.stopPropagation()
+                          if (didDragRef.current) { didDragRef.current = false; return }
+                          if (e.ctrlKey || e.metaKey) {
+                            if (tareasSeleccionadas.includes(tarea.id)) {
+                              onSeleccionarTarea(tareasSeleccionadas.filter(id => id !== tarea.id))
+                            } else {
+                              onSeleccionarTarea([...tareasSeleccionadas, tarea.id])
+                            }
+                          } else {
+                            onSeleccionarTarea([tarea.id])
+                          }
+                        }}
                       >
                         {width > 40 && (
-                          <span className="text-[9px] font-bold text-white truncate leading-none drop-shadow-sm">
+                          <span className="text-[9px] font-bold text-white truncate leading-none drop-shadow-sm pointer-events-none">
                             {tarea.descripcion}
                           </span>
                         )}
+                        <div
+                          className="absolute top-0 bottom-0 left-0 w-1.5 cursor-ew-resize hover:bg-white/20"
+                          onMouseDown={e => { e.stopPropagation(); handleTaskMouseDown(e, tarea, 'resize-left') }}
+                        />
+                        <div
+                          className="absolute top-0 bottom-0 right-0 w-1.5 cursor-ew-resize hover:bg-white/20"
+                          onMouseDown={e => { e.stopPropagation(); handleTaskMouseDown(e, tarea, 'resize-right') }}
+                        />
                       </div>
                     )
                   })}
