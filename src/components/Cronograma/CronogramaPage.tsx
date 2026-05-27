@@ -357,19 +357,38 @@ export function CronogramaPage({ onSectionChange, onToggleMenu, onIrAConfiguraci
 
   const handleMoverMultiTareas = useCallback(async (movimientos: { tareaId: string; nuevaHoraInicio: string; nuevaHoraFin: string; nuevaLineaId?: string }[]) => {
     try {
-      let tareasOptimistas = [...tareas]
+      // Delta por tarea, para desplazar también sus recursos de máquina (que la acompañan).
+      const deltaPorTarea = new Map<string, number>()
       for (const mov of movimientos) {
-        tareasOptimistas = tareasOptimistas.map(t =>
-          t.id === mov.tareaId
-            ? { ...t, hora_inicio: mov.nuevaHoraInicio, hora_fin: mov.nuevaHoraFin, ...(mov.nuevaLineaId ? { linea_id: mov.nuevaLineaId } : {}) }
-            : t
-        )
+        const t = tareas.find(x => x.id === mov.tareaId)
+        if (t) deltaPorTarea.set(mov.tareaId, timeToMin(mov.nuevaHoraInicio) - timeToMin(t.hora_inicio))
       }
+      const recursosDesplazados = (t: CronogramaTarea) => {
+        const d = deltaPorTarea.get(t.id) ?? 0
+        if (!t.recursos_programados || d === 0) return t.recursos_programados
+        return t.recursos_programados.map(r => ({
+          ...r,
+          hora_inicio: minToTime(timeToMin(r.hora_inicio) + d),
+          hora_fin: minToTime(timeToMin(r.hora_fin) + d)
+        }))
+      }
+
+      const movSet = new Map(movimientos.map(m => [m.tareaId, m]))
+      const tareasOptimistas = tareas.map(t => {
+        const mov = movSet.get(t.id)
+        if (!mov) return t
+        return { ...t, hora_inicio: mov.nuevaHoraInicio, hora_fin: mov.nuevaHoraFin, recursos_programados: recursosDesplazados(t) ?? t.recursos_programados, ...(mov.nuevaLineaId ? { linea_id: mov.nuevaLineaId } : {}) }
+      })
       setTareas(tareasOptimistas)
 
       await Promise.all(movimientos.map(mov => {
-        const update: Record<string, string> = { hora_inicio: mov.nuevaHoraInicio, hora_fin: mov.nuevaHoraFin }
+        const t = tareas.find(x => x.id === mov.tareaId)
+        const update: ActualizarCronogramaTareaRequest = { hora_inicio: mov.nuevaHoraInicio, hora_fin: mov.nuevaHoraFin }
         if (mov.nuevaLineaId) update.linea_id = mov.nuevaLineaId
+        if (t) {
+          const desplazados = recursosDesplazados(t)
+          if (desplazados && desplazados !== t.recursos_programados) update.recursos_programados = desplazados
+        }
         return cronogramaService.actualizarTarea(mov.tareaId, update)
       }))
       const corregidas = await aplicarCambiosSolape(tareasOptimistas)

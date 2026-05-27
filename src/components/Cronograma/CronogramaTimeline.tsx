@@ -1696,7 +1696,9 @@ export function CronogramaTimeline({
                     />
                   ))}
                   {maq.blocks.map(({ tarea, r }, i) => {
-                    const left = minToPx(timeToMin(r.hora_inicio))
+                    // Si la tarea se está arrastrando, el recurso de máquina la acompaña por el mismo delta.
+                    const dragDelta = getTaskPos(tarea).start - timeToMin(tarea.hora_inicio)
+                    const left = minToPx(timeToMin(r.hora_inicio) + dragDelta)
                     const width = Math.max(4, (timeToMin(r.hora_fin) - timeToMin(r.hora_inicio)) * pxPerMin)
                     const color = getTaskColor(tarea)
                     const isSelected = tareasSeleccionadas.includes(tarea.id)
