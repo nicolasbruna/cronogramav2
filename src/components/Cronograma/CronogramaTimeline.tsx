@@ -93,6 +93,8 @@ export function CronogramaTimeline({
   const [scrollLeft, setScrollLeft] = useState(0)
   const scrollRafRef = useRef<number | null>(null)
   const [colorMode, setColorMode] = useState<'empleado' | 'proceso'>('empleado')
+  const [seccionesColapsadas, setSeccionesColapsadas] = useState<{ procesos: boolean; maquinas: boolean }>({ procesos: false, maquinas: false })
+  const toggleSeccion = (s: 'procesos' | 'maquinas') => setSeccionesColapsadas(prev => ({ ...prev, [s]: !prev[s] }))
 
   if (zoom !== internalZoom && pendingScrollRef.current === null && !isLocalZoomRef.current) {
     setInternalZoom(zoom)
@@ -1424,10 +1426,11 @@ export function CronogramaTimeline({
         {/* Sección de procesos autónomos en sidebar */}
         {procesosRows.length > 0 && (
           <>
-            <div className="h-8 flex items-center gap-1.5 px-3 bg-slate-700 border-t-2 border-slate-800">
+            <div className="h-8 flex items-center gap-1.5 px-3 bg-slate-700 border-t-2 border-slate-800 cursor-pointer select-none" onClick={() => toggleSeccion('procesos')}>
+              <span className="text-slate-300 text-[10px] w-2">{seccionesColapsadas.procesos ? '▸' : '▾'}</span>
               <span className="text-[9px] uppercase tracking-widest text-slate-300 font-extrabold">Procesos</span>
             </div>
-            {procesosRows.map(proc => (
+            {!seccionesColapsadas.procesos && procesosRows.map(proc => (
               <div key={proc.nombre} className="border-b border-slate-200 flex items-center gap-2 px-3 bg-white" style={{ height: MAQUINA_ROW_H + 'px' }}>
                 <span className="w-2 h-2 rounded-full flex-shrink-0" style={{ backgroundColor: proc.color }} />
                 <span className="text-[11px] font-semibold text-slate-700 truncate">{proc.nombre}</span>
@@ -1438,11 +1441,12 @@ export function CronogramaTimeline({
         {/* Sección de máquinas en sidebar */}
         {machineRows.length > 0 && (
           <>
-            <div className="h-8 flex items-center gap-1.5 px-3 bg-slate-800 border-t-2 border-slate-900">
+            <div className="h-8 flex items-center gap-1.5 px-3 bg-slate-800 border-t-2 border-slate-900 cursor-pointer select-none" onClick={() => toggleSeccion('maquinas')}>
+              <span className="text-slate-400 text-[10px] w-2">{seccionesColapsadas.maquinas ? '▸' : '▾'}</span>
               <Package size={11} className="text-slate-400 flex-shrink-0" />
               <span className="text-[9px] uppercase tracking-widest text-slate-400 font-extrabold">Máquinas</span>
             </div>
-            {machineRows.map(maq => (
+            {!seccionesColapsadas.maquinas && machineRows.map(maq => (
               <div key={maq.maquinaId} className="border-b border-slate-200 flex items-center gap-2 px-3 bg-white" style={{ height: MAQUINA_ROW_H + 'px' }}>
                 <Package size={11} className="text-slate-400 flex-shrink-0" />
                 <span className="text-[11px] font-semibold text-slate-700 truncate">{maq.maquinaNombre}</span>
@@ -1649,12 +1653,14 @@ export function CronogramaTimeline({
           {procesosRows.length > 0 && (
             <>
               <div
-                className="flex items-center gap-1.5 px-3 bg-slate-700 border-t-2 border-slate-800"
+                className="flex items-center gap-1.5 px-3 bg-slate-700 border-t-2 border-slate-800 cursor-pointer select-none"
                 style={{ width: chartWidth + 'px', height: '32px' }}
+                onClick={() => toggleSeccion('procesos')}
               >
+                <span className="text-slate-300 text-[10px] w-2">{seccionesColapsadas.procesos ? '▸' : '▾'}</span>
                 <span className="text-[9px] uppercase tracking-widest text-slate-300 font-extrabold">Procesos</span>
               </div>
-              {procesosRows.map(proc => (
+              {!seccionesColapsadas.procesos && procesosRows.map(proc => (
                 <div
                   key={proc.nombre}
                   className="relative border-b border-slate-200 bg-slate-50"
@@ -1729,12 +1735,14 @@ export function CronogramaTimeline({
           {machineRows.length > 0 && (
             <>
               <div
-                className="flex items-center gap-1.5 px-3 bg-slate-800 border-t-2 border-slate-900"
+                className="flex items-center gap-1.5 px-3 bg-slate-800 border-t-2 border-slate-900 cursor-pointer select-none"
                 style={{ width: chartWidth + 'px', height: '32px' }}
+                onClick={() => toggleSeccion('maquinas')}
               >
+                <span className="text-slate-400 text-[10px] w-2">{seccionesColapsadas.maquinas ? '▸' : '▾'}</span>
                 <span className="text-[9px] uppercase tracking-widest text-slate-400 font-extrabold">Recursos de máquinas</span>
               </div>
-              {machineRows.map(maq => (
+              {!seccionesColapsadas.maquinas && machineRows.map(maq => (
                 <div
                   key={maq.maquinaId}
                   className="relative border-b border-slate-200 bg-slate-50"
