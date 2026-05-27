@@ -21,6 +21,7 @@ const COLORES_PROCESO = [
 import { PlantillaProceso, PlantillaEtapa, Maquina, Habilidad, CrearEtapaRequest, TipoEtapa, COLORES_ETAPA, VentanaEmpleado, RecursoEtapa, EmpleadoEtapaSlot } from '../../types/planificacion'
 import { planificacionService } from '../../services/planificacionService'
 import { convertirLegacyAVentanas } from '../../services/etapaHelpers'
+import { generarId } from '../Cronograma/cronogramaHelpers'
 
 const TIPO_LABELS: Record<TipoEtapa, string> = {
   critica: 'Crítica',
@@ -900,7 +901,7 @@ function AyudantesEditor({ duracion, slots, habilidades, empleados, onChange }: 
 }) {
   const agregar = () => {
     const nuevo: EmpleadoEtapaSlot = {
-      id: crypto.randomUUID(),
+      id: generarId(),
       rol: 'ayudante',
       ventanas: [{ desde: 0, hasta: duracion }],
       habilidad_id: null,

@@ -32,3 +32,16 @@ export function getDiaSemanaHoy(): number {
   const now = new Date()
   return now.getDay()
 }
+
+// UUID con respaldo: crypto.randomUUID solo existe en contextos seguros (HTTPS o localhost). La app se
+// sirve por IP/HTTP en la red local, donde no está disponible; ahí se usa un v4 basado en Math.random.
+export function generarId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID()
+  }
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+    const r = (Math.random() * 16) | 0
+    const v = c === 'x' ? r : (r & 0x3) | 0x8
+    return v.toString(16)
+  })
+}

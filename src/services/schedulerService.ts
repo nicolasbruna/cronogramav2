@@ -5,7 +5,7 @@ import {
   OcupacionEmpleado, SchedulerOverrides, MotivoConflicto, MetricasJornada, SolucionConflicto
 } from '../types/scheduler'
 import { recursosDeEtapa, slotsDeEtapa } from './etapaHelpers'
-import { timeToMin, minToTime, formatDuration } from '../components/Cronograma/cronogramaHelpers'
+import { timeToMin, minToTime, formatDuration, generarId } from '../components/Cronograma/cronogramaHelpers'
 import { cronogramaService } from './cronogramaService'
 import { planificacionService } from './planificacionService'
 import { configuracionService } from './configuracionService'
@@ -786,7 +786,7 @@ async function materializarInstancia(inst: InstanciaEtapa, dia: number): Promise
   // Se materializa el "cuerpo del proceso" (autónomo, con la máquina) + un bloque corto por cada ventana
   // de presencia (toques), todos vinculados con un mismo grupo.
   if (principal && !cubreContinuo(principal.ventanasAbs, inst.inicioAbs!, inst.finAbs!)) {
-    const grupoId = crypto.randomUUID()
+    const grupoId = generarId()
 
     // Cuerpo del proceso: ocupa la máquina toda la duración, sin empleado.
     await cronogramaService.crearTarea({

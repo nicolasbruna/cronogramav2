@@ -1,4 +1,5 @@
 import { supabase } from '../config/supabase'
+import { generarId } from '../components/Cronograma/cronogramaHelpers'
 import {
   CronogramaLinea,
   CronogramaTarea,
@@ -487,7 +488,7 @@ export const cronogramaService = {
   },
 
   async agruparTareas(tareaIds: string[]): Promise<string> {
-    const grupoId = crypto.randomUUID()
+    const grupoId = generarId()
     const { error } = await supabase
       .from('cronograma_tareas')
       .update({ grupo_id: grupoId })
