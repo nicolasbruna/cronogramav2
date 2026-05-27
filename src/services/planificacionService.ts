@@ -299,7 +299,7 @@ export const planificacionService = {
     return data
   },
 
-  async actualizarPlanDiaItem(id: string, req: Partial<Pick<PlanDiaItem, 'cantidad_lotes' | 'prioridad' | 'activo' | 'hora_inicio_min' | 'hora_inicio_max' | 'hora_fin_max'>>): Promise<void> {
+  async actualizarPlanDiaItem(id: string, req: Partial<Pick<PlanDiaItem, 'cantidad_lotes' | 'prioridad' | 'activo' | 'hora_inicio_min' | 'hora_inicio_max' | 'hora_fin_max' | 'empleado_preferido_modo' | 'empleado_preferido_override_id'>>): Promise<void> {
     const { error } = await supabase
       .from('plan_dia')
       .update(req)

@@ -15,6 +15,7 @@ interface PlanificarPageProps {
 export function PlanificarPage({ diaActual, onVolver }: PlanificarPageProps) {
   const [cola, setCola] = useState<PlanDiaItem[]>([])
   const [plantillas, setPlantillas] = useState<PlantillaProceso[]>([])
+  const [empleados, setEmpleados] = useState<{ id: string; nombre_completo: string }[]>([])
   const [loading, setLoading] = useState(false)
   const [generando, setGenerando] = useState(false)
   const [aplicando, setAplicando] = useState(false)
@@ -33,12 +34,14 @@ export function PlanificarPage({ diaActual, onVolver }: PlanificarPageProps) {
   const cargar = useCallback(async () => {
     setLoading(true)
     try {
-      const [c, p] = await Promise.all([
+      const [c, p, emps] = await Promise.all([
         planificacionService.listarPlanDia(diaActual),
-        planificacionService.listarPlantillas()
+        planificacionService.listarPlantillas(),
+        planificacionService.listarEmpleadosConHabilidades()
       ])
       setCola(c)
       setPlantillas(p.filter(pl => pl.activa))
+      setEmpleados(emps.map(e => ({ id: e.id, nombre_completo: e.nombre_completo })))
     } catch (err) {
       console.error('Error cargando planificación:', err)
     } finally {
@@ -109,6 +112,24 @@ export function PlanificarPage({ diaActual, onVolver }: PlanificarPageProps) {
       console.error('Error actualizando horario:', err)
     }
   }
+
+  // Override del empleado preferido del proceso para este día. '' = heredar plantilla,
+  // '__ninguno__' = sin preferido este día, otro = fijar ese empleado.
+  const cambiarPreferido = async (id: string, valor: string) => {
+    const modo = valor === '' ? 'heredar' : valor === '__ninguno__' ? 'ninguno' : 'fijar'
+    const override = modo === 'fijar' ? valor : null
+    setCola(prev => prev.map(i => i.id === id ? { ...i, empleado_preferido_modo: modo, empleado_preferido_override_id: override } : i))
+    try {
+      await planificacionService.actualizarPlanDiaItem(id, { empleado_preferido_modo: modo, empleado_preferido_override_id: override })
+      setPreparada(null)
+    } catch (err) {
+      console.error('Error actualizando empleado preferido:', err)
+    }
+  }
+  const valorSelectPreferido = (item: PlanDiaItem): string =>
+    item.empleado_preferido_modo === 'fijar' ? (item.empleado_preferido_override_id ?? '')
+      : item.empleado_preferido_modo === 'ninguno' ? '__ninguno__' : ''
+  const nombreEmpleado = (id: string | null | undefined) => empleados.find(e => e.id === id)?.nombre_completo
 
   const generar = async () => {
     setGenerando(true)
@@ -204,6 +225,7 @@ export function PlanificarPage({ diaActual, onVolver }: PlanificarPageProps) {
                       <th className="text-center px-1 py-2 font-bold text-slate-600 w-[66px]" title="No empezar antes de (solo este día)">Inicio</th>
                       <th className="text-center px-1 py-2 font-bold text-slate-600 w-[66px]" title="Empezar a más tardar (solo este día)">Tope ini.</th>
                       <th className="text-center px-1 py-2 font-bold text-slate-600 w-[66px]" title="Terminar a más tardar (solo este día)">Fin</th>
+                      <th className="text-center px-1 py-2 font-bold text-slate-600" title="Empleado preferido del proceso (solo este día)">Empleado</th>
                       <th className="w-[36px]"></th>
                     </tr>
                   </thead>
@@ -236,13 +258,22 @@ export function PlanificarPage({ diaActual, onVolver }: PlanificarPageProps) {
                             onChange={e => cambiarHorario(item.id, 'hora_fin_max', e.target.value)}
                             className="w-[62px] h-7 px-1 text-center bg-white text-slate-900 border border-slate-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-400" />
                         </td>
+                        <td className="px-1 py-1.5">
+                          <select value={valorSelectPreferido(item)}
+                            onChange={e => cambiarPreferido(item.id, e.target.value)}
+                            className="w-full max-w-[150px] h-7 px-1 text-[11px] bg-white text-slate-900 border border-slate-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-400">
+                            <option value="">Heredar{nombreEmpleado(item.plantilla?.empleado_preferido_id) ? ` (${nombreEmpleado(item.plantilla?.empleado_preferido_id)})` : ' (sin preferido)'}</option>
+                            {empleados.map(e => <option key={e.id} value={e.id}>{e.nombre_completo}</option>)}
+                            <option value="__ninguno__">Sin preferido este día</option>
+                          </select>
+                        </td>
                         <td className="px-1 py-1.5 text-center">
                           <button onClick={() => eliminarItem(item.id)} className="text-red-500 hover:text-red-700"><Trash2 size={13} /></button>
                         </td>
                       </tr>
                     ))}
                     {cola.length === 0 && (
-                      <tr><td colSpan={7} className="px-3 py-4 text-center text-slate-400">Cola vacía — agregá plantillas abajo</td></tr>
+                      <tr><td colSpan={8} className="px-3 py-4 text-center text-slate-400">Cola vacía — agregá plantillas abajo</td></tr>
                     )}
                   </tbody>
                 </table>
