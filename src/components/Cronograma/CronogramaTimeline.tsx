@@ -1709,12 +1709,26 @@ export function CronogramaTimeline({
                     return (
                       <div
                         key={i}
-                        className={`absolute rounded overflow-hidden flex items-center px-1 cursor-default ${isSelected ? 'ring-2 ring-blue-500 ring-offset-1' : isGrupoHighlight ? 'outline outline-2 outline-dashed outline-blue-400/60 outline-offset-1' : ''}`}
+                        className={`absolute rounded overflow-hidden flex items-center px-1 cursor-move select-none ${isSelected ? 'ring-2 ring-blue-500 ring-offset-1' : isGrupoHighlight ? 'outline outline-2 outline-dashed outline-blue-400/60 outline-offset-1' : ''}`}
                         style={{ left, width, top: 5, bottom: 5, backgroundColor: color + 'cc', border: `1.5px solid ${color}` }}
                         title={`${tarea.descripcion} · ${r.hora_inicio} – ${r.hora_fin}`}
+                        onMouseDown={e => handleTaskMouseDown(e, tarea, 'move')}
+                        onClick={e => {
+                          e.stopPropagation()
+                          if (didDragRef.current) { didDragRef.current = false; return }
+                          if (e.ctrlKey || e.metaKey) {
+                            if (tareasSeleccionadas.includes(tarea.id)) {
+                              onSeleccionarTarea(tareasSeleccionadas.filter(id => id !== tarea.id))
+                            } else {
+                              onSeleccionarTarea([...tareasSeleccionadas, tarea.id])
+                            }
+                          } else {
+                            onSeleccionarTarea([tarea.id])
+                          }
+                        }}
                       >
                         {width > 40 && (
-                          <span className="text-[9px] font-bold text-white truncate leading-none drop-shadow-sm">
+                          <span className="text-[9px] font-bold text-white truncate leading-none drop-shadow-sm pointer-events-none">
                             {tarea.descripcion}
                           </span>
                         )}
