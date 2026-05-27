@@ -17,6 +17,7 @@ export interface RecursoProgramadoCronograma {
   maquina_nombre: string
   hora_inicio: string
   hora_fin: string
+  uso?: number   // cuánto de la capacidad de la máquina ocupa (para el % de uso)
 }
 
 export interface CronogramaTarea {

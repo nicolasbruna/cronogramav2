@@ -733,6 +733,50 @@ export async function generarParaDia(dia: number, overrides: SchedulerOverrides 
   return { ctx, resultado, idsReemplazables: reemplazables.map(t => t.id) }
 }
 
+// Calcula un grupo_id por cada CADENA conectada (componente conexo de dependencias) dentro de cada
+// proceso (plantilla+lote). Las etapas sin dependencias (preparables con antelación) quedan sueltas.
+// Devuelve Map<inst.key, grupoId> solo para las etapas que pertenecen a una cadena de ≥2 etapas.
+function calcularGruposCadena(colocadas: InstanciaEtapa[]): Map<string, string> {
+  const grupoPorKey = new Map<string, string>()
+  const porProceso = new Map<string, InstanciaEtapa[]>()
+  for (const inst of colocadas) {
+    const k = `${inst.plantillaId}:${inst.lote}`
+    const arr = porProceso.get(k)
+    if (arr) arr.push(inst); else porProceso.set(k, [inst])
+  }
+  for (const insts of porProceso.values()) {
+    const parent = new Map<string, string>()
+    for (const i of insts) parent.set(i.etapa.id, i.etapa.id)
+    const find = (x: string): string => {
+      let r = x
+      while (parent.get(r) !== r) r = parent.get(r)!
+      while (parent.get(x) !== r) { const n = parent.get(x)!; parent.set(x, r); x = n }
+      return r
+    }
+    for (const i of insts) {
+      for (const depId of (i.etapa.dependencias ?? [])) {
+        if (parent.has(depId)) {
+          const ra = find(i.etapa.id), rb = find(depId)
+          if (ra !== rb) parent.set(ra, rb)
+        }
+      }
+    }
+    const comp = new Map<string, InstanciaEtapa[]>()
+    for (const i of insts) {
+      const r = find(i.etapa.id)
+      const arr = comp.get(r)
+      if (arr) arr.push(i); else comp.set(r, [i])
+    }
+    for (const miembros of comp.values()) {
+      if (miembros.length >= 2) {
+        const gid = generarId()
+        for (const m of miembros) grupoPorKey.set(m.key, gid)
+      }
+    }
+  }
+  return grupoPorKey
+}
+
 // Aplica el resultado: backup, borra reemplazables, crea las tareas colocadas, aplica solape.
 export async function aplicarResultado(dia: number, resultado: ResultadoScheduler, idsReemplazables: string[]): Promise<void> {
   await cronogramaService.guardarVersion(
@@ -743,8 +787,9 @@ export async function aplicarResultado(dia: number, resultado: ResultadoSchedule
   )
   for (const id of idsReemplazables) await cronogramaService.eliminarTarea(id)
 
+  const gruposCadena = calcularGruposCadena(resultado.instancias.filter(i => i.estado === 'colocada'))
   for (const inst of resultado.instancias) {
-    if (inst.estado === 'colocada') await materializarInstancia(inst, dia)
+    if (inst.estado === 'colocada') await materializarInstancia(inst, dia, gruposCadena.get(inst.key))
   }
 
   // Penalización por solapamiento sobre el resultado final
@@ -779,13 +824,14 @@ function cubreContinuo(ventanas: IntervaloAbs[], inicio: number, fin: number): b
   return cursor >= fin
 }
 
-async function materializarInstancia(inst: InstanciaEtapa, dia: number): Promise<void> {
+async function materializarInstancia(inst: InstanciaEtapa, dia: number, grupoIdCadena?: string): Promise<void> {
   const dur = inst.finAbs! - inst.inicioAbs!
   const recursos_programados: RecursoProgramadoCronograma[] = inst.recursosAbs.map(r => ({
     maquina_id: r.maquinaId,
     maquina_nombre: r.maquinaNombre,
     hora_inicio: minToTime(r.intervalo.inicio),
-    hora_fin: minToTime(r.intervalo.fin)
+    hora_fin: minToTime(r.intervalo.fin),
+    uso: r.uso
   }))
 
   const principal = inst.asignaciones.find(a => a.rol === 'principal') ?? inst.asignaciones[0]
@@ -794,7 +840,9 @@ async function materializarInstancia(inst: InstanciaEtapa, dia: number): Promise
   // Se materializa el "cuerpo del proceso" (autónomo, con la máquina) + un bloque corto por cada ventana
   // de presencia (toques), todos vinculados con un mismo grupo.
   if (principal && !cubreContinuo(principal.ventanasAbs, inst.inicioAbs!, inst.finAbs!)) {
-    const grupoId = generarId()
+    // Si la etapa pertenece a una cadena, todo (cuerpo + toques + resto de la cadena) comparte ese
+    // grupo; si está suelta, cuerpo y toques se agrupan entre sí con uno propio.
+    const grupoId = grupoIdCadena ?? generarId()
 
     // Cuerpo del proceso: ocupa la máquina toda la duración, sin empleado.
     await cronogramaService.crearTarea({
@@ -874,6 +922,7 @@ async function materializarInstancia(inst: InstanciaEtapa, dia: number): Promise
     permite_solape: inst.etapa.permite_solape ?? false,
     duracion_base_min: dur,
     recursos_programados,
+    grupo_id: grupoIdCadena ?? null,
     tamano: 5,
     fila: 0
   })
@@ -898,6 +947,7 @@ async function materializarInstancia(inst: InstanciaEtapa, dia: number): Promise
       lote: inst.lote,
       permite_solape: inst.etapa.permite_solape ?? false,
       duracion_base_min: fin - ini,
+      grupo_id: grupoIdCadena ?? null,
       tamano: 5,
       fila: 0
     })
