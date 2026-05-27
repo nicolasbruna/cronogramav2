@@ -328,6 +328,42 @@ export function CronogramaTimeline({
     return Math.max(0, Math.min(5 - tamano, best))
   }, [tareasporLinea, snapHorarioOriginal])
 
+  // Recursos (bloques de máquina) indexados por máquina, para el imán entre tareas que comparten máquina.
+  const recursosPorMaquina = useMemo(() => {
+    const map: Record<string, { tareaId: string; inicio: number; fin: number }[]> = {}
+    for (const t of tareas) {
+      for (const r of (t.recursos_programados || [])) {
+        (map[r.maquina_id] ||= []).push({ tareaId: t.id, inicio: timeToMin(r.hora_inicio), fin: timeToMin(r.hora_fin) })
+      }
+    }
+    return map
+  }, [tareas])
+
+  // Imán de máquina: ajusta el inicio de la tarea para que algún borde de sus recursos coincida con el
+  // borde de otro recurso en la MISMA máquina (evita huecos/solapes al mover ocupando una máquina).
+  const magnetSnapMaquina = useCallback((taskStart: number, tareaId: string): number => {
+    const tarea = tareas.find(t => t.id === tareaId)
+    if (!tarea?.recursos_programados?.length) return taskStart
+    const thresholdMin = MAGNET_PX / pxPerMin
+    const taskInicio = timeToMin(tarea.hora_inicio)
+    let best = taskStart
+    let bestDist = thresholdMin + 1
+    for (const r of tarea.recursos_programados) {
+      const offset = timeToMin(r.hora_inicio) - taskInicio
+      const durR = timeToMin(r.hora_fin) - timeToMin(r.hora_inicio)
+      for (const o of (recursosPorMaquina[r.maquina_id] || [])) {
+        if (o.tareaId === tareaId) continue
+        for (const borde of [o.inicio, o.fin]) {
+          for (const cand of [borde - offset, borde - offset - durR]) {
+            const d = Math.abs(cand - taskStart)
+            if (d < bestDist) { bestDist = d; best = cand }
+          }
+        }
+      }
+    }
+    return bestDist <= thresholdMin ? best : taskStart
+  }, [tareas, recursosPorMaquina, pxPerMin])
+
   // --- Drag handlers ---
   interface DragState {
     tareaId: string
@@ -497,8 +533,14 @@ export function CronogramaTimeline({
           }
 
           const snapLineaId = dragRef.current.currentLineaId
-          const sSnap = magnetSnap(ns, dragRef.current.tareaId, snapLineaId)
-          if (sSnap !== ns) { ns = sSnap; ne = ns + dur }
+          // Imán: bordes de tareas en la misma línea y bordes de recursos en la misma máquina; gana el más cercano.
+          const sLinea = magnetSnap(ns, dragRef.current.tareaId, snapLineaId)
+          const sMaquina = magnetSnapMaquina(ns, dragRef.current.tareaId)
+          const candidatos = [sLinea, sMaquina].filter(s => s !== ns)
+          if (candidatos.length > 0) {
+            const best = candidatos.reduce((a, b) => Math.abs(b - ns) < Math.abs(a - ns) ? b : a)
+            ns = best; ne = ns + dur
+          }
 
           // Snap al horario original cuando se mueve a otra línea
           if (snapHorarioOriginal && snapLineaId !== dragRef.current.origLineaId) {
@@ -613,7 +655,7 @@ export function CronogramaTimeline({
       document.removeEventListener('mousemove', handleMouseMove)
       document.removeEventListener('mouseup', handleMouseUp)
     }
-  }, [pxPerMin, startMin, endMin, magnetSnap, magnetSnapFila, pxToMinFn, onMoverTarea, onMoverMultiTareas, onResizeTarea, onCrearTarea, detectLineaUnderCursor, onSeleccionarTarea, tareasSeleccionadas, tareas, effRowH, onCambiarTamano, onCambiarFila, snapHorarioOriginal])
+  }, [pxPerMin, startMin, endMin, magnetSnap, magnetSnapFila, magnetSnapMaquina, pxToMinFn, onMoverTarea, onMoverMultiTareas, onResizeTarea, onCrearTarea, detectLineaUnderCursor, onSeleccionarTarea, tareasSeleccionadas, tareas, effRowH, onCambiarTamano, onCambiarFila, snapHorarioOriginal])
 
   // Get task position (considering drag state)
   const getTaskPos = (tarea: CronogramaTarea) => {
