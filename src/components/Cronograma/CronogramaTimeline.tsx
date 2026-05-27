@@ -1798,7 +1798,7 @@ export function CronogramaTimeline({
                       >
                         {width > 28 && (
                           <span className="text-[9px] font-bold text-white truncate leading-none drop-shadow-sm pointer-events-none">
-                            {pct}%{width > 90 ? ` · ${tarea.descripcion}` : ''}
+                            {tarea.descripcion} · {pct}%
                           </span>
                         )}
                       </div>
