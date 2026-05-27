@@ -43,7 +43,7 @@ export function PlantillasTab() {
 
   const [creandoPlantilla, setCreandoPlantilla] = useState(false)
   const [editandoPlantillaId, setEditandoPlantillaId] = useState<string | null>(null)
-  const [formPlantilla, setFormPlantilla] = useState({ nombre: '', descripcion: '', categoria: '', color: '', hora_inicio_min: '', hora_inicio_max: '', hora_fin_max: '', permite_solape: false, atencion_exclusiva: false })
+  const [formPlantilla, setFormPlantilla] = useState({ nombre: '', descripcion: '', categoria: '', color: '', hora_inicio_min: '', hora_inicio_max: '', hora_fin_max: '', permite_solape: false, atencion_exclusiva: false, empleado_preferido_id: '', puede_reemplazarse: true })
 
   const [creandoEtapa, setCreandoEtapa] = useState(false)
   const [editandoEtapaId, setEditandoEtapaId] = useState<string | null>(null)
@@ -103,7 +103,9 @@ export function PlantillasTab() {
         hora_inicio_max: formPlantilla.hora_inicio_max || null,
         hora_fin_max: formPlantilla.hora_fin_max || null,
         permite_solape: formPlantilla.permite_solape,
-        atencion_exclusiva: formPlantilla.atencion_exclusiva
+        atencion_exclusiva: formPlantilla.atencion_exclusiva,
+        empleado_preferido_id: formPlantilla.empleado_preferido_id || null,
+        puede_reemplazarse: formPlantilla.puede_reemplazarse
       })
       await cargar()
       setCreandoPlantilla(false)
@@ -118,7 +120,9 @@ export function PlantillasTab() {
         hora_inicio_max: formPlantilla.hora_inicio_max || null,
         hora_fin_max: formPlantilla.hora_fin_max || null,
         permite_solape: formPlantilla.permite_solape,
-        atencion_exclusiva: formPlantilla.atencion_exclusiva
+        atencion_exclusiva: formPlantilla.atencion_exclusiva,
+        empleado_preferido_id: formPlantilla.empleado_preferido_id || null,
+        puede_reemplazarse: formPlantilla.puede_reemplazarse
       })
       await cargar()
       setEditandoPlantillaId(null)
@@ -269,7 +273,7 @@ export function PlantillasTab() {
         <div className="flex items-center justify-between">
           <span className="text-[11px] font-bold text-slate-600 uppercase tracking-wider">Plantillas</span>
           <button
-            onClick={() => { setFormPlantilla({ nombre: '', descripcion: '', categoria: '', color: '', hora_inicio_min: '', hora_inicio_max: '', hora_fin_max: '', permite_solape: false, atencion_exclusiva: false }); setCreandoPlantilla(true); setEditandoPlantillaId(null) }}
+            onClick={() => { setFormPlantilla({ nombre: '', descripcion: '', categoria: '', color: '', hora_inicio_min: '', hora_inicio_max: '', hora_fin_max: '', permite_solape: false, atencion_exclusiva: false, empleado_preferido_id: '', puede_reemplazarse: true }); setCreandoPlantilla(true); setEditandoPlantillaId(null) }}
             className="h-7 px-2 text-[11px] font-semibold rounded-md bg-slate-900 text-white hover:bg-slate-700 flex items-center gap-1"
           >
             <Plus size={11} /> Nueva
@@ -298,6 +302,23 @@ export function PlantillasTab() {
                 <button onClick={() => setFormPlantilla(prev => ({ ...prev, color: '' }))}
                   className={`w-5 h-5 rounded-full border-2 bg-slate-200 text-slate-400 text-[8px] flex items-center justify-center ${!formPlantilla.color ? 'border-slate-700' : 'border-transparent'}`}>∅</button>
               </div>
+            </div>
+            <div className="mb-2">
+              <p className="text-[10px] text-slate-500 mb-1">Empleado preferido del proceso</p>
+              <select value={formPlantilla.empleado_preferido_id}
+                onChange={e => setFormPlantilla(prev => ({ ...prev, empleado_preferido_id: e.target.value }))}
+                className="w-full h-8 px-2 text-[12px] border border-slate-300 rounded-md bg-white focus:outline-none focus:ring-1 focus:ring-blue-400">
+                <option value="">Sin preferido</option>
+                {empleados.map(e => <option key={e.id} value={e.id}>{e.nombre_completo}</option>)}
+              </select>
+              {formPlantilla.empleado_preferido_id && (
+                <label className="flex items-center gap-2 cursor-pointer select-none mt-1.5">
+                  <input type="checkbox" checked={formPlantilla.puede_reemplazarse}
+                    onChange={e => setFormPlantilla(prev => ({ ...prev, puede_reemplazarse: e.target.checked }))}
+                    className="w-3.5 h-3.5 rounded border-slate-300 accent-sky-600" />
+                  <span className="text-[11px] text-slate-700">Puede reemplazarse si no está disponible</span>
+                </label>
+              )}
             </div>
             <div className="mb-2">
               <p className="text-[10px] text-slate-500 mb-1">Restricciones horarias</p>
@@ -374,6 +395,23 @@ export function PlantillasTab() {
                         className={`w-5 h-5 rounded-full border-2 bg-slate-200 text-slate-400 text-[8px] flex items-center justify-center ${!formPlantilla.color ? 'border-slate-700' : 'border-transparent'}`}>∅</button>
                     </div>
                   </div>
+                  <div className="mb-1.5">
+                    <label className="text-[9px] text-slate-400 block mb-0.5">Empleado preferido del proceso</label>
+                    <select value={formPlantilla.empleado_preferido_id}
+                      onChange={e => setFormPlantilla(prev => ({ ...prev, empleado_preferido_id: e.target.value }))}
+                      className="w-full h-7 px-1.5 text-[11px] bg-white text-slate-900 border border-slate-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-400">
+                      <option value="">Sin preferido</option>
+                      {empleados.map(e => <option key={e.id} value={e.id}>{e.nombre_completo}</option>)}
+                    </select>
+                    {formPlantilla.empleado_preferido_id && (
+                      <label className="flex items-center gap-1.5 cursor-pointer select-none mt-1">
+                        <input type="checkbox" checked={formPlantilla.puede_reemplazarse}
+                          onChange={e => setFormPlantilla(prev => ({ ...prev, puede_reemplazarse: e.target.checked }))}
+                          className="w-3.5 h-3.5 rounded border-slate-300 accent-sky-600" />
+                        <span className="text-[10px] text-slate-600 leading-tight">Puede reemplazarse si no está disponible</span>
+                      </label>
+                    )}
+                  </div>
                   <div className="flex gap-1.5 mb-1.5">
                     <div className="flex-1">
                       <label className="text-[9px] text-slate-400 block mb-0.5">Desde</label>
@@ -446,7 +484,7 @@ export function PlantillasTab() {
                   <div className={`flex items-center gap-0.5 flex-shrink-0 opacity-0 group-hover:opacity-100 transition-opacity ${plantillaSeleccionada?.id === p.id ? 'opacity-100' : ''}`}>
                     <button
                       className={`w-5 h-5 flex items-center justify-center rounded hover:bg-white/20 ${plantillaSeleccionada?.id === p.id ? 'text-slate-300' : 'text-slate-400'}`}
-                      onClick={e => { e.stopPropagation(); setFormPlantilla({ nombre: p.nombre, descripcion: p.descripcion || '', categoria: p.categoria || '', color: p.color || '', hora_inicio_min: p.hora_inicio_min?.slice(0, 5) ?? '', hora_inicio_max: p.hora_inicio_max?.slice(0, 5) ?? '', hora_fin_max: p.hora_fin_max?.slice(0, 5) ?? '', permite_solape: p.permite_solape ?? false, atencion_exclusiva: p.atencion_exclusiva ?? false }); setEditandoPlantillaId(p.id); setCreandoPlantilla(false) }}>
+                      onClick={e => { e.stopPropagation(); setFormPlantilla({ nombre: p.nombre, descripcion: p.descripcion || '', categoria: p.categoria || '', color: p.color || '', hora_inicio_min: p.hora_inicio_min?.slice(0, 5) ?? '', hora_inicio_max: p.hora_inicio_max?.slice(0, 5) ?? '', hora_fin_max: p.hora_fin_max?.slice(0, 5) ?? '', permite_solape: p.permite_solape ?? false, atencion_exclusiva: p.atencion_exclusiva ?? false, empleado_preferido_id: p.empleado_preferido_id ?? '', puede_reemplazarse: p.puede_reemplazarse ?? true }); setEditandoPlantillaId(p.id); setCreandoPlantilla(false) }}>
                       <Edit2 size={11} />
                     </button>
                     <button onClick={e => { e.stopPropagation(); eliminarPlantilla(p.id, p.nombre) }}
