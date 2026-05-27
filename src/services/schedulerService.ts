@@ -733,10 +733,11 @@ export async function generarParaDia(dia: number, overrides: SchedulerOverrides 
   return { ctx, resultado, idsReemplazables: reemplazables.map(t => t.id) }
 }
 
-// Calcula un grupo_id por cada CADENA conectada (componente conexo de dependencias) dentro de cada
-// proceso (plantilla+lote). Las etapas sin dependencias (preparables con antelación) quedan sueltas.
-// Devuelve Map<inst.key, grupoId> solo para las etapas que pertenecen a una cadena de ≥2 etapas.
-function calcularGruposCadena(colocadas: InstanciaEtapa[]): Map<string, string> {
+// Calcula un grupo_id por cada secuencia de etapas CONTIGUAS en el tiempo (una justo detrás de la otra:
+// el fin de una coincide exactamente con el inicio de la otra) dentro de un mismo proceso
+// (plantilla+lote). Donde hay un hueco entre etapas, el grupo se corta. Devuelve Map<inst.key, grupoId>
+// solo para las etapas que forman parte de un tramo contiguo de ≥2 etapas.
+function calcularGruposContiguos(colocadas: InstanciaEtapa[]): Map<string, string> {
   const grupoPorKey = new Map<string, string>()
   const porProceso = new Map<string, InstanciaEtapa[]>()
   for (const inst of colocadas) {
@@ -746,24 +747,26 @@ function calcularGruposCadena(colocadas: InstanciaEtapa[]): Map<string, string> 
   }
   for (const insts of porProceso.values()) {
     const parent = new Map<string, string>()
-    for (const i of insts) parent.set(i.etapa.id, i.etapa.id)
+    for (const i of insts) parent.set(i.key, i.key)
     const find = (x: string): string => {
       let r = x
       while (parent.get(r) !== r) r = parent.get(r)!
       while (parent.get(x) !== r) { const n = parent.get(x)!; parent.set(x, r); x = n }
       return r
     }
-    for (const i of insts) {
-      for (const depId of (i.etapa.dependencias ?? [])) {
-        if (parent.has(depId)) {
-          const ra = find(i.etapa.id), rb = find(depId)
+    // Unir etapas pegadas en el tiempo: A.finAbs === B.inicioAbs (sin hueco).
+    for (const a of insts) {
+      for (const b of insts) {
+        if (a === b || a.finAbs == null || b.inicioAbs == null) continue
+        if (a.finAbs === b.inicioAbs) {
+          const ra = find(a.key), rb = find(b.key)
           if (ra !== rb) parent.set(ra, rb)
         }
       }
     }
     const comp = new Map<string, InstanciaEtapa[]>()
     for (const i of insts) {
-      const r = find(i.etapa.id)
+      const r = find(i.key)
       const arr = comp.get(r)
       if (arr) arr.push(i); else comp.set(r, [i])
     }
@@ -787,9 +790,9 @@ export async function aplicarResultado(dia: number, resultado: ResultadoSchedule
   )
   for (const id of idsReemplazables) await cronogramaService.eliminarTarea(id)
 
-  const gruposCadena = calcularGruposCadena(resultado.instancias.filter(i => i.estado === 'colocada'))
+  const gruposContiguos = calcularGruposContiguos(resultado.instancias.filter(i => i.estado === 'colocada'))
   for (const inst of resultado.instancias) {
-    if (inst.estado === 'colocada') await materializarInstancia(inst, dia, gruposCadena.get(inst.key))
+    if (inst.estado === 'colocada') await materializarInstancia(inst, dia, gruposContiguos.get(inst.key))
   }
 
   // Penalización por solapamiento sobre el resultado final
