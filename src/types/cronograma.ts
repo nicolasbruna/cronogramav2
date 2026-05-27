@@ -93,6 +93,7 @@ export interface CrearCronogramaTareaRequest {
   duracion_base_min?: number | null
   factor_solape_pct?: number | null
   solape_modo?: string | null
+  grupo_id?: string | null
 }
 
 export interface ActualizarCronogramaTareaRequest {

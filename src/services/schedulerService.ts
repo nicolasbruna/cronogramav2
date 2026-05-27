@@ -758,6 +758,19 @@ export async function aplicarResultado(dia: number, resultado: ResultadoSchedule
   ))
 }
 
+// ¿Las ventanas cubren CONTINUAMENTE el intervalo [inicio, fin] (sin huecos)? Si no, la etapa es de
+// "atención puntual": el empleado solo está presente en ratos sueltos (p.ej. arrancar y sacar) y queda
+// libre en el medio.
+function cubreContinuo(ventanas: IntervaloAbs[], inicio: number, fin: number): boolean {
+  if (ventanas.length === 0) return false
+  let cursor = inicio
+  for (const v of [...ventanas].sort((a, b) => a.inicio - b.inicio)) {
+    if (v.inicio > cursor) return false  // hueco antes de esta ventana
+    cursor = Math.max(cursor, v.fin)
+  }
+  return cursor >= fin
+}
+
 async function materializarInstancia(inst: InstanciaEtapa, dia: number): Promise<void> {
   const dur = inst.finAbs! - inst.inicioAbs!
   const recursos_programados: RecursoProgramadoCronograma[] = inst.recursosAbs.map(r => ({
@@ -768,6 +781,67 @@ async function materializarInstancia(inst: InstanciaEtapa, dia: number): Promise
   }))
 
   const principal = inst.asignaciones.find(a => a.rol === 'principal') ?? inst.asignaciones[0]
+
+  // Atención puntual: hay empleado, pero su presencia NO cubre toda la etapa (queda libre en el medio).
+  // Se materializa el "cuerpo del proceso" (autónomo, con la máquina) + un bloque corto por cada ventana
+  // de presencia (toques), todos vinculados con un mismo grupo.
+  if (principal && !cubreContinuo(principal.ventanasAbs, inst.inicioAbs!, inst.finAbs!)) {
+    const grupoId = crypto.randomUUID()
+
+    // Cuerpo del proceso: ocupa la máquina toda la duración, sin empleado.
+    await cronogramaService.crearTarea({
+      linea_id: null,
+      dia_semana: dia,
+      hora_inicio: minToTime(inst.inicioAbs!),
+      hora_fin: minToTime(inst.finAbs!),
+      descripcion: `${inst.etapa.nombre} · ${inst.plantillaNombre}`,
+      color: inst.etapa.color ?? null,
+      plantilla_id: inst.plantillaId,
+      etapa_orden: inst.etapa.orden,
+      lote: inst.lote,
+      dependencias: [],
+      prerequisitos: [],
+      permite_solape: inst.etapa.permite_solape ?? false,
+      duracion_base_min: dur,
+      recursos_programados,
+      grupo_id: grupoId,
+      tamano: 5,
+      fila: 0
+    })
+
+    // Toques: un bloque corto por cada ventana de cada asignación (principal + ayudantes). Sin máquina
+    // (ya va en el cuerpo) para no duplicarla en "Recursos de máquinas".
+    for (const a of inst.asignaciones) {
+      const li = inst.etapa.permite_solape
+        ? await cronogramaService.asegurarLineaParalela(a.empleadoId, dia)
+        : await cronogramaService.asegurarLineaExiste(a.empleadoId, dia)
+      const ventanas = [...a.ventanasAbs].sort((x, y) => x.inicio - y.inicio)
+      for (let i = 0; i < ventanas.length; i++) {
+        const v = ventanas[i]
+        const rol = ventanas.length > 1 && i === 0 ? 'Arrancar · '
+          : ventanas.length > 1 && i === ventanas.length - 1 ? 'Finalizar · '
+          : ''
+        await cronogramaService.crearTarea({
+          linea_id: li,
+          dia_semana: dia,
+          hora_inicio: minToTime(v.inicio),
+          hora_fin: minToTime(v.fin),
+          descripcion: `${rol}${inst.etapa.nombre} · ${inst.plantillaNombre}`,
+          color: inst.etapa.color ?? null,
+          plantilla_id: inst.plantillaId,
+          etapa_orden: inst.etapa.orden,
+          lote: inst.lote,
+          permite_solape: inst.etapa.permite_solape ?? false,
+          duracion_base_min: v.fin - v.inicio,
+          grupo_id: grupoId,
+          tamano: 5,
+          fila: 0
+        })
+      }
+    }
+    return
+  }
+
   let lineaId: string | null = null
   if (principal) {
     lineaId = inst.etapa.permite_solape
