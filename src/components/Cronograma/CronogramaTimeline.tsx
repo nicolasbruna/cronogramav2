@@ -1,13 +1,14 @@
 import { useState, useRef, useCallback, useEffect, useLayoutEffect, useMemo, KeyboardEvent as ReactKeyboardEvent } from 'react'
 import { Lock, Unlock, Plus, Trash2, ChevronUp, ChevronDown, Link, Unlink, Package, Users, Tag } from 'lucide-react'
 import { CronogramaTarea, EmpleadoConLineas, TamanoTexto, RecursoProgramadoCronograma } from '../../types/cronograma'
-import { PlantillaProceso } from '../../types/planificacion'
+import { PlantillaProceso, Maquina } from '../../types/planificacion'
 import { timeToMin, minToTime, formatDuration, isLightColor } from './cronogramaHelpers'
 
 interface CronogramaTimelineProps {
   empleados: EmpleadoConLineas[]
   tareas: CronogramaTarea[]
   plantillas?: PlantillaProceso[]
+  maquinas?: Maquina[]
   rangoInicio: string
   rangoFin: string
   zoom: number
@@ -47,6 +48,7 @@ export function CronogramaTimeline({
   empleados,
   tareas,
   plantillas = [],
+  maquinas = [],
   rangoInicio,
   rangoFin,
   zoom,
@@ -95,6 +97,7 @@ export function CronogramaTimeline({
   const [colorMode, setColorMode] = useState<'empleado' | 'proceso'>('empleado')
   const [seccionesColapsadas, setSeccionesColapsadas] = useState<{ procesos: boolean; maquinas: boolean }>({ procesos: false, maquinas: false })
   const toggleSeccion = (s: 'procesos' | 'maquinas') => setSeccionesColapsadas(prev => ({ ...prev, [s]: !prev[s] }))
+  const [maquinaInfo, setMaquinaInfo] = useState<{ x: number; y: number; tarea: CronogramaTarea; r: RecursoProgramadoCronograma } | null>(null)
 
   if (zoom !== internalZoom && pendingScrollRef.current === null && !isLocalZoomRef.current) {
     setInternalZoom(zoom)
@@ -1779,6 +1782,7 @@ export function CronogramaTimeline({
                           if (!tareasSeleccionadas.includes(tarea.id)) onSeleccionarTarea([tarea.id])
                           setContextMenu({ x: e.clientX, y: e.clientY, tareaId: tarea.id })
                         }}
+                        onDoubleClick={e => { e.stopPropagation(); setMaquinaInfo({ x: e.clientX, y: e.clientY, tarea, r }) }}
                         onClick={e => {
                           e.stopPropagation()
                           if (didDragRef.current) { didDragRef.current = false; return }
@@ -1954,6 +1958,28 @@ export function CronogramaTimeline({
         </button>
       </div>
     )}
+    {maquinaInfo && (() => {
+      const maq = maquinas.find(m => m.id === maquinaInfo.r.maquina_id)
+      const capacidad = maq?.cantidad ?? 1
+      const uso = maquinaInfo.r.uso ?? 1
+      const pct = Math.round((uso / capacidad) * 100)
+      return (
+        <div className="fixed inset-0 z-[9998]" onClick={() => setMaquinaInfo(null)}>
+          <div
+            className="absolute bg-white border border-slate-200 shadow-xl rounded-lg p-3 text-[12px] min-w-[210px]"
+            style={{ left: maquinaInfo.x, top: maquinaInfo.y }}
+            onClick={e => e.stopPropagation()}
+          >
+            <div className="font-bold text-slate-800 mb-1.5 flex items-center gap-1.5">
+              <Package size={13} className="text-slate-500" /> {maquinaInfo.r.maquina_nombre}
+            </div>
+            <div className="text-slate-600">Uso: <span className="font-semibold text-slate-800">{pct}%</span> de la capacidad <span className="text-slate-400">({uso} de {capacidad})</span></div>
+            <div className="text-slate-700 mt-1">{maquinaInfo.tarea.descripcion}</div>
+            <div className="text-slate-400 text-[10px] mt-0.5">{maquinaInfo.r.hora_inicio} – {maquinaInfo.r.hora_fin}</div>
+          </div>
+        </div>
+      )
+    })()}
     </>
   )
 }

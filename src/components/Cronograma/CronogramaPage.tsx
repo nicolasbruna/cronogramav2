@@ -3,7 +3,7 @@ import { Plus, Minus, Maximize2, Copy, Trash2, ChevronLeft, ChevronRight, Lock, 
 import { cronogramaService } from '../../services/cronogramaService'
 import { cronogramaHistorialService } from '../../services/cronogramaHistorialService'
 import { planificacionService } from '../../services/planificacionService'
-import { PlantillaProceso } from '../../types/planificacion'
+import { PlantillaProceso, Maquina } from '../../types/planificacion'
 import { CronogramaLinea, CronogramaTarea, CronogramaVersion, EmpleadoConLineas, DIAS_SEMANA_NOMBRES, ActualizarCronogramaTareaRequest, TamanoTexto, OrientacionTexto } from '../../types/cronograma'
 import { CronogramaTimeline } from './CronogramaTimeline'
 import { TareaModal } from './TareaModal'
@@ -26,6 +26,7 @@ export function CronogramaPage({ onSectionChange, onToggleMenu, onIrAConfiguraci
   const [empleados, setEmpleados] = useState<EmpleadoConLineas[]>([])
   const [tareas, setTareas] = useState<CronogramaTarea[]>([])
   const [plantillas, setPlantillas] = useState<PlantillaProceso[]>([])
+  const [maquinas, setMaquinas] = useState<Maquina[]>([])
   const [diaActual, setDiaActual] = useState(() => {
     const saved = localStorage.getItem('cronograma_dia_actual')
     return saved !== null ? parseInt(saved, 10) : getDiaSemanaHoy()
@@ -187,6 +188,9 @@ export function CronogramaPage({ onSectionChange, onToggleMenu, onIrAConfiguraci
     planificacionService.listarPlantillas()
       .then(setPlantillas)
       .catch(err => console.error('Error cargando plantillas:', err))
+    planificacionService.listarMaquinas()
+      .then(setMaquinas)
+      .catch(err => console.error('Error cargando máquinas:', err))
   }, [])
   useEffect(() => { actualizarEstadoHistorial() }, [actualizarEstadoHistorial])
 
@@ -1287,6 +1291,7 @@ export function CronogramaPage({ onSectionChange, onToggleMenu, onIrAConfiguraci
             empleados={empleados.filter(e => e.lineas.length > 0)}
             tareas={tareas}
             plantillas={plantillas}
+            maquinas={maquinas}
             rangoInicio={rangoInicio}
             rangoFin={rangoFin}
             zoom={zoom}
