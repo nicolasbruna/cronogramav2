@@ -220,30 +220,14 @@ export function CronogramaTimeline({
   const MAQUINA_ROW_H = 36
 
   const machineRows = useMemo(() => {
-    const map = new Map<string, { maquinaId: string; maquinaNombre: string; blocks: { tarea: CronogramaTarea; r: RecursoProgramadoCronograma; lane: number }[]; lanes: number }>()
+    const map = new Map<string, { maquinaId: string; maquinaNombre: string; blocks: { tarea: CronogramaTarea; r: RecursoProgramadoCronograma }[] }>()
     for (const tarea of tareas) {
       for (const r of (tarea.recursos_programados || [])) {
         if (!map.has(r.maquina_id)) {
-          map.set(r.maquina_id, { maquinaId: r.maquina_id, maquinaNombre: r.maquina_nombre, blocks: [], lanes: 1 })
+          map.set(r.maquina_id, { maquinaId: r.maquina_id, maquinaNombre: r.maquina_nombre, blocks: [] })
         }
-        map.get(r.maquina_id)!.blocks.push({ tarea, r, lane: 0 })
+        map.get(r.maquina_id)!.blocks.push({ tarea, r })
       }
-    }
-    // Asignar carriles: bloques de la misma máquina que se solapan en el tiempo van en carriles
-    // distintos, para que se vean apilados (no encimados). lanes = máximo de solapamiento concurrente.
-    for (const maq of map.values()) {
-      const ordenados = [...maq.blocks].sort((a, b) => timeToMin(a.r.hora_inicio) - timeToMin(b.r.hora_inicio))
-      const finPorCarril: number[] = []
-      for (const b of ordenados) {
-        const ini = timeToMin(b.r.hora_inicio)
-        const fin = timeToMin(b.r.hora_fin)
-        let lane = finPorCarril.findIndex(end => end <= ini)
-        if (lane === -1) { lane = finPorCarril.length; finPorCarril.push(fin) }
-        else finPorCarril[lane] = fin
-        b.lane = lane
-      }
-      maq.blocks = ordenados
-      maq.lanes = Math.max(1, finPorCarril.length)
     }
     return [...map.values()].sort((a, b) => a.maquinaNombre.localeCompare(b.maquinaNombre))
   }, [tareas])
@@ -1771,16 +1755,12 @@ export function CronogramaTimeline({
                       style={{ left: minToPx(tick.min) + 'px' }}
                     />
                   ))}
-                  {maq.blocks.map(({ tarea, r, lane }, i) => {
+                  {maq.blocks.map(({ tarea, r }, i) => {
                     // Si la tarea se está arrastrando, el recurso de máquina la acompaña por el mismo delta.
                     const dragDelta = getTaskPos(tarea).start - timeToMin(tarea.hora_inicio)
                     const left = minToPx(timeToMin(r.hora_inicio) + dragDelta)
                     const width = Math.max(4, (timeToMin(r.hora_fin) - timeToMin(r.hora_inicio)) * pxPerMin)
                     const color = getTaskColor(tarea)
-                    // Apilado por carriles cuando hay solapes en la misma máquina.
-                    const laneH = MAQUINA_ROW_H / maq.lanes
-                    const top = lane * laneH + 2
-                    const height = laneH - 3
                     // % de utilización de la máquina por esta tarea (uso / capacidad).
                     const capacidad = maquinas.find(m => m.id === r.maquina_id)?.cantidad ?? 1
                     const pct = Math.round(((r.uso ?? 1) / capacidad) * 100)
@@ -1793,7 +1773,7 @@ export function CronogramaTimeline({
                       <div
                         key={i}
                         className={`absolute rounded overflow-hidden flex items-center px-1 cursor-move select-none ${isSelected ? SEL_RING : isGrupoHighlight ? SEL_GRUPO : ''}`}
-                        style={{ left, width, top, height, backgroundColor: color + 'cc', border: `1.5px solid ${color}` }}
+                        style={{ left, width, top: 5, bottom: 5, backgroundColor: color + 'cc', border: `1.5px solid ${color}` }}
                         title={`${tarea.descripcion} · ${r.hora_inicio} – ${r.hora_fin} · ${pct}% de uso`}
                         onMouseDown={e => handleTaskMouseDown(e, tarea, 'move')}
                         onContextMenu={e => {
