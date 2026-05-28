@@ -115,6 +115,8 @@ export interface ActualizarCronogramaTareaRequest {
   duracion_base_min?: number | null
   factor_solape_pct?: number | null
   solape_modo?: string | null
+  es_provisoria?: boolean
+  notas_provisoria?: string | null
 }
 
 export interface EmpleadoConLineas {

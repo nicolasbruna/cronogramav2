@@ -614,6 +614,23 @@ export function CronogramaPage({ onSectionChange, onToggleMenu, onIrAConfiguraci
     }
   }, [tareas, registrarEnHistorial, cargarDatos])
 
+  const handleConfirmarProvisoria = useCallback(async (ids: string[]) => {
+    if (ids.length === 0) return
+    try {
+      const tareasOptimistas = tareas.map(t =>
+        ids.includes(t.id) ? { ...t, es_provisoria: false, notas_provisoria: null } : t
+      )
+      setTareas(tareasOptimistas)
+      await Promise.all(ids.map(id =>
+        cronogramaService.actualizarTarea(id, { es_provisoria: false, notas_provisoria: null })
+      ))
+      registrarEnHistorial(tareasOptimistas, `Confirmar ${ids.length} provisoria(s)`)
+    } catch (err) {
+      console.error('Error confirmando provisoria:', err)
+      await cargarDatos()
+    }
+  }, [tareas, registrarEnHistorial, cargarDatos])
+
   const handleAgruparDesdeMenu = useCallback(async (ids: string[]) => {
     if (ids.length < 2) return
     try {
@@ -1327,6 +1344,7 @@ export function CronogramaPage({ onSectionChange, onToggleMenu, onIrAConfiguraci
             onAgrupar={handleAgruparDesdeMenu}
             onDesagrupar={handleDesagruparDesdeMenu}
             onBloquear={handleBloquearDesdeMenu}
+            onConfirmarProvisoria={handleConfirmarProvisoria}
             vistaAgrupacion={vistaAgrupacion}
           />
         )}

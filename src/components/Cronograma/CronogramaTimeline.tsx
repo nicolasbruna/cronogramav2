@@ -1,5 +1,5 @@
 import { useState, useRef, useCallback, useEffect, useLayoutEffect, useMemo, KeyboardEvent as ReactKeyboardEvent } from 'react'
-import { Lock, Unlock, Plus, Trash2, ChevronUp, ChevronDown, Link, Unlink, Package, Users, Tag } from 'lucide-react'
+import { Lock, Unlock, Plus, Trash2, ChevronUp, ChevronDown, Link, Unlink, Package, Users, Tag, CheckCircle2 } from 'lucide-react'
 import { CronogramaTarea, EmpleadoConLineas, TamanoTexto, RecursoProgramadoCronograma } from '../../types/cronograma'
 import { PlantillaProceso, Maquina } from '../../types/planificacion'
 import { timeToMin, minToTime, formatDuration, isLightColor } from './cronogramaHelpers'
@@ -33,6 +33,7 @@ interface CronogramaTimelineProps {
   onAgrupar?: (tareaIds: string[]) => void
   onDesagrupar?: (tareaIds: string[]) => void
   onBloquear?: (tareaIds: string[]) => void
+  onConfirmarProvisoria?: (tareaIds: string[]) => void
   vistaAgrupacion?: 'secciones' | 'todos'
 }
 
@@ -71,6 +72,7 @@ export function CronogramaTimeline({
   onCambiarTamano,
   onCambiarFila,
   onAgrupar,
+  onConfirmarProvisoria,
   onDesagrupar,
   onBloquear,
   vistaAgrupacion = 'secciones'
@@ -933,8 +935,11 @@ export function CronogramaTimeline({
     const effectiveHeight = Math.round(slotHeight * tamano)
     const effectiveTop = top + Math.round(fila * slotHeight)
 
-    const defaultBorder = '1px solid rgba(0,0,0,0.75)'
-    const connectedBorder = '2px solid #000000'
+    // Tareas provisorias (resolución manual pendiente de confirmar): borde discontinuo en ámbar.
+    const esProvisoria = tarea.es_provisoria === true
+    const provisoriaBorder = '2px dashed #f59e0b'
+    const defaultBorder = esProvisoria ? provisoriaBorder : '1px solid rgba(0,0,0,0.75)'
+    const connectedBorder = esProvisoria ? provisoriaBorder : '2px solid #000000'
 
     return (
       <div
@@ -1955,6 +1960,25 @@ export function CronogramaTimeline({
         >
           {contextBloqueada ? <><Unlock size={14} /> Desbloquear</> : <><Lock size={14} /> Bloquear</>}
         </button>
+        {contextTarea?.es_provisoria && onConfirmarProvisoria && (
+          <>
+            <div className="border-t border-slate-100 my-1" />
+            <button
+              className="w-full px-3 py-1.5 text-left flex items-center gap-2 hover:bg-amber-50 text-amber-700 font-semibold"
+              onClick={() => {
+                const ids = tareasSeleccionadas.filter(id => {
+                  const t = tareas.find(ta => ta.id === id)
+                  return t?.es_provisoria
+                })
+                onConfirmarProvisoria(ids)
+                setContextMenu(null)
+              }}
+              title="Sacar la marca de provisoria — el cambio queda confirmado en el cronograma"
+            >
+              <CheckCircle2 size={14} /> Confirmar provisoria
+            </button>
+          </>
+        )}
       </div>
     )}
     {maquinaInfo && (() => {

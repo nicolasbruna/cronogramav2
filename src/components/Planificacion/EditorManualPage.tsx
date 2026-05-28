@@ -98,12 +98,33 @@ export function EditorManualPage({ diaActual, onVolver }: Props) {
       asignacionFijada: [{ plantillaId: inst.plantillaId, lote: inst.lote, etapaOrden: inst.etapa.orden, empleadoId }]
     }))
   }
+  // Aplica un delta de overrides al cronograma DE LA BD inmediatamente (commit directo,
+  // sin esperar el botón "Aplicar al cronograma"). Recarga el contexto luego para mostrar
+  // el estado nuevo.
+  const aplicarDeltaInmediato = async (delta: SchedulerOverrides) => {
+    if (!preparada) return
+    const nuevos = fusionarOverrides(overridesEditor, delta)
+    const resultadoLocal = generarCronograma(preparada.ctx, nuevos)
+    setOverridesEditor(nuevos)
+    setAplicando(true)
+    try {
+      await aplicarResultado(diaActual, resultadoLocal, preparada.idsReemplazables)
+      await cargar()   // recarga el contexto desde la BD y limpia los overrides
+    } catch (err) {
+      console.error('Error aplicando cambio:', err)
+      alert('Error al aplicar el cambio al cronograma')
+    } finally {
+      setAplicando(false)
+    }
+  }
+
   const fijarHora = (inst: InstanciaEtapa, hhmm: string) => {
     const m = hhmmAMin(hhmm)
     if (m == null) return
-    setOverridesEditor(prev => fusionarOverrides(prev, {
+    // Fijar hora desde el panel detalle: además del override, se aplica AL CRONOGRAMA directo.
+    aplicarDeltaInmediato({
       inicioFijado: [{ plantillaId: inst.plantillaId, lote: inst.lote, etapaOrden: inst.etapa.orden, inicioMin: m }]
-    }))
+    })
   }
   const sustituirMaquina = (inst: InstanciaEtapa) =>
     setOverridesEditor(prev => fusionarOverrides(prev, { sustituirMaquina: [inst.etapa.id] }))
@@ -211,15 +232,9 @@ export function EditorManualPage({ diaActual, onVolver }: Props) {
   }
 
   // ===== Menú contextual (click derecho en bloque o chip) =====
-  // "Forzar horario" usa prompt nativo para fijar hora rápido sin ir al panel detalle.
-  const promptHorario = (inst: InstanciaEtapa) => {
-    const actual = inst.inicioAbs != null ? minToTime(inst.inicioAbs).slice(0, 5) : ''
-    const v = prompt(`Forzar hora de inicio de "${inst.etapa.nombre}" (HH:MM):`, actual)
-    if (v && /^\d{1,2}:\d{2}$/.test(v.trim())) fijarHora(inst, v.trim())
-    else if (v) alert('Formato inválido. Usá HH:MM (por ejemplo 04:30).')
-  }
+  // Acciones rápidas. "Cambiar hora" vive solo en el panel detalle (lateral derecho)
+  // para no duplicar la opción.
   const itemsMenuConflicto = (inst: InstanciaEtapa): MenuContextualItem[] => [
-    { label: 'Forzar horario…', onClick: () => promptHorario(inst) },
     { label: 'Cambiar empleado…', onClick: () => setSeleccionada(claveInst(inst)) },
     { label: 'Fijar al proceso completo…', onClick: () => setSeleccionada(claveInst(inst)) },
     { label: 'Forzar antes de otro proceso…', onClick: () => setSeleccionada(claveInst(inst)) },
@@ -243,7 +258,6 @@ export function EditorManualPage({ diaActual, onVolver }: Props) {
 
   // Items para una instancia "normal" (colocada sin conflicto).
   const itemsMenuColocada = (inst: InstanciaEtapa): MenuContextualItem[] => [
-    { label: 'Forzar horario…', onClick: () => promptHorario(inst) },
     { label: 'Cambiar empleado…', onClick: () => setSeleccionada(claveInst(inst)) },
     { label: 'Fijar al proceso completo…', onClick: () => setSeleccionada(claveInst(inst)) },
     { label: 'Forzar antes de otro proceso…', onClick: () => setSeleccionada(claveInst(inst)) },
