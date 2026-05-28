@@ -5,6 +5,7 @@ import { CronogramaPage } from './components/Cronograma/CronogramaPage'
 import { CronogramaEmpleadoPage } from './components/Cronograma/CronogramaEmpleadoPage'
 import { ConfiguracionPage } from './components/Configuracion/ConfiguracionPage'
 import { PlanificarPage } from './components/Planificacion/PlanificarPage'
+import { SimulacionPage } from './components/Simulacion/SimulacionPage'
 import { Loader2 } from 'lucide-react'
 
 type Vista =
@@ -12,6 +13,7 @@ type Vista =
   | { tipo: 'cronograma-empleado'; empleadoId: string; dia?: number }
   | { tipo: 'configuracion' }
   | { tipo: 'planificar'; dia: number }
+  | { tipo: 'simulacion' }
 
 function AppContent() {
   const { user, loading } = useAuth()
@@ -69,11 +71,16 @@ function AppContent() {
     )
   }
 
+  if (vista.tipo === 'simulacion') {
+    return <SimulacionPage onVolver={() => setVista({ tipo: 'cronograma' })} />
+  }
+
   return (
     <CronogramaPage
       onSectionChange={handleSectionChange}
       onIrAConfiguracion={() => setVista({ tipo: 'configuracion' })}
       onIrAPlanificar={(dia) => setVista({ tipo: 'planificar', dia })}
+      onIrASimulacion={() => setVista({ tipo: 'simulacion' })}
     />
   )
 }

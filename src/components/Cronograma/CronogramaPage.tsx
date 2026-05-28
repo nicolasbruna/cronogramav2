@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
-import { Plus, Minus, Maximize2, Copy, Trash2, ChevronLeft, ChevronRight, Lock, Unlock, UserPlus, Undo2, Redo2, List, Save, FolderOpen, Menu, Link, Unlink, ArchiveRestore, Magnet, Users, LogOut, Settings, LayoutList, Layers, CalendarClock } from 'lucide-react'
+import { Plus, Minus, Maximize2, Copy, Trash2, ChevronLeft, ChevronRight, Lock, Unlock, UserPlus, Undo2, Redo2, List, Save, FolderOpen, Menu, Link, Unlink, ArchiveRestore, Magnet, Users, LogOut, Settings, LayoutList, Layers, CalendarClock, MapPin } from 'lucide-react'
 import { cronogramaService } from '../../services/cronogramaService'
 import { cronogramaHistorialService } from '../../services/cronogramaHistorialService'
 import { planificacionService } from '../../services/planificacionService'
@@ -19,9 +19,10 @@ interface CronogramaPageProps {
   onToggleMenu?: () => void
   onIrAConfiguracion?: () => void
   onIrAPlanificar?: (dia: number) => void
+  onIrASimulacion?: () => void
 }
 
-export function CronogramaPage({ onSectionChange, onToggleMenu, onIrAConfiguracion, onIrAPlanificar }: CronogramaPageProps) {
+export function CronogramaPage({ onSectionChange, onToggleMenu, onIrAConfiguracion, onIrAPlanificar, onIrASimulacion }: CronogramaPageProps) {
   const { signOut } = useAuth()
   const [empleados, setEmpleados] = useState<EmpleadoConLineas[]>([])
   const [tareas, setTareas] = useState<CronogramaTarea[]>([])
@@ -1199,6 +1200,16 @@ export function CronogramaPage({ onSectionChange, onToggleMenu, onIrAConfiguraci
           >
             <CalendarClock size={11} /> Planificar
           </button>
+
+          {onIrASimulacion && (
+            <button
+              onClick={onIrASimulacion}
+              className="h-[26px] px-2.5 text-[10px] font-semibold rounded-md border border-slate-200 bg-white text-slate-600 hover:bg-slate-50 hover:border-slate-300 flex items-center gap-1.5 transition-colors"
+              title="Ver simulación de máquinas sobre el plano de la fábrica"
+            >
+              <MapPin size={11} /> Simulación
+            </button>
+          )}
 
           {onIrAConfiguracion && (
             <button
