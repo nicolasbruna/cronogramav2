@@ -477,7 +477,9 @@ function colocarEtapa(
   if (plantFinMax != null) bajarLatest(plantFinMax - dur, `el proceso debe terminar a más tardar a las ${minLabel(plantFinMax)}`)
   if (etapa.margen_espera_max != null && depEncadenadasFinMax > 0) bajarLatest(depEncadenadasFinMax + etapa.margen_espera_max, `solo puede esperar ${etapa.margen_espera_max} min después de "${depEncadenadasNombre}"`)
 
-  if (earliest > latest) {
+  // Si hay PIN de hora, la ventana legítima se ignora — la responsabilidad es del usuario.
+  const pinHoraTmp = overrides.inicioFijado?.find(p => p.plantillaId === plantilla.id && p.lote === lote && p.etapaOrden === etapa.orden)
+  if (earliest > latest && !pinHoraTmp) {
     inst.conflicto = {
       motivo: 'ventana_horaria',
       mensaje: `Dura ${formatDuration(dur)} y no hay lugar en su ventana: puede empezar recién a las ${minLabel(earliest)} porque ${earliestReason}, pero ${latestReason}, así que tendría que empezar a más tardar a las ${minLabel(latest)}.`,
@@ -489,6 +491,11 @@ function colocarEtapa(
   // PIN: asignación fijada por resolución asistida
   const pin = overrides.asignacionFijada?.find(p => p.plantillaId === plantilla.id && p.lote === lote && p.etapaOrden === etapa.orden)
 
+  // PIN de HORA: el editor manual puede fijar la hora exacta de inicio. Si está, no se barre la
+  // ventana — sólo se prueba ese minuto. Permite forzar una colocación fuera de [earliest, latest]
+  // a riesgo del usuario.
+  const pinHora = overrides.inicioFijado?.find(p => p.plantillaId === plantilla.id && p.lote === lote && p.etapaOrden === etapa.orden)
+
   // Solape de empleado: la etapa define si puede correr en paralelo / si es exclusiva (default de la plantilla).
   const permiteSolape = etapa.permite_solape ?? plantilla.permite_solape ?? false
   const exclusiva = etapa.atencion_exclusiva ?? plantilla.atencion_exclusiva ?? false
@@ -496,13 +503,20 @@ function colocarEtapa(
   // Sustitución de máquina habilitada por resolución asistida (puede usar otra del grupo).
   const permitirSustitucion = overrides.sustituirMaquina?.includes(etapa.id) ?? false
 
-  // Barrido temporal: ubicar en el horario MÁS TEMPRANO posible. En cada instante se prefiere
-  // al empleado preferido si está disponible; si no lo está y la etapa permite reemplazo, lo hace
-  // cualquier otro disponible (NO se espera al titular). Si puede_reemplazarse es false, solo el titular.
+  // Barrido temporal: ubicar en el horario MÁS TEMPRANO posible (o probar solo el PIN de hora si
+  // existe). En cada instante se prefiere al empleado preferido si está disponible; si no lo
+  // está y la etapa permite reemplazo, lo hace cualquier otro disponible (NO se espera al
+  // titular). Si puede_reemplazarse es false, solo el titular.
   let hit: { t: number; intento: ResultadoIntento } | null = null
-  for (let t = earliest; t <= latest; t++) {
-    const intento = intentarColocar(t, etapa, empleados, empById, maquinas, cal, pin?.empleadoId, permiteSolape, exclusiva, permitirSustitucion, preferenciaProceso)
-    if (intento.ok) { hit = { t, intento }; break }
+  if (pinHora) {
+    // Si hay PIN de hora, ese es el único instante a probar.
+    const intento = intentarColocar(pinHora.inicioMin, etapa, empleados, empById, maquinas, cal, pin?.empleadoId, permiteSolape, exclusiva, permitirSustitucion, preferenciaProceso)
+    if (intento.ok) hit = { t: pinHora.inicioMin, intento }
+  } else {
+    for (let t = earliest; t <= latest; t++) {
+      const intento = intentarColocar(t, etapa, empleados, empById, maquinas, cal, pin?.empleadoId, permiteSolape, exclusiva, permitirSustitucion, preferenciaProceso)
+      if (intento.ok) { hit = { t, intento }; break }
+    }
   }
   if (hit) {
     // Commit (la etiqueta permite nombrar al "culpable" si otra etapa choca con ésta)
@@ -517,11 +531,16 @@ function colocarEtapa(
     return true
   }
 
-  // No se pudo ubicar: capturar el motivo del primer instante que falló.
+  // No se pudo ubicar: capturar el motivo. Si hay PIN de hora, el fallo es exactamente en esa
+  // hora; si no, escanear desde earliest para encontrar la primera causa.
   let primerFallo: ResultadoIntento | null = null
-  for (let t = earliest; t <= latest; t++) {
-    const intento = intentarColocar(t, etapa, empleados, empById, maquinas, cal, pin?.empleadoId, permiteSolape, exclusiva, permitirSustitucion, preferenciaProceso)
-    if (!intento.ok) { primerFallo = intento; break }
+  if (pinHora) {
+    primerFallo = intentarColocar(pinHora.inicioMin, etapa, empleados, empById, maquinas, cal, pin?.empleadoId, permiteSolape, exclusiva, permitirSustitucion, preferenciaProceso)
+  } else {
+    for (let t = earliest; t <= latest; t++) {
+      const intento = intentarColocar(t, etapa, empleados, empById, maquinas, cal, pin?.empleadoId, permiteSolape, exclusiva, permitirSustitucion, preferenciaProceso)
+      if (!intento.ok) { primerFallo = intento; break }
+    }
   }
 
   const ventanaTxt = `${minLabel(earliest)}–${minLabel(latest + dur)}`
@@ -936,8 +955,6 @@ async function materializarInstancia(inst: InstanciaEtapa, dia: number, grupoIdC
 
 // ============ Fase 4: resolución asistida ============
 
-const DIA_EXTRA_INICIO = 180   // 03:00 — tope inferior para franjas extra
-
 // Fusiona dos overrides (delta sobre base) de forma inmutable.
 export function fusionarOverrides(base: SchedulerOverrides, delta: SchedulerOverrides): SchedulerOverrides {
   const franjasExtra = { ...(base.franjasExtra || {}) }
@@ -951,7 +968,9 @@ export function fusionarOverrides(base: SchedulerOverrides, delta: SchedulerOver
     relajarTopeInicio: [...(base.relajarTopeInicio || []), ...(delta.relajarTopeInicio || [])],
     relajarInicioPlan: [...(base.relajarInicioPlan || []), ...(delta.relajarInicioPlan || [])],
     excluirPlantillas: [...(base.excluirPlantillas || []), ...(delta.excluirPlantillas || [])],
-    asignacionFijada: [...(base.asignacionFijada || []), ...(delta.asignacionFijada || [])]
+    asignacionFijada: [...(base.asignacionFijada || []), ...(delta.asignacionFijada || [])],
+    sustituirMaquina: [...(base.sustituirMaquina || []), ...(delta.sustituirMaquina || [])],
+    inicioFijado: [...(base.inicioFijado || []), ...(delta.inicioFijado || [])]
   }
 }
 
@@ -1035,6 +1054,11 @@ export function generarSolucionesConflicto(
   }
 
   // 2) Extender el turno de un empleado (para conflictos de empleado): franja extra + PIN.
+  // Dos modos:
+  //   A) "Extender turno de X" — X es el preferido de la fijada y hace AMBAS (culpable + fijada).
+  //   B) "Adelantar entrada de Y" — Y NO es el preferido de la fijada; sólo hace la culpable,
+  //      la fijada queda para su preferido en su horario normal. El turno de Y se adelanta y
+  //      sigue activo hasta su fin de turno normal sin huecos.
   if (conflicto.conflicto?.motivo === 'empleado_no_disponible') {
     const slots = slotsDeEtapa(etapa, preferenciaProceso)
     const habilidadReq = slots.find(s => s.ventanas.length > 0)?.habilidad_id ?? null
@@ -1047,6 +1071,20 @@ export function generarSolucionesConflicto(
     const dur = etapa.duracion_proceso
     const justo = desde0 != null && tope != null
 
+    // Empleado preferido de la fijada y su inicio de turno normal (si tiene turno hoy).
+    const preferidoFijadaEmp = preferidoEtapaId ? ctx.empleados.find(e => e.id === preferidoEtapaId) : null
+    const turnosPref = preferidoFijadaEmp?.franjas.filter(f => f.origen === 'turno') ?? []
+    const turnoInicioPref = turnosPref.length > 0 ? Math.min(...turnosPref.map(f => f.desde)) : null
+
+    // Ancla óptima: arrancar la fijada en el inicio del turno del preferido de la fijada,
+    // clampeada a la ventana legítima [desde0, tope]. Si no hay preferido o no tiene turno
+    // hoy, caer a desde0 (comportamiento previo). Sin ancla la "extensión" se calcula desde
+    // el primer minuto posible.
+    const anclaIdeal = turnoInicioPref ?? desde0
+    const ancla = justo && anclaIdeal != null
+      ? Math.max(desde0!, Math.min(tope!, anclaIdeal))
+      : (desde0 ?? 0)
+
     // Minutos de [ini,fin] dentro del turno NORMAL del empleado (no cuentan como hora extra).
     const minEnTurno = (emp: EmpleadoScheduler, ini: number, fin: number) =>
       emp.franjas.filter(f => f.origen === 'turno')
@@ -1056,38 +1094,84 @@ export function generarSolucionesConflicto(
       const fines = emp.franjas.filter(f => f.origen === 'turno' && f.hasta <= t0).map(f => f.hasta)
       return fines.length ? Math.max(...fines) : null
     }
+    // Fin del turno normal del empleado (último minuto de su turno hoy; 0 si día libre).
+    const finTurnoNormal = (emp: EmpleadoScheduler) =>
+      emp.franjas.filter(f => f.origen === 'turno').reduce((m, f) => Math.max(m, f.hasta), 0)
+    const nombrePrefFijada = preferidoFijadaEmp?.nombre_completo.split(' ')[0] ?? null
 
     const opciones: { sol: SolucionConflicto; empId: string; costoExtra: number; hueco: number }[] = []
     for (const emp of candidatos) {
-      const lead = emp.id === preferidoBloqueadoId ? leadPreferido : 0
-      const desde = justo ? Math.max(DIA_EXTRA_INICIO, desde0! - lead) : DIA_EXTRA_INICIO
-      // La franja cubre SOLO lo que necesita la tarea (desde0 → desde0+dur): nunca hasta medianoche.
-      const fin = justo ? Math.min(DIA_FIN, desde0! + dur) : DIA_FIN
-      const franja: FranjaDisponibilidad = { desde, hasta: fin, origen: 'extra', etiqueta: 'Turno extendido' }
-
-      const ini = justo ? desde0! : desde
-      const costoExtra = Math.max(0, dur - minEnTurno(emp, ini, fin))
-      const diaLibre = emp.franjas.every(f => f.origen !== 'turno')
-      const fp = finTurnoPrevio(emp, ini)
-      const hueco = fp != null ? Math.max(0, ini - fp) : 0
+      const esPreferidoFijada = emp.id === preferidoEtapaId
+      const esPreferidoBloqueado = emp.id === preferidoBloqueadoId
+      const lead = esPreferidoBloqueado ? leadPreferido : 0
+      const fTN = finTurnoNormal(emp)
+      const diaLibre = fTN === 0
 
       const nombre = emp.nombre_completo.split(' ')[0]
-      const descripcion = diaLibre
-        ? `Hacer venir a ${nombre} en su día libre hasta las ${minLabel(fin)}`
-        : lead > 0
-          ? `Extender turno de ${nombre} (entra ${minLabel(desde)} por la otra tarea, cubre hasta ${minLabel(fin)})`
-          : `Extender turno de ${nombre} hasta las ${minLabel(fin)}`
 
-      simular(
-        { franjasExtra: { [emp.id]: [franja] }, asignacionFijada: [{ plantillaId: conflicto.plantillaId, lote: conflicto.lote, etapaOrden: etapa.orden, empleadoId: emp.id }] },
-        'traer_empleado',
-        'traer',
-        descripcion
-      )
-      const sol = soluciones[soluciones.length - 1]
-      sol.costoExtraMin = costoExtra
-      sol.huecoMuertoMin = hueco
-      opciones.push({ sol, empId: emp.id, costoExtra, hueco })
+      if (esPreferidoFijada || diaLibre) {
+        // Modo A: este empleado hace la fijada (con PIN). Si está bloqueado por una culpable,
+        // se adelanta `lead` min para que la culpable corra en su tiempo traído (las franjas
+        // extra son globales). El extremo superior es max(ancla+dur, finTurnoNormal) para
+        // que la franja se enchufe de corrido con el turno normal sin recortar nada.
+        const desde = Math.max(0, ancla - lead)
+        const fin = Math.max(ancla + dur, fTN > 0 ? fTN : ancla + dur)
+        const franja: FranjaDisponibilidad = { desde, hasta: fin, origen: 'extra', etiqueta: 'Turno extendido' }
+
+        const costoExtra = Math.max(0, (fin - desde) - minEnTurno(emp, desde, fin))
+        const fp = finTurnoPrevio(emp, desde)
+        const hueco = fp != null ? Math.max(0, desde - fp) : 0
+
+        const descripcion = diaLibre
+          ? `Hacer venir a ${nombre} en su día libre (entra ${minLabel(desde)}, arranca ${etapa.nombre} a las ${minLabel(ancla)})`
+          : lead > 0
+            ? `Extender turno de ${nombre}: entra ${minLabel(desde)} para liberar la otra tarea y arranca ${etapa.nombre} a las ${minLabel(ancla)} (+${lead} min extra)`
+            : `Extender turno de ${nombre}: entra ${minLabel(desde)} para hacer ${etapa.nombre}`
+
+        simular(
+          {
+            franjasExtra: { [emp.id]: [franja] },
+            asignacionFijada: [{ plantillaId: conflicto.plantillaId, lote: conflicto.lote, etapaOrden: etapa.orden, empleadoId: emp.id }]
+          },
+          'traer_empleado',
+          'traer',
+          descripcion
+        )
+        const sol = soluciones[soluciones.length - 1]
+        sol.costoExtraMin = costoExtra
+        sol.huecoMuertoMin = hueco
+        opciones.push({ sol, empId: emp.id, costoExtra, hueco })
+      } else {
+        // Modo B: este empleado NO es el preferido de la fijada. Lo adelantamos para que haga
+        // SÓLO la culpable (gracias a que las franjas extra son globales, el scheduler le
+        // asignará la culpable porque podría ser su preferida o reemplazo). La fijada queda
+        // para el preferido en su horario normal. NO se pinea la fijada a este empleado.
+        // Sólo aplica si hay culpable identificada (lead > 0).
+        if (leadPreferido === 0) continue
+
+        const desde = Math.max(0, ancla - leadPreferido)
+        const fin = Math.max(ancla, fTN)
+        const franja: FranjaDisponibilidad = { desde, hasta: fin, origen: 'extra', etiqueta: 'Turno extendido' }
+
+        const costoExtra = Math.max(0, (fin - desde) - minEnTurno(emp, desde, fin))
+        const fp = finTurnoPrevio(emp, desde)
+        const hueco = fp != null ? Math.max(0, desde - fp) : 0
+
+        const descripcion = nombrePrefFijada
+          ? `Adelantar entrada de ${nombre} a las ${minLabel(desde)} para que haga el proceso culpable (${etapa.nombre} la sigue haciendo ${nombrePrefFijada} a las ${minLabel(ancla)})`
+          : `Adelantar entrada de ${nombre} a las ${minLabel(desde)} para que haga el proceso culpable`
+
+        simular(
+          { franjasExtra: { [emp.id]: [franja] } },   // sin PIN de fijada
+          'traer_empleado',
+          'traer',
+          descripcion
+        )
+        const sol = soluciones[soluciones.length - 1]
+        sol.costoExtraMin = costoExtra
+        sol.huecoMuertoMin = hueco
+        opciones.push({ sol, empId: emp.id, costoExtra, hueco })
+      }
     }
 
     // Recomendado: el de menos hueco muerto, luego menos hora extra; desempate por preferido.
@@ -1200,3 +1284,4 @@ export function generarSolucionesConflicto(
 
   return filtradas
 }
+

@@ -10,9 +10,10 @@ import { minToTime, formatDuration } from '../Cronograma/cronogramaHelpers'
 interface PlanificarPageProps {
   diaActual: number
   onVolver: () => void
+  onIrAEditorManual?: () => void
 }
 
-export function PlanificarPage({ diaActual, onVolver }: PlanificarPageProps) {
+export function PlanificarPage({ diaActual, onVolver, onIrAEditorManual }: PlanificarPageProps) {
   const [cola, setCola] = useState<PlanDiaItem[]>([])
   const [plantillas, setPlantillas] = useState<PlantillaProceso[]>([])
   const [empleados, setEmpleados] = useState<{ id: string; nombre_completo: string }[]>([])
@@ -30,6 +31,18 @@ export function PlanificarPage({ diaActual, onVolver }: PlanificarPageProps) {
   const [nuevoInicioMin, setNuevoInicioMin] = useState('')
   const [nuevoInicioMax, setNuevoInicioMax] = useState('')
   const [nuevoFinMax, setNuevoFinMax] = useState('')
+
+  // ===== Estado del editor "Resolver manualmente" =====
+  // Sección colapsable al pie del modal de resolución. Permite armar un SchedulerOverrides a mano
+  // (asignación forzada de empleado + franjas extra ad-hoc) y previsualizar antes de aplicar.
+  const [manualAbierto, setManualAbierto] = useState(false)
+  const [manualEmpleadoId, setManualEmpleadoId] = useState('')   // empleado forzado para la etapa en conflicto
+  const [manualFranjas, setManualFranjas] = useState<{ empleadoId: string; desde: string; hasta: string }[]>([])
+  const [nuevaFranjaEmp, setNuevaFranjaEmp] = useState('')
+  const [nuevaFranjaDesde, setNuevaFranjaDesde] = useState('')
+  const [nuevaFranjaHasta, setNuevaFranjaHasta] = useState('')
+  const [manualNota, setManualNota] = useState('')
+  const [manualPreview, setManualPreview] = useState<{ conflictos: number; cierre: number | null; fuera: number } | null>(null)
 
   const cargar = useCallback(async () => {
     setLoading(true)
@@ -151,10 +164,100 @@ export function PlanificarPage({ diaActual, onVolver }: PlanificarPageProps) {
     if (!preparada) return
     setResolviendo(c)
     setSoluciones(generarSolucionesConflicto(c, preparada.ctx, overrides))
+    // Reset del editor manual al cambiar de conflicto.
+    setManualAbierto(false)
+    setManualEmpleadoId('')
+    setManualFranjas([])
+    setNuevaFranjaEmp(''); setNuevaFranjaDesde(''); setNuevaFranjaHasta('')
+    setManualNota('')
+    setManualPreview(null)
   }
 
   const aplicarSolucion = (s: SolucionConflicto) => {
     aplicarOverrideDelta(s.overrideDelta)
+  }
+
+  // ===== Resolución manual =====
+
+  // Convierte "HH:MM" → minutos del día. Devuelve null si está vacío o inválido.
+  const hhmmAMin = (v: string): number | null => {
+    if (!v) return null
+    const m = /^(\d{1,2}):(\d{2})$/.exec(v.trim())
+    if (!m) return null
+    const h = parseInt(m[1], 10), mi = parseInt(m[2], 10)
+    if (h < 0 || h > 23 || mi < 0 || mi > 59) return null
+    return h * 60 + mi
+  }
+
+  // Arma un SchedulerOverrides a partir de las palancas del editor manual.
+  // No valida (es resolución manual; el usuario asume lo que pone).
+  const construirDeltaManual = (): SchedulerOverrides | null => {
+    if (!resolviendo) return null
+    const delta: SchedulerOverrides = {}
+    // 1) Empleado forzado para la etapa en conflicto.
+    if (manualEmpleadoId) {
+      delta.asignacionFijada = [{
+        plantillaId: resolviendo.plantillaId,
+        lote: resolviendo.lote,
+        etapaOrden: resolviendo.etapa.orden,
+        empleadoId: manualEmpleadoId
+      }]
+    }
+    // 2) Franjas extra ad-hoc.
+    const franjas: Record<string, { desde: number; hasta: number; origen: 'extra'; etiqueta?: string }[]> = {}
+    for (const f of manualFranjas) {
+      const d = hhmmAMin(f.desde), h = hhmmAMin(f.hasta)
+      if (d == null || h == null || h <= d) continue
+      if (!franjas[f.empleadoId]) franjas[f.empleadoId] = []
+      franjas[f.empleadoId].push({ desde: d, hasta: h, origen: 'extra', etiqueta: 'Manual' })
+    }
+    if (Object.keys(franjas).length > 0) delta.franjasExtra = franjas
+    return delta
+  }
+
+  // Simula el delta manual sobre los overrides actuales y muestra el resumen.
+  const previsualizarManual = () => {
+    if (!preparada) return
+    const delta = construirDeltaManual()
+    if (!delta) return
+    const fusionados = fusionarOverrides(overrides, delta)
+    const resultado = generarCronograma(preparada.ctx, fusionados)
+    const conflictos = resultado.conflictos.filter(c => !c.cascada).length
+    // Suma de minutos fuera de turno (todas las franjas 'extra' usadas en las asignaciones).
+    let fuera = 0
+    for (const inst of resultado.instancias) {
+      for (const a of inst.asignaciones) if (a.enFranjaExtra) {
+        for (const iv of a.ventanasAbs) fuera += Math.max(0, iv.fin - iv.inicio)
+      }
+    }
+    setManualPreview({ conflictos, cierre: resultado.cierreJornada, fuera })
+  }
+
+  const aplicarManual = () => {
+    const delta = construirDeltaManual()
+    if (!delta) return
+    // (Nota: el campo 'notas_provisoria' se persiste al aplicar el cronograma — TODO en aplicarResultado).
+    aplicarOverrideDelta(delta)
+    // Reset del editor.
+    setManualAbierto(false)
+    setManualEmpleadoId('')
+    setManualFranjas([])
+    setNuevaFranjaEmp(''); setNuevaFranjaDesde(''); setNuevaFranjaHasta('')
+    setManualNota('')
+    setManualPreview(null)
+  }
+
+  const agregarFranjaManual = () => {
+    if (!nuevaFranjaEmp || !nuevaFranjaDesde || !nuevaFranjaHasta) return
+    if (hhmmAMin(nuevaFranjaDesde) == null || hhmmAMin(nuevaFranjaHasta) == null) return
+    setManualFranjas(prev => [...prev, { empleadoId: nuevaFranjaEmp, desde: nuevaFranjaDesde, hasta: nuevaFranjaHasta }])
+    setNuevaFranjaEmp(''); setNuevaFranjaDesde(''); setNuevaFranjaHasta('')
+    setManualPreview(null)
+  }
+
+  const eliminarFranjaManual = (idx: number) => {
+    setManualFranjas(prev => prev.filter((_, i) => i !== idx))
+    setManualPreview(null)
   }
 
   // Aplica un override y re-simula todo (cascada). Reutilizado por soluciones y acciones de culpable.
@@ -246,17 +349,17 @@ export function PlanificarPage({ diaActual, onVolver }: PlanificarPageProps) {
                         <td className="px-1 py-1.5 text-center">
                           <input type="time" value={item.hora_inicio_min?.slice(0, 5) ?? ''}
                             onChange={e => cambiarHorario(item.id, 'hora_inicio_min', e.target.value)}
-                            className="w-[62px] h-7 px-1 text-center bg-white text-slate-900 border border-slate-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-400" />
+                            className="w-[78px] h-7 px-1 text-center bg-white text-slate-900 border border-slate-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-400" />
                         </td>
                         <td className="px-1 py-1.5 text-center">
                           <input type="time" value={item.hora_inicio_max?.slice(0, 5) ?? ''}
                             onChange={e => cambiarHorario(item.id, 'hora_inicio_max', e.target.value)}
-                            className="w-[62px] h-7 px-1 text-center bg-white text-slate-900 border border-slate-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-400" />
+                            className="w-[78px] h-7 px-1 text-center bg-white text-slate-900 border border-slate-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-400" />
                         </td>
                         <td className="px-1 py-1.5 text-center">
                           <input type="time" value={item.hora_fin_max?.slice(0, 5) ?? ''}
                             onChange={e => cambiarHorario(item.id, 'hora_fin_max', e.target.value)}
-                            className="w-[62px] h-7 px-1 text-center bg-white text-slate-900 border border-slate-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-400" />
+                            className="w-[78px] h-7 px-1 text-center bg-white text-slate-900 border border-slate-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-400" />
                         </td>
                         <td className="px-1 py-1.5">
                           <select value={valorSelectPreferido(item)}
@@ -292,13 +395,13 @@ export function PlanificarPage({ diaActual, onVolver }: PlanificarPageProps) {
                     className="w-12 h-8 px-1 text-center bg-white text-slate-900 border border-slate-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-400" />
                   <input type="time" value={nuevoInicioMin} title="Inicio (opcional, solo este día)"
                     onChange={e => setNuevoInicioMin(e.target.value)}
-                    className="w-[62px] h-8 px-1 text-center bg-white text-slate-900 border border-slate-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-400" />
+                    className="w-[78px] h-8 px-1 text-center bg-white text-slate-900 border border-slate-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-400" />
                   <input type="time" value={nuevoInicioMax} title="Tope de inicio (opcional)"
                     onChange={e => setNuevoInicioMax(e.target.value)}
-                    className="w-[62px] h-8 px-1 text-center bg-white text-slate-900 border border-slate-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-400" />
+                    className="w-[78px] h-8 px-1 text-center bg-white text-slate-900 border border-slate-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-400" />
                   <input type="time" value={nuevoFinMax} title="Fin (opcional)"
                     onChange={e => setNuevoFinMax(e.target.value)}
-                    className="w-[62px] h-8 px-1 text-center bg-white text-slate-900 border border-slate-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-400" />
+                    className="w-[78px] h-8 px-1 text-center bg-white text-slate-900 border border-slate-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-400" />
                   <button onClick={agregarItem} disabled={!nuevaPlantillaId}
                     className="h-8 px-2.5 text-[12px] font-semibold rounded bg-slate-700 text-white hover:bg-slate-800 disabled:opacity-40 flex items-center gap-1">
                     <Plus size={13} /> Agregar
@@ -421,6 +524,135 @@ export function PlanificarPage({ diaActual, onVolver }: PlanificarPageProps) {
                   )
                 })
               )}
+
+              {/* ===== Sección "Resolver manualmente" ===== */}
+              <div className="mt-4 border-t border-slate-200 pt-3">
+                <button
+                  onClick={() => setManualAbierto(v => !v)}
+                  className="flex items-center gap-1.5 text-[12px] font-bold text-slate-700 hover:text-slate-900"
+                >
+                  <Wrench size={13} /> 🔧 Resolver manualmente {manualAbierto ? '▾' : '▸'}
+                </button>
+                {manualAbierto && (
+                  <div className="mt-2 space-y-3 p-3 bg-slate-50 border border-slate-200 rounded-lg">
+                    <p className="text-[11px] text-slate-500">
+                      Ajustes ad-hoc para este conflicto. Se aplican junto a los overrides ya acumulados.
+                      Usá <span className="font-semibold">Previsualizar</span> para ver el impacto antes de aplicar.
+                    </p>
+
+                    {/* 1) Forzar empleado para la etapa en conflicto */}
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <label className="text-[11px] font-semibold text-slate-600 min-w-[140px]">
+                        Asignar esta etapa a:
+                      </label>
+                      <select
+                        value={manualEmpleadoId}
+                        onChange={e => { setManualEmpleadoId(e.target.value); setManualPreview(null) }}
+                        className="flex-1 h-7 px-2 text-[12px] bg-white border border-slate-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-400"
+                      >
+                        <option value="">— sin forzar (lo decide el scheduler) —</option>
+                        {empleados.map(e => <option key={e.id} value={e.id}>{e.nombre_completo}</option>)}
+                      </select>
+                    </div>
+
+                    {/* 2) Franjas extra ad-hoc */}
+                    <div className="space-y-1.5">
+                      <div className="text-[11px] font-semibold text-slate-600">
+                        Adelantar entrada / agregar franja extra:
+                      </div>
+                      {manualFranjas.length > 0 && (
+                        <div className="space-y-1">
+                          {manualFranjas.map((f, i) => (
+                            <div key={i} className="flex items-center gap-2 text-[11px] bg-white border border-slate-200 rounded px-2 py-1">
+                              <span className="flex-1 text-slate-700">
+                                <span className="font-semibold">{nombreEmpleado(f.empleadoId) ?? f.empleadoId}</span>
+                                {' '}— {f.desde} a {f.hasta}
+                              </span>
+                              <button onClick={() => eliminarFranjaManual(i)} className="text-rose-500 hover:text-rose-700">
+                                <Trash2 size={12} />
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        <select
+                          value={nuevaFranjaEmp}
+                          onChange={e => setNuevaFranjaEmp(e.target.value)}
+                          className="flex-1 min-w-[120px] h-7 px-2 text-[11px] bg-white border border-slate-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-400"
+                        >
+                          <option value="">Empleado…</option>
+                          {empleados.map(e => <option key={e.id} value={e.id}>{e.nombre_completo}</option>)}
+                        </select>
+                        <input
+                          type="time"
+                          value={nuevaFranjaDesde}
+                          onChange={e => setNuevaFranjaDesde(e.target.value)}
+                          placeholder="Desde"
+                          title="Desde"
+                          className="w-[88px] h-7 px-1 text-center text-[11px] bg-white border border-slate-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-400"
+                        />
+                        <input
+                          type="time"
+                          value={nuevaFranjaHasta}
+                          onChange={e => setNuevaFranjaHasta(e.target.value)}
+                          placeholder="Hasta"
+                          title="Hasta"
+                          className="w-[88px] h-7 px-1 text-center text-[11px] bg-white border border-slate-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-400"
+                        />
+                        <button
+                          onClick={agregarFranjaManual}
+                          disabled={!nuevaFranjaEmp || !nuevaFranjaDesde || !nuevaFranjaHasta}
+                          className="h-7 px-2 text-[11px] font-semibold rounded bg-slate-700 text-white hover:bg-slate-800 disabled:opacity-40 flex items-center gap-1"
+                        >
+                          <Plus size={11} /> Agregar
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* 3) Nota libre */}
+                    <div>
+                      <label className="text-[11px] font-semibold text-slate-600 block mb-1">Nota (para la resolución):</label>
+                      <textarea
+                        value={manualNota}
+                        onChange={e => setManualNota(e.target.value)}
+                        rows={2}
+                        placeholder="Ej.: traigo a Romina antes para liberar a Sebastian del horno"
+                        className="w-full px-2 py-1 text-[11px] bg-white border border-slate-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-400 resize-none"
+                      />
+                    </div>
+
+                    {/* 4) Previsualización */}
+                    {manualPreview && (
+                      <div className="text-[11px] bg-white border border-slate-200 rounded px-2.5 py-1.5 flex items-center gap-3 flex-wrap">
+                        {manualPreview.conflictos === 0
+                          ? <span className="text-emerald-700 font-semibold">✓ Sin conflictos</span>
+                          : <span className="text-amber-700 font-semibold">⚠ {manualPreview.conflictos} conflicto(s) restante(s)</span>}
+                        {manualPreview.cierre != null && <span className="text-slate-600">· cierre {minToTime(manualPreview.cierre)}</span>}
+                        {manualPreview.fuera > 0 && <span className="text-slate-600">· {formatDuration(manualPreview.fuera)} fuera de turno</span>}
+                      </div>
+                    )}
+
+                    {/* 5) Botones */}
+                    <div className="flex items-center gap-2 justify-end pt-1">
+                      <button
+                        onClick={previsualizarManual}
+                        disabled={!manualEmpleadoId && manualFranjas.length === 0}
+                        className="h-7 px-3 text-[11px] font-semibold text-slate-700 border border-slate-300 bg-white rounded hover:bg-slate-100 disabled:opacity-40"
+                      >
+                        Previsualizar
+                      </button>
+                      <button
+                        onClick={aplicarManual}
+                        disabled={!manualEmpleadoId && manualFranjas.length === 0}
+                        className="h-7 px-3 text-[11px] font-semibold text-white bg-violet-600 rounded hover:bg-violet-700 disabled:opacity-40"
+                      >
+                        Aplicar resolución manual
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
             </div>
           )}
         </div>
@@ -431,6 +663,13 @@ export function PlanificarPage({ diaActual, onVolver }: PlanificarPageProps) {
         <div className="max-w-[900px] mx-auto flex items-center justify-between">
           <button onClick={onVolver} className="h-9 px-3 text-sm font-semibold text-slate-700 border border-slate-300 rounded hover:bg-slate-100">Volver</button>
           <div className="flex items-center gap-2">
+            {onIrAEditorManual && (
+              <button onClick={onIrAEditorManual}
+                className="h-9 px-3 text-sm font-semibold text-violet-700 border border-violet-300 bg-violet-50 rounded hover:bg-violet-100 flex items-center gap-1.5"
+                title="Editor manual libre del día (mover las fichas)">
+                <Wrench size={14} /> Editor manual
+              </button>
+            )}
             <button onClick={generar} disabled={generando || cola.length === 0}
               className="h-9 px-3 text-sm font-semibold text-blue-700 border border-blue-300 bg-blue-50 rounded hover:bg-blue-100 disabled:opacity-40 flex items-center gap-1.5">
               {generando ? <Loader2 size={14} className="animate-spin" /> : <CalendarClock size={14} />} Generar

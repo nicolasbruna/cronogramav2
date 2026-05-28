@@ -129,7 +129,11 @@ export interface SchedulerOverrides {
   relajarInicioPlan?: string[]   // plantillaIds: quitar el "no empezar antes" del plan del día / plantilla (hora_inicio_min)
   sustituirMaquina?: string[]    // etapaIds: pueden usar cualquier máquina activa de su mismo grupo (no solo la asignada)
   excluirPlantillas?: string[]
-  asignacionFijada?: { plantillaId: string; lote: number; etapaOrden: number; empleadoId: string }[]  // PIN
+  asignacionFijada?: { plantillaId: string; lote: number; etapaOrden: number; empleadoId: string }[]  // PIN de EMPLEADO
+  // PIN de HORA: la etapa debe arrancar exactamente en `inicioMin` (no se barre la ventana).
+  // Si la hora pinada no es viable (recursos/empleado ocupados, fuera de turno sin franja extra,
+  // etc.), la instancia queda en conflicto explícito.
+  inicioFijado?: { plantillaId: string; lote: number; etapaOrden: number; inicioMin: number }[]
 }
 
 export interface MetricasJornada {

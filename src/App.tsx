@@ -5,6 +5,7 @@ import { CronogramaPage } from './components/Cronograma/CronogramaPage'
 import { CronogramaEmpleadoPage } from './components/Cronograma/CronogramaEmpleadoPage'
 import { ConfiguracionPage } from './components/Configuracion/ConfiguracionPage'
 import { PlanificarPage } from './components/Planificacion/PlanificarPage'
+import { EditorManualPage } from './components/Planificacion/EditorManualPage'
 import { SimulacionPage } from './components/Simulacion/SimulacionPage'
 import { Loader2 } from 'lucide-react'
 
@@ -13,6 +14,7 @@ type Vista =
   | { tipo: 'cronograma-empleado'; empleadoId: string; dia?: number }
   | { tipo: 'configuracion' }
   | { tipo: 'planificar'; dia: number }
+  | { tipo: 'editor-manual'; dia: number }
   | { tipo: 'simulacion' }
 
 function AppContent() {
@@ -66,7 +68,19 @@ function AppContent() {
   if (vista.tipo === 'planificar') {
     return (
       <div className="h-screen">
-        <PlanificarPage diaActual={vista.dia} onVolver={() => setVista({ tipo: 'cronograma' })} />
+        <PlanificarPage
+          diaActual={vista.dia}
+          onVolver={() => setVista({ tipo: 'cronograma' })}
+          onIrAEditorManual={() => setVista({ tipo: 'editor-manual', dia: vista.dia })}
+        />
+      </div>
+    )
+  }
+
+  if (vista.tipo === 'editor-manual') {
+    return (
+      <div className="h-screen">
+        <EditorManualPage diaActual={vista.dia} onVolver={() => setVista({ tipo: 'planificar', dia: vista.dia })} />
       </div>
     )
   }
