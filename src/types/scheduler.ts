@@ -134,6 +134,9 @@ export interface SchedulerOverrides {
   // Si la hora pinada no es viable (recursos/empleado ocupados, fuera de turno sin franja extra,
   // etc.), la instancia queda en conflicto explícito.
   inicioFijado?: { plantillaId: string; lote: number; etapaOrden: number; inicioMin: number }[]
+  // Vínculos "Proceso A termina antes que Proceso B empiece" — override del día (no persiste en plantilla).
+  // Si B no llega a empezar después del fin de A, B queda en conflicto explícito con A como culpable.
+  secuenciaProcesos?: { antesPlantillaId: string; despuesPlantillaId: string }[]
 }
 
 export interface MetricasJornada {

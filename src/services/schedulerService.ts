@@ -267,10 +267,43 @@ export function generarCronograma(ctx: ContextoScheduler, overrides: SchedulerOv
     const res = colocarProceso(
       proc.plantilla, proc.lote, empleados, empById, ctx.maquinas, cal, overrides, ctx.diaInicio,
       { inicioMin: proc.inicioMinOverride, inicioMax: proc.inicioMaxOverride, finMax: proc.finMaxOverride },
-      proc.preferenciaProceso
+      proc.preferenciaProceso,
+      instancias,   // pasamos lo ya colocado para que respete vínculos secuenciaProcesos
+      plantById
     )
     instancias.push(...res.instancias)
     cal = res.cal
+  }
+
+  // === G6: post-validación bidireccional del vínculo secuenciaProcesos ===
+  // Si B quedó en conflicto culpando a A, marcamos también las instancias de A como conflicto
+  // (la secuencia exige que ambas estén bien). No liberamos reservas del calendario —
+  // el calendario ya no se usa después de generarCronograma y otros procesos podrían depender
+  // de esas reservas.
+  for (const v of (overrides.secuenciaProcesos ?? [])) {
+    const instsB = instancias.filter(i => i.plantillaId === v.despuesPlantillaId)
+    const bFallaPorA = instsB.some(i =>
+      i.estado === 'conflicto' &&
+      !i.cascada &&
+      (i.conflicto?.culpablesPlantillaIds ?? []).includes(v.antesPlantillaId)
+    )
+    if (!bFallaPorA) continue
+    const nombreB = plantById.get(v.despuesPlantillaId)?.nombre ?? 'el otro proceso'
+    for (const inst of instancias) {
+      if (inst.plantillaId !== v.antesPlantillaId) continue
+      if (inst.estado === 'conflicto') continue   // ya está mal por otro motivo, no pisar el mensaje original
+      inst.estado = 'conflicto'
+      inst.inicioAbs = null
+      inst.finAbs = null
+      inst.asignaciones = []
+      inst.recursosAbs = []
+      inst.conflicto = {
+        motivo: 'dependencia',
+        mensaje: `Termina muy tarde para que "${nombreB}" pueda empezar a tiempo. La secuencia activa exige terminar antes.`,
+        culpables: [],
+        culpablesPlantillaIds: [v.despuesPlantillaId]
+      }
+    }
   }
 
   const conflictos = instancias.filter(i => i.estado === 'conflicto')
@@ -297,9 +330,37 @@ function colocarProceso(
   overrides: SchedulerOverrides,
   diaInicio: number,
   overrideDia: OverrideDia,
-  preferenciaProceso: PreferenciaProceso
+  preferenciaProceso: PreferenciaProceso,
+  instanciasPrevias: InstanciaEtapa[] = [],
+  plantById?: Map<string, PlantillaProceso>
 ): { instancias: InstanciaEtapa[]; cal: CalendarioOcupacion } {
   const etapas = [...plantilla.etapas!].sort((a, b) => a.orden - b.orden)
+
+  // === Override secuenciaProcesos: este proceso debe esperar a que termine "antes" ===
+  // Si A no se pudo colocar (alguna instancia en conflicto), B queda bloqueado con motivo claro.
+  let secuenciaPiso = 0
+  let secuenciaRazon = ''
+  let secuenciaCulpableId: string | null = null
+  let secuenciaBloqueada = false
+  const vinculos = (overrides.secuenciaProcesos ?? []).filter(v => v.despuesPlantillaId === plantilla.id)
+  for (const v of vinculos) {
+    const instsAntes = instanciasPrevias.filter(i => i.plantillaId === v.antesPlantillaId)
+    if (instsAntes.length === 0) continue   // antes no está en el plan (o no se intentó aún), ignorar
+    const nombreAntes = plantById?.get(v.antesPlantillaId)?.nombre ?? instsAntes[0].plantillaNombre
+    const algunaEnConflicto = instsAntes.some(i => i.estado !== 'colocada' || i.finAbs == null)
+    if (algunaEnConflicto) {
+      secuenciaBloqueada = true
+      secuenciaCulpableId = v.antesPlantillaId
+      secuenciaRazon = `depende de "${nombreAntes}" que no se pudo ubicar`
+      break
+    }
+    const fin = Math.max(...instsAntes.map(i => i.finAbs!))
+    if (fin > secuenciaPiso) {
+      secuenciaPiso = fin
+      secuenciaCulpableId = v.antesPlantillaId
+      secuenciaRazon = `debe esperar a que termine "${nombreAntes}" (${minLabel(fin)})`
+    }
+  }
 
   // Etapas que pueden adelantarse: se ubican desde el inicio del día (no desde el piso del proceso),
   // así caen en el primer hueco libre aunque el resto de la cadena arranque más tarde.
@@ -318,6 +379,33 @@ function colocarProceso(
     estado: 'conflicto'
   })
 
+  // Info de secuencia para pasar a colocarEtapa (solo se aplica en etapas que arrancan el proceso).
+  const secuenciaInfo = secuenciaPiso > 0
+    ? { piso: secuenciaPiso, razon: secuenciaRazon, culpableId: secuenciaCulpableId }
+    : null
+
+  // Si la secuencia está bloqueada (antes no se pudo colocar), no tiene sentido probar pisos.
+  // Generar conflicto raíz directo, sin commitear nada.
+  if (secuenciaBloqueada) {
+    const insts: InstanciaEtapa[] = []
+    for (const etapa of etapas) {
+      const inst = nuevaInst(etapa)
+      if (etapas[0].id === etapa.id) {
+        inst.conflicto = {
+          motivo: 'dependencia',
+          mensaje: `No se puede ubicar porque ${secuenciaRazon}.`,
+          culpables: [],
+          culpablesPlantillaIds: secuenciaCulpableId ? [secuenciaCulpableId] : []
+        }
+      } else {
+        inst.cascada = true
+        inst.conflicto = { motivo: 'dependencia', mensaje: 'El proceso no se pudo ubicar completo.', culpables: [] }
+      }
+      insts.push(inst)
+    }
+    return { instancias: insts, cal }
+  }
+
   // Prueba colocar toda la cadena con un piso dado, contra un clon del calendario.
   const intentar = (piso: number) => {
     const calAttempt = cal.clonar()
@@ -329,7 +417,7 @@ function colocarProceso(
       const inst = nuevaInst(etapa)
       // Las etapas preparables arrancan su búsqueda desde el inicio del día; el resto, desde el piso.
       const floor = floatableIds.has(etapa.id) ? diaInicio : piso
-      const c = colocarEtapa(inst, plantilla, etapa, colocadasPorId, empleados, empById, maquinas, calAttempt, overrides, lote, floor, overrideDia, preferenciaProceso)
+      const c = colocarEtapa(inst, plantilla, etapa, colocadasPorId, empleados, empById, maquinas, calAttempt, overrides, lote, floor, overrideDia, preferenciaProceso, secuenciaInfo)
       insts.push(inst)
       if (c) { colocadasPorId.set(etapa.id, inst); colocadas++ }
       else ok = false
@@ -367,6 +455,8 @@ function colocarProceso(
       if (p > diaInicio && p < DIA_FIN) candidatos.add(p)
     }
   }
+  // Si hay secuencia, asegurarnos de probar exactamente ese piso (la primera etapa no podrá arrancar antes).
+  if (secuenciaPiso > 0 && secuenciaPiso < DIA_FIN) candidatos.add(secuenciaPiso)
   const pisos = [...candidatos].sort((a, b) => a - b)
 
   let mejor: { insts: InstanciaEtapa[]; colocadas: number } | null = null
@@ -412,7 +502,9 @@ function colocarEtapa(
   lote: number,
   piso: number,
   overrideDia: { inicioMin: number | null; inicioMax: number | null; finMax: number | null },
-  preferenciaProceso: PreferenciaProceso
+  preferenciaProceso: PreferenciaProceso,
+  // Info de vínculo "secuenciaProcesos": solo se aplica si esta etapa es la primera del proceso.
+  secuenciaInfo: { piso: number; razon: string; culpableId: string | null } | null = null
 ): boolean {
   const dur = etapa.duracion_proceso
 
@@ -467,6 +559,10 @@ function colocarEtapa(
   if (depFinMax > 0) subirEarliest(depFinMax, `debe esperar a que termine "${depFinNombre}" (${minLabel(depFinMax)})`)
   subirEarliest(etapaInicioMin, `la etapa no puede empezar antes de las ${minLabel(etapaInicioMin ?? 0)}`)
   subirEarliest(plantInicioMin, `el proceso no puede empezar antes de las ${minLabel(plantInicioMin ?? 0)}`)
+  // Vínculo "secuenciaProcesos": solo aplica a la primera etapa del proceso (la que arranca).
+  if (esInicioProceso && secuenciaInfo && secuenciaInfo.piso > 0) {
+    subirEarliest(secuenciaInfo.piso, secuenciaInfo.razon)
+  }
 
   let latest = DIA_FIN - dur
   let latestReason = 'el fin del día'
@@ -480,10 +576,16 @@ function colocarEtapa(
   // Si hay PIN de hora, la ventana legítima se ignora — la responsabilidad es del usuario.
   const pinHoraTmp = overrides.inicioFijado?.find(p => p.plantillaId === plantilla.id && p.lote === lote && p.etapaOrden === etapa.orden)
   if (earliest > latest && !pinHoraTmp) {
+    // Si la subida del earliest vino del vínculo secuenciaProcesos, marcar al "antes" como culpable.
+    const culpablesPlantillaIds: string[] = []
+    if (esInicioProceso && secuenciaInfo?.culpableId && earliest === secuenciaInfo.piso) {
+      culpablesPlantillaIds.push(secuenciaInfo.culpableId)
+    }
     inst.conflicto = {
       motivo: 'ventana_horaria',
       mensaje: `Dura ${formatDuration(dur)} y no hay lugar en su ventana: puede empezar recién a las ${minLabel(earliest)} porque ${earliestReason}, pero ${latestReason}, así que tendría que empezar a más tardar a las ${minLabel(latest)}.`,
-      culpables: []
+      culpables: [],
+      culpablesPlantillaIds: culpablesPlantillaIds.length > 0 ? culpablesPlantillaIds : undefined
     }
     return false
   }
@@ -970,7 +1072,8 @@ export function fusionarOverrides(base: SchedulerOverrides, delta: SchedulerOver
     excluirPlantillas: [...(base.excluirPlantillas || []), ...(delta.excluirPlantillas || [])],
     asignacionFijada: [...(base.asignacionFijada || []), ...(delta.asignacionFijada || [])],
     sustituirMaquina: [...(base.sustituirMaquina || []), ...(delta.sustituirMaquina || [])],
-    inicioFijado: [...(base.inicioFijado || []), ...(delta.inicioFijado || [])]
+    inicioFijado: [...(base.inicioFijado || []), ...(delta.inicioFijado || [])],
+    secuenciaProcesos: [...(base.secuenciaProcesos || []), ...(delta.secuenciaProcesos || [])]
   }
 }
 
