@@ -43,6 +43,9 @@ export function PlanificarPage({ diaActual, onVolver, onIrAEditorManual }: Plani
   const [nuevaFranjaHasta, setNuevaFranjaHasta] = useState('')
   const [manualNota, setManualNota] = useState('')
   const [manualPreview, setManualPreview] = useState<{ conflictos: number; cierre: number | null; fuera: number } | null>(null)
+  // Cambio E (paso 2): si hubo "Resolver manualmente" en esta sesión, marcamos las tareas como provisorias al aplicar.
+  // null = no hubo resolución manual; string = nota a usar (puede ser '' si el usuario no escribió nada).
+  const [resolucionManualNota, setResolucionManualNota] = useState<string | null>(null)
 
   const cargar = useCallback(async () => {
     setLoading(true)
@@ -67,6 +70,7 @@ export function PlanificarPage({ diaActual, onVolver, onIrAEditorManual }: Plani
     setOverrides({})
     setResolviendo(null)
     setSoluciones([])
+    setResolucionManualNota(null)
     cargar()
   }, [cargar])
 
@@ -152,6 +156,7 @@ export function PlanificarPage({ diaActual, onVolver, onIrAEditorManual }: Plani
       const prep = await generarParaDia(diaActual)
       setPreparada(prep)
       setOverrides({})
+      setResolucionManualNota(null)
     } catch (err) {
       console.error('Error generando:', err)
       alert('Error al generar el cronograma')
@@ -236,8 +241,10 @@ export function PlanificarPage({ diaActual, onVolver, onIrAEditorManual }: Plani
   const aplicarManual = () => {
     const delta = construirDeltaManual()
     if (!delta) return
-    // (Nota: el campo 'notas_provisoria' se persiste al aplicar el cronograma — TODO en aplicarResultado).
     aplicarOverrideDelta(delta)
+    // Guardar la nota (o '' si no la escribió) para que al aplicar al cronograma se persista en
+    // notas_provisoria y se marque la tarea como provisoria.
+    setResolucionManualNota(manualNota || '')
     // Reset del editor.
     setManualAbierto(false)
     setManualEmpleadoId('')
@@ -274,10 +281,19 @@ export function PlanificarPage({ diaActual, onVolver, onIrAEditorManual }: Plani
 
   const aplicar = async () => {
     if (!preparada) return
-    if (!confirm(`Se reemplazarán las tareas generadas previamente del ${DIAS_SEMANA_NOMBRES[diaActual]} (las manuales y bloqueadas se conservan). Se guarda un backup. ¿Continuar?`)) return
+    const conResolucionManual = resolucionManualNota !== null
+    const mensajeExtra = conResolucionManual
+      ? ' Las tareas resultantes quedarán marcadas como PROVISORIAS (borde discontinuo) hasta que las confirmes desde el cronograma.'
+      : ''
+    if (!confirm(`Se reemplazarán las tareas generadas previamente del ${DIAS_SEMANA_NOMBRES[diaActual]} (las manuales y bloqueadas se conservan). Se guarda un backup.${mensajeExtra} ¿Continuar?`)) return
     setAplicando(true)
     try {
-      await aplicarResultado(diaActual, preparada.resultado, preparada.idsReemplazables)
+      await aplicarResultado(
+        diaActual,
+        preparada.resultado,
+        preparada.idsReemplazables,
+        conResolucionManual ? { esProvisoria: true, notasProvisoria: resolucionManualNota || null } : undefined
+      )
       onVolver()
     } catch (err) {
       console.error('Error aplicando:', err)
@@ -674,8 +690,13 @@ export function PlanificarPage({ diaActual, onVolver, onIrAEditorManual }: Plani
               className="h-9 px-3 text-sm font-semibold text-blue-700 border border-blue-300 bg-blue-50 rounded hover:bg-blue-100 disabled:opacity-40 flex items-center gap-1.5">
               {generando ? <Loader2 size={14} className="animate-spin" /> : <CalendarClock size={14} />} Generar
             </button>
+            {resolucionManualNota !== null && (
+              <span className="text-[10px] text-amber-700 bg-amber-50 border border-amber-300 rounded px-2 py-1 font-semibold" title="Hubo resolución manual: las tareas se aplicarán como PROVISORIAS">
+                ⚠️ Provisorio
+              </span>
+            )}
             <button onClick={aplicar} disabled={!preparada || aplicando || colocadas.length === 0}
-              className="h-9 px-4 text-sm font-semibold text-white bg-slate-900 rounded hover:bg-slate-800 disabled:opacity-40 flex items-center gap-1.5">
+              className={`h-9 px-4 text-sm font-semibold text-white rounded disabled:opacity-40 flex items-center gap-1.5 ${resolucionManualNota !== null ? 'bg-amber-600 hover:bg-amber-700' : 'bg-slate-900 hover:bg-slate-800'}`}>
               {aplicando ? <Loader2 size={14} className="animate-spin" /> : null} Aplicar al cronograma
             </button>
           </div>

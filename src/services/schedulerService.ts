@@ -880,7 +880,19 @@ export async function generarParaDia(dia: number, overrides: SchedulerOverrides 
 }
 
 // Aplica el resultado: backup, borra reemplazables, crea las tareas colocadas, aplica solape.
-export async function aplicarResultado(dia: number, resultado: ResultadoScheduler, idsReemplazables: string[]): Promise<void> {
+export interface AplicarOpts {
+  // Marca todas las tareas creadas como provisorias (resolución manual pendiente de confirmar).
+  esProvisoria?: boolean
+  // Nota del usuario que se guarda en notas_provisoria de cada tarea creada.
+  notasProvisoria?: string | null
+}
+
+export async function aplicarResultado(
+  dia: number,
+  resultado: ResultadoScheduler,
+  idsReemplazables: string[],
+  opts?: AplicarOpts
+): Promise<void> {
   await cronogramaService.guardarVersion(
     dia,
     `Backup pre-generación ${new Date().toLocaleString('es-AR')}`,
@@ -890,7 +902,7 @@ export async function aplicarResultado(dia: number, resultado: ResultadoSchedule
   for (const id of idsReemplazables) await cronogramaService.eliminarTarea(id)
 
   for (const inst of resultado.instancias) {
-    if (inst.estado === 'colocada') await materializarInstancia(inst, dia)
+    if (inst.estado === 'colocada') await materializarInstancia(inst, dia, undefined, opts)
   }
 
   // Penalización por solapamiento sobre el resultado final
@@ -925,7 +937,9 @@ function cubreContinuo(ventanas: IntervaloAbs[], inicio: number, fin: number): b
   return cursor >= fin
 }
 
-async function materializarInstancia(inst: InstanciaEtapa, dia: number, grupoIdCadena?: string): Promise<void> {
+async function materializarInstancia(inst: InstanciaEtapa, dia: number, grupoIdCadena?: string, opts?: AplicarOpts): Promise<void> {
+  const esProvisoria = opts?.esProvisoria === true
+  const notasProvisoria = opts?.notasProvisoria ?? null
   const dur = inst.finAbs! - inst.inicioAbs!
   const recursos_programados: RecursoProgramadoCronograma[] = inst.recursosAbs.map(r => ({
     maquina_id: r.maquinaId,
@@ -963,7 +977,9 @@ async function materializarInstancia(inst: InstanciaEtapa, dia: number, grupoIdC
       recursos_programados,
       grupo_id: grupoId,
       tamano: 5,
-      fila: 0
+      fila: 0,
+      es_provisoria: esProvisoria,
+      notas_provisoria: notasProvisoria
     })
 
     // Toques: un bloque corto por cada ventana de cada asignación (principal + ayudantes). Sin máquina
@@ -992,7 +1008,9 @@ async function materializarInstancia(inst: InstanciaEtapa, dia: number, grupoIdC
           duracion_base_min: v.fin - v.inicio,
           grupo_id: grupoId,
           tamano: 5,
-          fila: 0
+          fila: 0,
+          es_provisoria: esProvisoria,
+          notas_provisoria: notasProvisoria
         })
       }
     }
@@ -1025,7 +1043,9 @@ async function materializarInstancia(inst: InstanciaEtapa, dia: number, grupoIdC
     recursos_programados,
     grupo_id: grupoIdCadena ?? null,
     tamano: 5,
-    fila: 0
+    fila: 0,
+    es_provisoria: esProvisoria,
+    notas_provisoria: notasProvisoria
   })
 
   // Ayudantes: un bloque por cada asignación adicional, en la línea del ayudante.
@@ -1050,7 +1070,9 @@ async function materializarInstancia(inst: InstanciaEtapa, dia: number, grupoIdC
       duracion_base_min: fin - ini,
       grupo_id: grupoIdCadena ?? null,
       tamano: 5,
-      fila: 0
+      fila: 0,
+      es_provisoria: esProvisoria,
+      notas_provisoria: notasProvisoria
     })
   }
 }
