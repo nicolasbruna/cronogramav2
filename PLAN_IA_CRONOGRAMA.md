@@ -105,7 +105,8 @@ Verificación local: `supabase functions serve ia-asistente --env-file ./supabas
 - [x] Iter 0 — andamiaje (Edge Function + ping, iaService, feature flag `ia_habilitada`)
 - [x] Iter 1 — repasar y mejorar + auto-aplicar mejoras claras (repaso automático tras generar)
 - [x] Iter 2 — explicar conflictos (botón "Explicar con IA" + badge "IA sugiere")
-- [ ] Iter 3 — comando NL (opcional, pendiente)
+- [x] Iter 3 — comando NL → overrides ("Pedile un cambio a la IA" + preview + aplicar)
+- [x] Toggle de IA en Configuración (tab "IA" → flag `ia_habilitada`)
 
 ### Falta para que funcione en runtime (lo corre el usuario)
 1. `supabase link --project-ref sjqmmqlvmcnctmjrhdlk`

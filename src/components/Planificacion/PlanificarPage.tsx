@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback } from 'react'
 import { Plus, Trash2, CalendarClock, AlertTriangle, CheckCircle2, Loader2, Wrench, ArrowLeft, Sparkles } from 'lucide-react'
 import { planificacionService } from '../../services/planificacionService'
 import { generarParaDia, aplicarResultado, GeneracionPreparada, generarCronograma, generarSolucionesConflicto, fusionarOverrides } from '../../services/schedulerService'
-import { iaDisponible, repasarPlan, explicarConflicto as iaExplicarConflicto, IAError, ResultadoRepaso, PropuestaSimulada } from '../../services/iaService'
+import { iaDisponible, repasarPlan, explicarConflicto as iaExplicarConflicto, comandoAOverrides, IAError, ResultadoRepaso, PropuestaSimulada, PreviewComando } from '../../services/iaService'
 import { PlanDiaItem, PlantillaProceso } from '../../types/planificacion'
 import { SchedulerOverrides, SolucionConflicto, InstanciaEtapa, ResultadoScheduler } from '../../types/scheduler'
 import { IAEstado, ExplicarConflictoData } from '../../types/ia'
@@ -74,6 +74,10 @@ export function PlanificarPage({ diaActual, onVolver, onIrAEditorManual }: Plani
   // Explicar conflicto (sub-caso, dentro del panel de resolución)
   const [iaExplicando, setIaExplicando] = useState(false)
   const [iaExplicacion, setIaExplicacion] = useState<ExplicarConflictoData | null>(null)
+  // Comando en lenguaje natural → overrides
+  const [comandoTexto, setComandoTexto] = useState('')
+  const [comandoCargando, setComandoCargando] = useState(false)
+  const [comandoPreview, setComandoPreview] = useState<PreviewComando | null>(null)
 
   // Carga el estado de la IA al montar y ante cambios de conexión.
   useEffect(() => {
@@ -120,6 +124,24 @@ export function PlanificarPage({ diaActual, onVolver, onIrAEditorManual }: Plani
   const aplicarOpcionIA = (op: PropuestaSimulada) => {
     aplicarOverrideDelta(op.overrideDelta)
     setIaRepaso(null); setIaAutoAviso(null)
+  }
+
+  const interpretarComando = async () => {
+    if (!preparada || !comandoTexto.trim()) return
+    setComandoCargando(true); setComandoPreview(null); setIaError(null)
+    try {
+      setComandoPreview(await comandoAOverrides(comandoTexto.trim(), preparada, overrides))
+    } catch (e) {
+      setIaError(e instanceof Error ? e.message : 'No se pudo interpretar el comando.')
+    } finally {
+      setComandoCargando(false)
+    }
+  }
+
+  const aplicarComando = () => {
+    if (!comandoPreview?.overrideDelta) return
+    aplicarOverrideDelta(comandoPreview.overrideDelta)
+    setComandoPreview(null); setComandoTexto(''); setIaRepaso(null); setIaAutoAviso(null)
   }
 
   const explicarConIA = async () => {
@@ -262,6 +284,7 @@ export function PlanificarPage({ diaActual, onVolver, onIrAEditorManual }: Plani
     setResolviendo(null)
     setSoluciones([])
     setIaRepaso(null); setIaAutoAviso(null); setIaError(null); setIaExplicacion(null)
+    setComandoPreview(null); setComandoTexto('')
     try {
       const prep = await generarParaDia(diaActual)
       setPreparada(prep)
@@ -903,6 +926,53 @@ export function PlanificarPage({ diaActual, onVolver, onIrAEditorManual }: Plani
 
                   {iaRepaso && !iaRepasando && !iaAutoAviso && iaRepaso.opciones.length === 0 && iaRepaso.diagnostico.length === 0 && (
                     <div className="text-[12px] text-slate-500">La IA no encontró mejoras: el plan está bien así.</div>
+                  )}
+                </div>
+              )}
+
+              {/* ===== Comando en lenguaje natural ===== */}
+              {iaEstado.disponible && (
+                <div className="border border-slate-200 rounded-lg bg-white p-3 space-y-2">
+                  <div className="flex items-center gap-1.5 text-[12px] font-bold text-slate-700">
+                    <Sparkles size={13} className="text-violet-600" /> Pedile un cambio a la IA
+                  </div>
+                  <div className="flex gap-2">
+                    <input value={comandoTexto} onChange={e => setComandoTexto(e.target.value)}
+                      onKeyDown={e => { if (e.key === 'Enter') interpretarComando() }}
+                      placeholder="Ej: traé a Romina de 6 a 8 y bajá la prioridad del salado"
+                      className="flex-1 h-8 px-3 rounded-md border border-slate-300 text-[12px] focus:outline-none focus:ring-2 focus:ring-violet-300" />
+                    <button onClick={interpretarComando} disabled={comandoCargando || !comandoTexto.trim()}
+                      className="h-8 px-3 text-[12px] font-semibold text-white bg-violet-600 rounded hover:bg-violet-700 disabled:opacity-50 flex items-center gap-1 flex-shrink-0">
+                      {comandoCargando ? <Loader2 size={12} className="animate-spin" /> : <Sparkles size={12} />} Interpretar
+                    </button>
+                  </div>
+                  {comandoPreview && (
+                    <div className="border border-slate-200 rounded p-2 text-[12px] space-y-1 bg-slate-50">
+                      <div className="text-slate-700"><span className="font-semibold">Entendí:</span> {comandoPreview.resumenInterpretacion}</div>
+                      {comandoPreview.advertencias.length > 0 && (
+                        <ul className="text-amber-600 text-[11px] space-y-0.5">{comandoPreview.advertencias.map((a, i) => <li key={i}>⚠ {a}</li>)}</ul>
+                      )}
+                      {comandoPreview.errores && comandoPreview.errores.length > 0 && (
+                        <div className="text-rose-600 text-[11px]">No se pudo aplicar: {comandoPreview.errores.join('; ')}</div>
+                      )}
+                      {comandoPreview.overrideDelta && comandoPreview.metricas && (
+                        <>
+                          <div className="text-[11px] text-slate-500 flex gap-2 flex-wrap">
+                            {comandoPreview.metricas.conflictos === 0
+                              ? <span className="text-emerald-600 font-semibold">Sin conflictos</span>
+                              : <span className="text-amber-600">{comandoPreview.metricas.conflictos} conflicto(s)</span>}
+                            {comandoPreview.metricas.cierreJornada != null && <span>· cierre {minToTime(comandoPreview.metricas.cierreJornada)}</span>}
+                          </div>
+                          {comandoPreview.diff && comandoPreview.diff.length > 0 && (
+                            <ul className="text-[11px] text-slate-500 space-y-0.5 pl-1">{comandoPreview.diff.slice(0, 6).map((c, i) => <li key={i}>{c}</li>)}</ul>
+                          )}
+                          <div className="flex gap-2 pt-1">
+                            <button onClick={aplicarComando} className="h-7 px-3 text-[11px] font-semibold text-white bg-violet-600 rounded hover:bg-violet-700">Aplicar</button>
+                            <button onClick={() => setComandoPreview(null)} className="h-7 px-3 text-[11px] font-semibold text-slate-600 border border-slate-300 rounded hover:bg-slate-100">Descartar</button>
+                          </div>
+                        </>
+                      )}
+                    </div>
                   )}
                 </div>
               )}

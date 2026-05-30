@@ -26,6 +26,7 @@ import {
   OverrideDeltaWire,
   RepasarPlanData,
   ExplicarConflictoData,
+  ComandoOverridesData,
 } from '../types/ia'
 
 // ============ Errores ============
@@ -289,6 +290,58 @@ export async function explicarConflicto(
       conflictosRestantes: s.metricas.conflictos, costoExtraMin: s.costoExtraMin, dejaProductoFuera: s.dejaProductoFuera,
     })),
   })
+}
+
+// ============ Comando en lenguaje natural -> overrides ============
+export interface PreviewComando {
+  resumenInterpretacion: string
+  advertencias: string[]
+  overrideDelta: SchedulerOverrides | null   // null si la propuesta no es válida
+  errores?: string[]
+  resultado?: ResultadoScheduler
+  metricas?: MetricasJornada
+  diff?: string[]
+}
+
+export async function comandoAOverrides(
+  comando: string,
+  prep: GeneracionPreparada,
+  baseOverrides: SchedulerOverrides,
+): Promise<PreviewComando> {
+  const { ctx, resultado } = prep
+  const data = await invocarIA<ComandoOverridesData>('comando_overrides', {
+    comando,
+    contexto: {
+      dia: ctx.dia,
+      catalogos: {
+        empleados: ctx.empleados.map(e => ({ id: e.id, nombre: e.nombre_completo })),
+        plantillas: ctx.plantillasConEtapas.map(p => ({
+          id: p.id, nombre: p.nombre,
+          etapas: (p.etapas ?? []).map(e => ({ orden: e.orden, nombre: e.nombre })),
+        })),
+      },
+      conflictosActuales: resultado.conflictos.filter(c => !c.cascada).map(c => ({
+        plantillaNombre: c.plantillaNombre, etapaNombre: c.etapa.nombre, lote: c.lote,
+        mensaje: c.conflicto?.mensaje ?? '',
+      })),
+    },
+  })
+
+  const advertencias = data.advertencias ?? []
+  const v = validarOverrides(data.overrides, ctx)
+  if (!v.ok) {
+    return { resumenInterpretacion: data.resumenInterpretacion, advertencias, overrideDelta: null, errores: v.errores }
+  }
+  const fus = fusionarOverrides(baseOverrides, v.overrides)
+  const res = generarCronograma(ctx, fus)
+  return {
+    resumenInterpretacion: data.resumenInterpretacion,
+    advertencias,
+    overrideDelta: v.overrides,
+    resultado: res,
+    metricas: calcularMetricasJornada(res, ctx.empleados),
+    diff: diffInstancias(resultado, res),
+  }
 }
 
 // ============ Helpers ============

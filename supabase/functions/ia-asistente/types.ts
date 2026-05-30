@@ -102,3 +102,19 @@ export interface ExplicarConflictoData {
   recomendacionSolucionId: string | null
   porQueRecomendada: string
 }
+
+// ---- C. comando_overrides ----
+export interface ComandoOverridesPayload {
+  comando: string
+  contexto: {
+    dia: number
+    catalogos: Catalogos
+    conflictosActuales: { plantillaNombre: string; etapaNombre: string; lote: number; mensaje: string }[]
+  }
+}
+
+export interface ComandoOverridesData {
+  overrides: OverrideDeltaWire
+  resumenInterpretacion: string
+  advertencias?: string[]
+}

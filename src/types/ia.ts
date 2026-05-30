@@ -39,3 +39,9 @@ export interface ExplicarConflictoData {
   recomendacionSolucionId: string | null
   porQueRecomendada: string
 }
+
+export interface ComandoOverridesData {
+  overrides: OverrideDeltaWire
+  resumenInterpretacion: string
+  advertencias?: string[]
+}

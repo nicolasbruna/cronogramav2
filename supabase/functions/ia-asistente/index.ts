@@ -5,6 +5,7 @@ import { corsHeaders } from '../_shared/cors.ts'
 import { RequestIA, RespuestaIA } from './types.ts'
 import { repasarPlan } from './handlers/repasarPlan.ts'
 import { explicarConflicto } from './handlers/explicarConflicto.ts'
+import { comandoOverrides } from './handlers/comandoOverrides.ts'
 import { AnthropicError } from './anthropic.ts'
 
 function json(body: unknown, status = 200): Response {
@@ -54,6 +55,10 @@ Deno.serve(async (req: Request) => {
       case 'explicar_conflicto':
         // deno-lint-ignore no-explicit-any
         data = await explicarConflicto(payload as any)
+        break
+      case 'comando_overrides':
+        // deno-lint-ignore no-explicit-any
+        data = await comandoOverrides(payload as any)
         break
       default:
         return json({ ok: false, error: { code: 'accion', message: `Acción desconocida: ${accion}` } }, 400)

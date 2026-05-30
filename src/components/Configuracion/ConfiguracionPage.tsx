@@ -1,14 +1,15 @@
 import { useState } from 'react'
-import { Package, Layers, ArrowLeft, Zap } from 'lucide-react'
+import { Package, Layers, ArrowLeft, Zap, Sparkles } from 'lucide-react'
 import { MaquinasTab } from './MaquinasTab'
 import { PlantillasTab } from './PlantillasTab'
 import { SolapamientoTab } from './SolapamientoTab'
+import { IATab } from './IATab'
 
 interface ConfiguracionPageProps {
   onVolver: () => void
 }
 
-type Tab = 'maquinas' | 'plantillas' | 'solapamiento'
+type Tab = 'maquinas' | 'plantillas' | 'solapamiento' | 'ia'
 
 export function ConfiguracionPage({ onVolver }: ConfiguracionPageProps) {
   const [tab, setTab] = useState<Tab>('plantillas')
@@ -31,6 +32,7 @@ export function ConfiguracionPage({ onVolver }: ConfiguracionPageProps) {
             <TabBtn active={tab === 'plantillas'} onClick={() => setTab('plantillas')} icon={<Layers size={13} />} label="Plantillas de proceso" />
             <TabBtn active={tab === 'maquinas'} onClick={() => setTab('maquinas')} icon={<Package size={13} />} label="Máquinas" />
             <TabBtn active={tab === 'solapamiento'} onClick={() => setTab('solapamiento')} icon={<Zap size={13} />} label="Solapamiento" />
+            <TabBtn active={tab === 'ia'} onClick={() => setTab('ia')} icon={<Sparkles size={13} />} label="IA" />
           </div>
         </div>
       </div>
@@ -39,6 +41,7 @@ export function ConfiguracionPage({ onVolver }: ConfiguracionPageProps) {
       <div className="flex-1 min-h-0 overflow-hidden p-5">
         {tab === 'maquinas' && <MaquinasTab />}
         {tab === 'solapamiento' && <SolapamientoTab />}
+        {tab === 'ia' && <IATab />}
         {tab === 'plantillas' && (
           <div className="h-full flex flex-col">
             <div className="mb-3">

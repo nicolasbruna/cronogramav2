@@ -5,17 +5,19 @@ import { Tool } from './anthropic.ts'
 import { Catalogos } from './types.ts'
 
 export const TOOL_PROPONER = 'proponer_mejoras'
+export const TOOL_COMANDO = 'proponer_overrides'
 
 function idEnum(ids: string[]) {
   // Si no hay IDs, dejamos string libre (la validación dura está en el cliente igual).
   return ids.length > 0 ? { type: 'string', enum: ids } : { type: 'string' }
 }
 
-export function buildToolProponer(catalogos: Catalogos): Tool {
+// Esquema del overrideDelta (compartido por repasar_plan y comando_overrides).
+export function buildOverrideDeltaSchema(catalogos: Catalogos): Record<string, unknown> {
   const empIds = catalogos.empleados.map(e => e.id)
   const plantIds = catalogos.plantillas.map(p => p.id)
 
-  const overrideDelta = {
+  return {
     type: 'object',
     description: 'Cambio mínimo y puntual a aplicar. Usá solo los campos necesarios.',
     additionalProperties: false,
@@ -100,7 +102,10 @@ export function buildToolProponer(catalogos: Catalogos): Tool {
       relajarInicioPlan: { type: 'array', items: idEnum(plantIds) },
     },
   }
+}
 
+export function buildToolProponer(catalogos: Catalogos): Tool {
+  const overrideDelta = buildOverrideDeltaSchema(catalogos)
   return {
     name: TOOL_PROPONER,
     description:
@@ -136,6 +141,26 @@ export function buildToolProponer(catalogos: Catalogos): Tool {
         },
       },
       required: ['diagnostico', 'propuestas'],
+    },
+  }
+}
+
+// Tool para comando_overrides: traduce un pedido en lenguaje natural a un overrideDelta.
+export function buildToolComando(catalogos: Catalogos): Tool {
+  return {
+    name: TOOL_COMANDO,
+    description:
+      'Traducí el pedido del usuario a un overrideDelta. Usá solo IDs de los catálogos. Si algo es ' +
+      'ambiguo o un nombre no existe, no lo inventes: dejalo fuera y avisalo en advertencias.',
+    input_schema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        overrides: buildOverrideDeltaSchema(catalogos),
+        resumenInterpretacion: { type: 'string', description: 'En una frase, qué entendiste que hay que hacer.' },
+        advertencias: { type: 'array', items: { type: 'string' } },
+      },
+      required: ['overrides', 'resumenInterpretacion'],
     },
   }
 }
