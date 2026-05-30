@@ -506,7 +506,10 @@ function colocarEtapa(
   // Info de vínculo "secuenciaProcesos": solo se aplica si esta etapa es la primera del proceso.
   secuenciaInfo: { piso: number; razon: string; culpableId: string | null } | null = null
 ): boolean {
-  const dur = etapa.duracion_proceso
+  // #26 Override de duración para esta instancia (resolución manual). Si no hay, usa la duración de la etapa.
+  const overrideDur = overrides.duracionFijada?.find(d =>
+    d.plantillaId === plantilla.id && d.lote === lote && d.etapaOrden === etapa.orden)
+  const dur = overrideDur?.duracionMin ?? etapa.duracion_proceso
 
   // Restricciones (override de relajación si aplica)
   const rel = overrides.relajarRestriccion?.[etapa.id] || overrides.relajarRestriccion?.[plantilla.id]
@@ -553,9 +556,17 @@ function colocarEtapa(
   const esInicioProceso = (etapa.dependencias?.length ?? 0) === 0
 
   // Ventana de inicio permitida, registrando el motivo de cada borde para explicar conflictos.
+  // #28 Llevamos un trace de decisiones para el botón "¿Por qué?".
+  const decisiones: string[] = [`Etapa "${etapa.nombre}" de "${plantilla.nombre}" (lote ${lote}), duración ${formatDuration(dur)}.`]
   let earliest = piso
   let earliestReason = `no puede arrancar antes de las ${minLabel(piso)}`
-  const subirEarliest = (v: number | null, reason: string) => { if (v != null && v > earliest) { earliest = v; earliestReason = reason } }
+  decisiones.push(`Piso inicial: ${minLabel(piso)} (${earliestReason}).`)
+  const subirEarliest = (v: number | null, reason: string) => {
+    if (v != null && v > earliest) {
+      earliest = v; earliestReason = reason
+      decisiones.push(`Subí piso a ${minLabel(v)}: ${reason}.`)
+    }
+  }
   if (depFinMax > 0) subirEarliest(depFinMax, `debe esperar a que termine "${depFinNombre}" (${minLabel(depFinMax)})`)
   subirEarliest(etapaInicioMin, `la etapa no puede empezar antes de las ${minLabel(etapaInicioMin ?? 0)}`)
   subirEarliest(plantInicioMin, `el proceso no puede empezar antes de las ${minLabel(plantInicioMin ?? 0)}`)
@@ -566,7 +577,12 @@ function colocarEtapa(
 
   let latest = DIA_FIN - dur
   let latestReason = 'el fin del día'
-  const bajarLatest = (v: number | null, reason: string) => { if (v != null && v < latest) { latest = v; latestReason = reason } }
+  const bajarLatest = (v: number | null, reason: string) => {
+    if (v != null && v < latest) {
+      latest = v; latestReason = reason
+      decisiones.push(`Bajé tope a ${minLabel(v)}: ${reason}.`)
+    }
+  }
   if (etapaInicioMax != null) bajarLatest(etapaInicioMax, `la etapa debe empezar a más tardar a las ${minLabel(etapaInicioMax)}`)
   if (esInicioProceso && plantInicioMax != null) bajarLatest(plantInicioMax, `el proceso debe empezar a más tardar a las ${minLabel(plantInicioMax)}`)
   if (etapaFinMax != null) bajarLatest(etapaFinMax - dur, `la etapa debe terminar a más tardar a las ${minLabel(etapaFinMax)}`)
@@ -581,11 +597,13 @@ function colocarEtapa(
     if (esInicioProceso && secuenciaInfo?.culpableId && earliest === secuenciaInfo.piso) {
       culpablesPlantillaIds.push(secuenciaInfo.culpableId)
     }
+    decisiones.push(`✗ Ventana imposible: earliest (${minLabel(earliest)}) > latest (${minLabel(latest)}). Conflicto.`)
     inst.conflicto = {
       motivo: 'ventana_horaria',
       mensaje: `Dura ${formatDuration(dur)} y no hay lugar en su ventana: puede empezar recién a las ${minLabel(earliest)} porque ${earliestReason}, pero ${latestReason}, así que tendría que empezar a más tardar a las ${minLabel(latest)}.`,
       culpables: [],
-      culpablesPlantillaIds: culpablesPlantillaIds.length > 0 ? culpablesPlantillaIds : undefined
+      culpablesPlantillaIds: culpablesPlantillaIds.length > 0 ? culpablesPlantillaIds : undefined,
+      decisionesScheduler: [...decisiones]
     }
     return false
   }
@@ -630,6 +648,31 @@ function colocarEtapa(
     inst.estado = 'colocada'
     for (const r of inst.recursosAbs) cal.reservarMaquina(r.maquinaId, r.intervalo, r.uso, etiqueta, inst.plantillaId)
     for (const a of inst.asignaciones) for (const iv of a.ventanasAbs) cal.reservarEmpleado(a.empleadoId, iv, etiqueta, inst.plantillaId, permiteSolape, exclusiva)
+
+    // #25 Ayudantes fijados (resolución manual): sumar empleados adicionales al principal SI están disponibles.
+    // Cubren todo el rango [inicio, fin] de la etapa. Si alguno no está disponible, se ignora silenciosamente.
+    const ayudantesOv = overrides.ayudantesFijados?.find(a =>
+      a.plantillaId === plantilla.id && a.lote === lote && a.etapaOrden === etapa.orden)
+    if (ayudantesOv) {
+      const ventanaAyudante: IntervaloAbs = { inicio: hit.t, fin: hit.t + dur }
+      for (const empId of ayudantesOv.empleadosIds) {
+        if (inst.asignaciones.some(a => a.empleadoId === empId)) continue   // ya está como principal
+        const emp = empById.get(empId)
+        if (!emp) continue
+        if (!ventanaEnUnaFranja(emp, ventanaAyudante)) continue
+        if (!cal.empleadoLibre(empId, [ventanaAyudante], permiteSolape, exclusiva)) continue
+        inst.asignaciones.push({
+          slotId: `ayudante:${empId}`,
+          rol: 'ayudante',
+          empleadoId: empId,
+          empleadoNombre: emp.nombre_completo,
+          ventanasAbs: [ventanaAyudante],
+          esReemplazo: false,
+          enFranjaExtra: emp.franjas.some(f => f.origen === 'extra' && f.desde <= hit.t && f.hasta >= hit.t + dur)
+        })
+        cal.reservarEmpleado(empId, ventanaAyudante, etiqueta + ' · ayuda', inst.plantillaId, permiteSolape, exclusiva)
+      }
+    }
     return true
   }
 
@@ -656,11 +699,13 @@ function colocarEtapa(
         maquinasCandidatas(r.maquina_id, maquinas, permitirSustitucion).flatMap(m => cal.plantillasMaquina(m.id, [ventana]))
       )
     )].filter(id => id !== plantilla.id)
+    decisiones.push(`✗ Máquina "${primerFallo.detalle}" ocupada en toda la ventana.`)
     inst.conflicto = {
       motivo: 'maquina_ocupada',
       mensaje: `La máquina "${primerFallo.detalle}" está ocupada durante toda la ventana posible de esta etapa (${ventanaTxt}), así que no hay momento libre para hacerla.${usan}`,
       culpables,
-      culpablesPlantillaIds
+      culpablesPlantillaIds,
+      decisionesScheduler: [...decisiones]
     }
   } else if (primerFallo?.motivo === 'empleado_no_disponible') {
     // Explicar qué ocupa a cada empleado preferido dentro de la ventana (nombrar al "culpable").
@@ -690,6 +735,7 @@ function colocarEtapa(
       const span = cal.spanOcupacionPlantillasEnEmpleado([...culpablesPlantillaIds], s.empleado_preferido_id)
       if (span > leadBloqueo) { leadBloqueo = span; preferidoBloqueadoId = s.empleado_preferido_id }
     }
+    decisiones.push(`✗ Empleado no disponible: ${detalleTxt.trim() || 'ninguno cumple los requisitos.'}`)
     inst.conflicto = {
       motivo: 'empleado_no_disponible',
       culpablesPlantillaIds: [...culpablesPlantillaIds],
@@ -698,13 +744,16 @@ function colocarEtapa(
       desdeColocacion: earliest,
       topeColocacion: latest,
       leadBloqueo: leadBloqueo > 0 ? leadBloqueo : undefined,
-      preferidoBloqueadoId
+      preferidoBloqueadoId,
+      decisionesScheduler: [...decisiones]
     }
   } else {
+    decisiones.push(`✗ No se encontró ningún momento libre.`)
     inst.conflicto = {
       motivo: 'ventana_horaria',
       mensaje: `No se encontró ningún momento libre dentro de su ventana (${ventanaTxt}).`,
-      culpables: []
+      culpables: [],
+      decisionesScheduler: [...decisiones]
     }
   }
   return false
@@ -1095,7 +1144,9 @@ export function fusionarOverrides(base: SchedulerOverrides, delta: SchedulerOver
     asignacionFijada: [...(base.asignacionFijada || []), ...(delta.asignacionFijada || [])],
     sustituirMaquina: [...(base.sustituirMaquina || []), ...(delta.sustituirMaquina || [])],
     inicioFijado: [...(base.inicioFijado || []), ...(delta.inicioFijado || [])],
-    secuenciaProcesos: [...(base.secuenciaProcesos || []), ...(delta.secuenciaProcesos || [])]
+    secuenciaProcesos: [...(base.secuenciaProcesos || []), ...(delta.secuenciaProcesos || [])],
+    duracionFijada: [...(base.duracionFijada || []), ...(delta.duracionFijada || [])],
+    ayudantesFijados: [...(base.ayudantesFijados || []), ...(delta.ayudantesFijados || [])]
   }
 }
 

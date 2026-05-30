@@ -72,6 +72,8 @@ export interface ConflictoInfo {
   topeColocacion?: number          // minuto límite (latest) en que esta etapa debe arrancar como máximo
   leadBloqueo?: number             // minutos que el proceso culpable ocupa al empleado preferido (lo que tarda, p.ej. la crema)
   preferidoBloqueadoId?: string    // empleado preferido que está bloqueado por el proceso culpable
+  // #28 Camino de decisiones del scheduler que llevaron al conflicto (para debug "¿Por qué?").
+  decisionesScheduler?: string[]
 }
 
 // Una instancia concreta de una etapa (una etapa de una plantilla en un lote)
@@ -137,6 +139,10 @@ export interface SchedulerOverrides {
   // Vínculos "Proceso A termina antes que Proceso B empiece" — override del día (no persiste en plantilla).
   // Si B no llega a empezar después del fin de A, B queda en conflicto explícito con A como culpable.
   secuenciaProcesos?: { antesPlantillaId: string; despuesPlantillaId: string }[]
+  // Override de duración para una etapa puntual (no toca la plantilla).
+  duracionFijada?: { plantillaId: string; lote: number; etapaOrden: number; duracionMin: number }[]
+  // Ayudantes adicionales para una etapa (NO reemplazan al principal — se suman como rol 'ayudante').
+  ayudantesFijados?: { plantillaId: string; lote: number; etapaOrden: number; empleadosIds: string[] }[]
 }
 
 export interface MetricasJornada {
