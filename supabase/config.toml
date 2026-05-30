@@ -380,6 +380,10 @@ deno_version = 2
 # [edge_runtime.secrets]
 # secret_key = "env(SECRET_VALUE)"
 
+[functions.ia-asistente]
+# Exige JWT válido del usuario antes de invocar la función (capa de IA opcional).
+verify_jwt = true
+
 [analytics]
 enabled = true
 port = 54327

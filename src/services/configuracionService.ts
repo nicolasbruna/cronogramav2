@@ -17,6 +17,7 @@ const DEFAULT_CONFIG: ConfiguracionSolape = {
 
 const KEY_PCT = 'solape_penalizacion_pct'
 const KEY_MODO = 'solape_modo_default'
+const KEY_IA = 'ia_habilitada'
 
 export const configuracionService = {
   async obtenerConfiguracionSolape(): Promise<ConfiguracionSolape> {
@@ -48,5 +49,30 @@ export const configuracionService = {
         { clave: KEY_MODO, valor: cfg.modoDefault, fecha_actualizacion: fecha }
       ], { onConflict: 'clave' })
     if (error) throw error
+  },
+
+  // Feature flag de la capa de IA (opcional). Default: desactivada.
+  // Se cachea en memoria para no consultar en cada repaso.
+  async obtenerIAHabilitada(): Promise<boolean> {
+    if (_iaHabilitadaCache !== null) return _iaHabilitadaCache
+    const { data, error } = await supabase
+      .from('configuracion_sistema')
+      .select('valor')
+      .eq('clave', KEY_IA)
+      .maybeSingle()
+    if (error) throw error
+    _iaHabilitadaCache = data?.valor === true
+    return _iaHabilitadaCache
+  },
+
+  async guardarIAHabilitada(habilitada: boolean): Promise<void> {
+    const { error } = await supabase
+      .from('configuracion_sistema')
+      .upsert([{ clave: KEY_IA, valor: habilitada, fecha_actualizacion: new Date().toISOString() }], { onConflict: 'clave' })
+    if (error) throw error
+    _iaHabilitadaCache = habilitada
   }
 }
+
+// Cache en memoria del flag de IA (se setea al leer/guardar).
+let _iaHabilitadaCache: boolean | null = null

@@ -1,9 +1,11 @@
 import { useState, useEffect, useCallback } from 'react'
-import { Plus, Trash2, CalendarClock, AlertTriangle, CheckCircle2, Loader2, Wrench, ArrowLeft } from 'lucide-react'
+import { Plus, Trash2, CalendarClock, AlertTriangle, CheckCircle2, Loader2, Wrench, ArrowLeft, Sparkles } from 'lucide-react'
 import { planificacionService } from '../../services/planificacionService'
 import { generarParaDia, aplicarResultado, GeneracionPreparada, generarCronograma, generarSolucionesConflicto, fusionarOverrides } from '../../services/schedulerService'
+import { iaDisponible, repasarPlan, explicarConflicto as iaExplicarConflicto, IAError, ResultadoRepaso, PropuestaSimulada } from '../../services/iaService'
 import { PlanDiaItem, PlantillaProceso } from '../../types/planificacion'
 import { SchedulerOverrides, SolucionConflicto, InstanciaEtapa, ResultadoScheduler } from '../../types/scheduler'
+import { IAEstado, ExplicarConflictoData } from '../../types/ia'
 import { DIAS_SEMANA_NOMBRES } from '../../types/cronograma'
 import { minToTime, formatDuration } from '../Cronograma/cronogramaHelpers'
 
@@ -62,6 +64,75 @@ export function PlanificarPage({ diaActual, onVolver, onIrAEditorManual }: Plani
   const [templates, setTemplates] = useState<{ nombre: string; campos: TemplateCampos }[]>(() => cargarTemplatesDeStorage())
   const [templateSeleccionado, setTemplateSeleccionado] = useState('')
   const [nuevoTemplateNombre, setNuevoTemplateNombre] = useState('')
+
+  // ===== Capa de IA (opcional): repasa el plan y propone/aplica mejoras =====
+  const [iaEstado, setIaEstado] = useState<IAEstado>({ disponible: false })
+  const [iaRepasando, setIaRepasando] = useState(false)
+  const [iaRepaso, setIaRepaso] = useState<ResultadoRepaso | null>(null)
+  const [iaAutoAviso, setIaAutoAviso] = useState<{ titulo: string; diff: string[] } | null>(null)
+  const [iaError, setIaError] = useState<string | null>(null)
+  // Explicar conflicto (sub-caso, dentro del panel de resolución)
+  const [iaExplicando, setIaExplicando] = useState(false)
+  const [iaExplicacion, setIaExplicacion] = useState<ExplicarConflictoData | null>(null)
+
+  // Carga el estado de la IA al montar y ante cambios de conexión.
+  useEffect(() => {
+    let activo = true
+    const check = () => { iaDisponible().then(e => { if (activo) setIaEstado(e) }).catch(() => {}) }
+    check()
+    window.addEventListener('online', check)
+    window.addEventListener('offline', check)
+    return () => { activo = false; window.removeEventListener('online', check); window.removeEventListener('offline', check) }
+  }, [])
+
+  // Repaso automático: la IA revisa el resultado y aplica sola las mejoras claras.
+  const ejecutarRepaso = async (prep: GeneracionPreparada, baseOv: SchedulerOverrides) => {
+    setIaRepaso(null); setIaAutoAviso(null); setIaError(null)
+    setIaRepasando(true)
+    try {
+      const rep = await repasarPlan(prep, baseOv)
+      if (rep.autoAplicable) {
+        // Mejora clara → se aplica sola (el resultado ya fue simulado con base+delta).
+        const nuevos = fusionarOverrides(baseOv, rep.autoAplicable.overrideDelta)
+        setOverrides(nuevos)
+        setPreparada({ ...prep, resultado: rep.autoAplicable.resultado })
+        setIaAutoAviso({ titulo: rep.autoAplicable.titulo, diff: rep.autoAplicable.diff })
+      }
+      setIaRepaso(rep)
+    } catch (e) {
+      // Si la IA no está disponible, degradar en silencio (el plan determinístico vale igual).
+      const code = e instanceof IAError ? e.code : 'servidor'
+      if (code !== 'offline' && code !== 'desactivada' && code !== 'sin_config') {
+        setIaError(e instanceof Error ? e.message : 'No se pudo repasar con IA.')
+      }
+    } finally {
+      setIaRepasando(false)
+    }
+  }
+
+  const repasarSiDisponible = async (prep: GeneracionPreparada) => {
+    const est = await iaDisponible()
+    setIaEstado(est)
+    if (est.disponible) await ejecutarRepaso(prep, {})
+  }
+
+  // Aplica una opción propuesta por la IA (cuando no hubo auto-aplicación).
+  const aplicarOpcionIA = (op: PropuestaSimulada) => {
+    aplicarOverrideDelta(op.overrideDelta)
+    setIaRepaso(null); setIaAutoAviso(null)
+  }
+
+  const explicarConIA = async () => {
+    if (!resolviendo) return
+    setIaExplicando(true); setIaExplicacion(null); setIaError(null)
+    try {
+      setIaExplicacion(await iaExplicarConflicto(resolviendo, soluciones))
+    } catch (e) {
+      setIaError(e instanceof Error ? e.message : 'No se pudo explicar con IA.')
+    } finally {
+      setIaExplicando(false)
+    }
+  }
 
   const cargar = useCallback(async () => {
     setLoading(true)
@@ -190,11 +261,14 @@ export function PlanificarPage({ diaActual, onVolver, onIrAEditorManual }: Plani
     setGenerando(true)
     setResolviendo(null)
     setSoluciones([])
+    setIaRepaso(null); setIaAutoAviso(null); setIaError(null); setIaExplicacion(null)
     try {
       const prep = await generarParaDia(diaActual)
       setPreparada(prep)
       setOverrides({})
       setResolucionManualNota(null)
+      // La IA repasa el plan automáticamente (si hay internet y está habilitada).
+      void repasarSiDisponible(prep)
     } catch (err) {
       console.error('Error generando:', err)
       alert('Error al generar el cronograma')
@@ -215,6 +289,7 @@ export function PlanificarPage({ diaActual, onVolver, onIrAEditorManual }: Plani
     setNuevaFranjaEmp(''); setNuevaFranjaDesde(''); setNuevaFranjaHasta('')
     setManualNota('')
     setManualPreview(null)
+    setIaExplicacion(null)
   }
 
   const aplicarSolucion = (s: SolucionConflicto) => {
@@ -759,6 +834,78 @@ export function PlanificarPage({ diaActual, onVolver, onIrAEditorManual }: Plani
                   </div>
                 </div>
               )}
+
+              {/* ===== Repaso de la IA (automático) ===== */}
+              {(iaRepasando || iaRepaso || iaAutoAviso || iaError) && (
+                <div className="border border-violet-200 rounded-lg bg-violet-50/40 p-3 space-y-2">
+                  <div className="flex items-center gap-1.5 text-[12px] font-bold text-violet-700">
+                    <Sparkles size={13} /> Repaso de la IA
+                    {iaRepasando && <Loader2 size={12} className="animate-spin text-violet-500" />}
+                  </div>
+
+                  {iaRepasando && <div className="text-[12px] text-slate-500">La IA está repasando el plan…</div>}
+                  {iaError && <div className="text-[12px] text-rose-600">{iaError}</div>}
+
+                  {iaAutoAviso && (
+                    <div className="border border-emerald-200 bg-emerald-50 rounded p-2 text-[12px]">
+                      <div className="font-semibold text-emerald-700 flex items-center gap-1">
+                        <CheckCircle2 size={12} /> La IA aplicó una mejora: {iaAutoAviso.titulo}
+                      </div>
+                      {iaAutoAviso.diff.length > 0 && (
+                        <ul className="mt-1 space-y-0.5 text-slate-600 pl-1">
+                          {iaAutoAviso.diff.map((c, i) => <li key={i}>{c}</li>)}
+                        </ul>
+                      )}
+                      <div className="text-[11px] text-slate-400 mt-1">Se guardó como cambio del plan. Volvé a generar para descartarlo.</div>
+                    </div>
+                  )}
+
+                  {iaRepaso && iaRepaso.diagnostico.length > 0 && (
+                    <div className="space-y-1">
+                      {iaRepaso.diagnostico.map((d, i) => (
+                        <div key={i} className="text-[12px] flex items-start gap-1.5">
+                          <span className={`flex-shrink-0 px-1.5 py-0.5 text-[9px] font-bold uppercase rounded ${
+                            d.severidad === 'alta' ? 'bg-rose-100 text-rose-700'
+                              : d.severidad === 'media' ? 'bg-amber-100 text-amber-700'
+                                : 'bg-slate-100 text-slate-600'}`}>{d.severidad}</span>
+                          <span><span className="font-semibold text-slate-700">{d.titulo}:</span> <span className="text-slate-600">{d.detalle}</span></span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {iaRepaso && !iaRepaso.autoAplicable && iaRepaso.opciones.length > 0 && (
+                    <div className="space-y-1.5">
+                      <div className="text-[11px] uppercase tracking-wider font-bold text-violet-600">Opciones para mejorar</div>
+                      {iaRepaso.opciones.map((op, i) => (
+                        <div key={i} className="border border-slate-200 rounded bg-white px-3 py-2">
+                          <div className="text-[12px] font-semibold text-slate-800">{op.titulo}</div>
+                          <div className="text-[11px] text-slate-500 mt-0.5">{op.justificacion}</div>
+                          <div className="text-[11px] text-slate-500 mt-1 flex gap-2 flex-wrap">
+                            {op.metricas.conflictos === 0
+                              ? <span className="text-emerald-600 font-semibold">Sin conflictos</span>
+                              : <span className="text-amber-600">{op.metricas.conflictos} conflicto(s)</span>}
+                            {op.metricas.cierreJornada != null && <span>· cierre {minToTime(op.metricas.cierreJornada)}</span>}
+                          </div>
+                          {op.diff.length > 0 && (
+                            <ul className="text-[11px] text-slate-500 mt-1 space-y-0.5 pl-1">
+                              {op.diff.slice(0, 5).map((c, j) => <li key={j}>{c}</li>)}
+                            </ul>
+                          )}
+                          <button onClick={() => aplicarOpcionIA(op)}
+                            className="mt-1.5 h-6 px-3 text-[11px] font-semibold text-white bg-violet-600 rounded hover:bg-violet-700">
+                            Aplicar esta opción
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {iaRepaso && !iaRepasando && !iaAutoAviso && iaRepaso.opciones.length === 0 && iaRepaso.diagnostico.length === 0 && (
+                    <div className="text-[12px] text-slate-500">La IA no encontró mejoras: el plan está bien así.</div>
+                  )}
+                </div>
+              )}
             </div>
           )}
 
@@ -780,8 +927,25 @@ export function PlanificarPage({ diaActual, onVolver, onIrAEditorManual }: Plani
                     🔍 ¿Por qué? {porQueAbierto ? '▾' : '▸'}
                   </button>
                 )}
+                {/* Explicar con IA (sub-caso del repaso) */}
+                {iaEstado.disponible && (
+                  <button onClick={explicarConIA} disabled={iaExplicando}
+                          className="h-6 px-2 text-[11px] font-semibold text-violet-700 border border-violet-300 bg-violet-50 rounded hover:bg-violet-100 flex items-center gap-1 disabled:opacity-50">
+                    {iaExplicando ? <Loader2 size={11} className="animate-spin" /> : <Sparkles size={11} />} Explicar con IA
+                  </button>
+                )}
               </div>
               <div className="text-[12px] text-amber-600">{resolviendo.conflicto?.mensaje}</div>
+              {/* Explicación de la IA */}
+              {iaExplicacion && (
+                <div className="bg-violet-50 border border-violet-200 rounded p-2.5 text-[12px] space-y-1">
+                  <div className="flex items-center gap-1 text-[11px] font-bold text-violet-700"><Sparkles size={11} /> Explicación de la IA</div>
+                  <div className="text-slate-700">{iaExplicacion.explicacion}</div>
+                  {iaExplicacion.recomendacionSolucionId && (
+                    <div className="text-slate-600"><span className="font-semibold">Recomendación:</span> {iaExplicacion.porQueRecomendada}</div>
+                  )}
+                </div>
+              )}
               {/* #28 Panel desplegable con las decisiones del scheduler */}
               {porQueAbierto && resolviendo.conflicto?.decisionesScheduler && (
                 <div className="bg-slate-50 border border-slate-200 rounded p-2.5 text-[11px] space-y-0.5">
@@ -817,6 +981,9 @@ export function PlanificarPage({ diaActual, onVolver, onIrAEditorManual }: Plani
                                 {s.descripcion}
                                 {s.recomendada && (
                                   <span className="px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide text-emerald-700 bg-emerald-100 rounded">Recomendado</span>
+                                )}
+                                {iaExplicacion?.recomendacionSolucionId === s.id && (
+                                  <span className="px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide text-violet-700 bg-violet-100 rounded flex items-center gap-0.5"><Sparkles size={9} /> IA sugiere</span>
                                 )}
                               </div>
                               <div className="text-[11px] text-slate-500 flex items-center gap-2 mt-0.5 flex-wrap">
