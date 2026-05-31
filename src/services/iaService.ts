@@ -53,7 +53,7 @@ export async function iaDisponible(): Promise<IAEstado> {
 }
 
 // ============ Invocación de la Edge Function ============
-async function invocarIA<T>(accion: AccionIA, payload: unknown, timeoutMs = 30_000): Promise<T> {
+async function invocarIA<T>(accion: AccionIA, payload: unknown, timeoutMs = 75_000): Promise<T> {
   if (typeof navigator !== 'undefined' && !navigator.onLine) throw new IAError('offline', 'Sin conexión.')
 
   const llamada = supabase.functions.invoke('ia-asistente', { body: { accion, payload } })

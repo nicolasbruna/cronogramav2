@@ -4,7 +4,7 @@
 export const MODELO_DEFAULT = 'claude-sonnet-4-6'
 const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages'
 const ANTHROPIC_VERSION = '2023-06-01'
-const TIMEOUT_MS = 25_000
+const TIMEOUT_MS = 60_000
 
 export interface BloqueSystem {
   type: 'text'
