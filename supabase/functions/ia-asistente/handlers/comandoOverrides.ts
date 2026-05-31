@@ -36,7 +36,7 @@ explicá en advertencias qué no pudiste mapear.`
   const resp = await llamarClaude({
     system: buildSystem(),
     messages: [{ role: 'user', content: userMsg }],
-    maxTokens: 1500,
+    maxTokens: 1024,
     tools: [buildToolComando(catalogos)],
     toolChoice: { type: 'tool', name: TOOL_COMANDO },
   })

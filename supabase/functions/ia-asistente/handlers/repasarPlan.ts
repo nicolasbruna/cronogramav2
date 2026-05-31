@@ -47,14 +47,16 @@ ${instTxt || '(sin datos)'}
 ## Conflictos
 ${conflictosTxt}
 
-Devolvé un diagnóstico y propuestas de mejora concretas con su overrideDelta. Cada propuesta debe
-ser un cambio mínimo y bien apuntado (el sistema lo va a simular y descartar si no mejora de verdad).
-Si el plan ya está bien y no hay nada que mejorar, devolvé propuestas: [] y un diagnóstico breve.`
+Devolvé un diagnóstico breve y propuestas de mejora concretas con su overrideDelta. Cada propuesta
+debe ser un cambio mínimo y bien apuntado (el sistema lo va a simular y descartar si no mejora de
+verdad). Proponé COMO MÁXIMO 3 propuestas, las de mayor impacto. Sé conciso en títulos y
+justificaciones (una frase cada uno). Si el plan ya está bien, devolvé propuestas: [] y un
+diagnóstico de a lo sumo 2 puntos.`
 
   const resp = await llamarClaude({
     system: buildSystem(),
     messages: [{ role: 'user', content: userMsg }],
-    maxTokens: 2000,
+    maxTokens: 1100,
     tools: [buildToolProponer(catalogos)],
     toolChoice: { type: 'tool', name: TOOL_PROPONER },
   })

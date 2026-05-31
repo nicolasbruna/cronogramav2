@@ -78,6 +78,22 @@ export function PlanificarPage({ diaActual, onVolver, onIrAEditorManual }: Plani
   const [comandoTexto, setComandoTexto] = useState('')
   const [comandoCargando, setComandoCargando] = useState(false)
   const [comandoPreview, setComandoPreview] = useState<PreviewComando | null>(null)
+  // Texto de progreso mientras la IA repasa (da feedback de en qué anda).
+  const [iaPaso, setIaPaso] = useState(0)
+
+  // Mensajes de progreso que van cambiando mientras la IA repasa.
+  const PASOS_IA = [
+    'Leyendo la jornada…',
+    'Buscando mejoras posibles…',
+    'Simulando propuestas con el motor…',
+    'Comparando resultados…',
+    'Casi listo…',
+  ]
+  useEffect(() => {
+    if (!iaRepasando) { setIaPaso(0); return }
+    const id = setInterval(() => setIaPaso(p => Math.min(p + 1, PASOS_IA.length - 1)), 4000)
+    return () => clearInterval(id)
+  }, [iaRepasando])
 
   // Carga el estado de la IA al montar y ante cambios de conexión.
   useEffect(() => {
@@ -866,7 +882,16 @@ export function PlanificarPage({ diaActual, onVolver, onIrAEditorManual }: Plani
                     {iaRepasando && <Loader2 size={12} className="animate-spin text-violet-500" />}
                   </div>
 
-                  {iaRepasando && <div className="text-[12px] text-slate-500">La IA está repasando el plan…</div>}
+                  {iaRepasando && (
+                    <div className="text-[12px] text-slate-500 flex items-center gap-1.5">
+                      <span className="inline-flex gap-0.5">
+                        <span className="w-1 h-1 rounded-full bg-violet-400 animate-bounce" style={{ animationDelay: '0ms' }} />
+                        <span className="w-1 h-1 rounded-full bg-violet-400 animate-bounce" style={{ animationDelay: '150ms' }} />
+                        <span className="w-1 h-1 rounded-full bg-violet-400 animate-bounce" style={{ animationDelay: '300ms' }} />
+                      </span>
+                      {PASOS_IA[iaPaso]}
+                    </div>
+                  )}
                   {iaError && <div className="text-[12px] text-rose-600">{iaError}</div>}
 
                   {iaAutoAviso && (
