@@ -117,7 +117,8 @@ Verificación local: `supabase functions serve ia-asistente --env-file ./supabas
 - ✅ SessionStart hook (`.claude/`) que instala deps + carga esta bitácora al iniciar.
 
 ### Pendiente / próximos pasos
-- Llevar la rama a producción (merge a `main`) cuando se confirme todo en la Pi.
+- ✅ Mergeado a `main` (2026-05-31): la rama principal ya tiene la IA + el hook + el
+  trabajo de simulación/editor manual. `main` y `claude/serene-ritchie-5nTCJ` en sync.
 - Posible: límite de gasto / monitoreo de costos de la API.
 - Optimizar latencia del repaso si molesta (hoy ~15-30s).
 
