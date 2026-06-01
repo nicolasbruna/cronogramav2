@@ -108,12 +108,18 @@ Verificación local: `supabase functions serve ia-asistente --env-file ./supabas
 - [x] Iter 3 — comando NL → overrides ("Pedile un cambio a la IA" + preview + aplicar)
 - [x] Toggle de IA en Configuración (tab "IA" → flag `ia_habilitada`)
 
-### Falta para que funcione en runtime (lo corre el usuario)
-1. `supabase link --project-ref sjqmmqlvmcnctmjrhdlk`
-2. `supabase secrets set ANTHROPIC_API_KEY=sk-ant-...`
-3. `supabase functions deploy ia-asistente`
-4. Activar el flag: en `configuracion_sistema`, upsert `{ clave:'ia_habilitada', valor:true }`
-   (o exponer un toggle en la config de la app más adelante).
+### Estado de runtime (al 2026-05-31)
+- ✅ Edge Function `ia-asistente` desplegada en Supabase (proyecto `sjqmmqlvmcnctmjrhdlk`), **versión 4**, `verify_jwt` on.
+- ✅ Flag `ia_habilitada = true` en `configuracion_sistema`.
+- ✅ `ANTHROPIC_API_KEY` cargada como secret (la cargó el usuario; modelo `claude-sonnet-4-6`).
+- ✅ La Pi corre la rama `claude/serene-ritchie-5nTCJ` con todo el front de IA.
+- Timeouts: Anthropic 60s / cliente 75s. Repaso acotado a ≤3 propuestas y max_tokens 1100 para bajar latencia.
+- ✅ SessionStart hook (`.claude/`) que instala deps + carga esta bitácora al iniciar.
+
+### Pendiente / próximos pasos
+- Llevar la rama a producción (merge a `main`) cuando se confirme todo en la Pi.
+- Posible: límite de gasto / monitoreo de costos de la API.
+- Optimizar latencia del repaso si molesta (hoy ~15-30s).
 
 Mientras el flag esté en false o falte el deploy/secret, la app funciona igual que
 hoy (la IA queda invisible).

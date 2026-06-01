@@ -23,7 +23,11 @@ dist-ssr
 .env
 
 .vercel
-.claude
+# .claude: versionar el hook y settings compartidos; ignorar lo local/personal.
+.claude/*
+!.claude/settings.json
+!.claude/hooks
+.claude/settings.local.json
 *.tmp.*
 .next
 .env*
