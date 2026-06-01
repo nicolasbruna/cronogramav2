@@ -119,8 +119,23 @@ Verificación local: `supabase functions serve ia-asistente --env-file ./supabas
 ### Pendiente / próximos pasos
 - ✅ Mergeado a `main` (2026-05-31): la rama principal ya tiene la IA + el hook + el
   trabajo de simulación/editor manual. `main` y `claude/serene-ritchie-5nTCJ` en sync.
+- Confirmar que **Vercel** redeploya desde `main` con la IA (producción web).
+- Opcional: pasar la **Pi** a seguir `main` (hoy sigue `claude/serene-ritchie-5nTCJ`,
+  mismo contenido).
 - Posible: límite de gasto / monitoreo de costos de la API.
 - Optimizar latencia del repaso si molesta (hoy ~15-30s).
+
+### Cómo retomar (próxima sesión)
+- Todo lo de IA está **funcionando end-to-end**: la Pi corre el front con IA, la
+  función `ia-asistente` (v4) responde con la `ANTHROPIC_API_KEY` cargada, flag activo.
+- El usuario estaba **probando en la Pi** (`Planificar → Generar` dispara el repaso
+  automático). Si reporta un error, revisar logs con el MCP de Supabase
+  (`get_logs` service `edge-function`).
+- Para cambiar la función: editar en `supabase/functions/ia-asistente/`, commitear, y
+  **redeployar** con `deploy_edge_function` (MCP) — el CLI de Supabase no está en el
+  entorno. Hay que reenviar TODOS los archivos en cada deploy.
+- Topología: GitHub = fuente de verdad; yo trabajo en la nube y pusheo; la Pi hace
+  `git pull` para recibir cambios. No tengo acceso directo a la Pi ni a la PC.
 
 Mientras el flag esté en false o falte el deploy/secret, la app funciona igual que
 hoy (la IA queda invisible).
